@@ -1,0 +1,51 @@
+# Large dataset artifacts and caches
+*.h5
+*.hdf5
+*.npz
+*.npy
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.xz
+*.zst
+*.rar
+*.7z
+*.pkl
+*.pickle
+*.pt
+*.pth
+*.ckpt
+*.joblib
+
+# Raw media dumps
+*.jpeg
+*.jpg
+*.png
+*.bmp
+*.tiff
+*.gif
+*.webp
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.wav
+*.mp3
+*.flac
+
+# Dataset splits and extracted samples
+**/train/
+**/test/
+**/val/
+**/validation/
+**/dev/
+
+# Known bulky dataset folders
+256/
+Brain_cancer/
+chest_xray_Pnem_Normal/
+hdf5/
+lsun_cat/
