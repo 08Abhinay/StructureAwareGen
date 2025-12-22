@@ -2,6 +2,7 @@ SIF
 CNN-JEPA/jepa-cnn/
 ijepa-main/ijepa-env/
 ijepa-main/logs/
+SegmentationAwareGen
 *.ckpt
 __pycache__
 *.pyc
@@ -64,3 +65,5 @@ ENV/
 *metric-fid50k_full.jsonl
 *stats.jsonl
 *metric*.jsonl
+*.npy
+*.npz

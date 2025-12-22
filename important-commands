@@ -1,0 +1,82 @@
+mkdir -p /scratch/gilbreth/abelde/.conda/pkgs
+mkdir -p /scratch/gilbreth/abelde/.conda/envs
+
+export CONDA_PKGS_DIRS=/scratch/gilbreth/abelde/.conda/pkgs
+export CONDA_ENVS_DIRS=/scratch/gilbreth/abelde/.conda/envs
+echo $CONDA_PKGS_DIRS
+mkdir -p /scratch/gilbreth/abelde/.cache/pip
+export PIP_CACHE_DIR=/scratch/gilbreth/abelde/.cache/pip
+echo $PIP_CACHE_DIR
+
+To create conda environment:
+
+conda create -y \
+  -p /scratch/gilbreth/abelde/Thesis/StructureAwareGen/SegmentationAwareGen \
+  python=3.9 pip
+
+
+Check storage in home 
+du -a $HOME | sort -n -r | head -n 20
+
+
+conda info --envs
+
+module avail anaconda
+
+
+Option A (recommended): set exports before you start Jupyter
+In the terminal where you launch Jupyter:
+module load cuda/12.6.0
+source /apps/external/anaconda/2025.06/etc/profile.d/conda.sh
+conda activate /scratch/gilbreth/abelde/Thesis/StructureAwareGen/SegmentationAwareGen
+
+export TMPDIR=/tmp/$USER-jupyter
+export TORCH_EXTENSIONS_DIR=/tmp/$USER-jupyter/torch_extensions
+export XDG_CACHE_HOME=/tmp/$USER-jupyter/cache
+
+export HF_HOME=/scratch/gilbreth/abelde/.cache/huggingface
+export TRANSFORMERS_CACHE=$HF_HOME
+export HF_HUB_CACHE=$HF_HOME/hub
+
+mkdir -p "$TMPDIR" "$TORCH_EXTENSIONS_DIR" "$XDG_CACHE_HOME" "$HF_HUB_CACHE"
+
+
+Option B: set them inside a notebook cell
+Run this once at the top of the notebook:
+import os
+
+# Short tmp paths (avoid AF_UNIX path too long)
+os.environ["TMPDIR"] = f"/tmp/{os.environ.get('USER','user')}-jupyter"
+os.environ["TEMP"]  = os.environ["TMPDIR"]
+os.environ["TMP"]   = os.environ["TMPDIR"]
+os.environ["TORCH_EXTENSIONS_DIR"] = os.path.join(os.environ["TMPDIR"], "torch_extensions")
+os.environ["XDG_CACHE_HOME"] = os.path.join(os.environ["TMPDIR"], "cache")
+
+# Hugging Face cache in scratch
+os.environ["HF_HOME"] = "/scratch/gilbreth/abelde/.cache/huggingface"
+os.environ["TRANSFORMERS_CACHE"] = os.environ["HF_HOME"]
+os.environ["HF_HUB_CACHE"] = os.path.join(os.environ["HF_HOME"], "hub")
+
+for p in [os.environ["TMPDIR"], os.environ["TORCH_EXTENSIONS_DIR"], os.environ["XDG_CACHE_HOME"], os.environ["HF_HUB_CACHE"]]:
+    os.makedirs(p, exist_ok=True)
+
+print("TMPDIR=", os.environ["TMPDIR"])
+print("HF_HOME=", os.environ["HF_HOME"])
+
+
+
+# 2) Install ipykernel into that env
+pip install ipykernel
+
+
+# 3) Register the env as a Jupyter kernel
+# Give it a clear name so you recognize it:
+python -m ipykernel install \
+  --user \
+  --name seg-aware-gen \
+  --display-name "Python (SegmentationAwareGen)"
+
+# 4) Verify the kernel exists
+jupyter kernelspec list
+
+export PYTHONNOUSERSITE=1
