@@ -67,3 +67,4 @@ ENV/
 *metric*.jsonl
 *.npy
 *.npz
+*.github/
