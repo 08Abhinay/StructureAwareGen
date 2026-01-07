@@ -1,11 +1,15 @@
 #!/bin/bash
-#SBATCH -A debug
-#SBATCH -o test.out
-#SBATCH -e test.err
+#SBATCH -A pfw-cs
+#SBATCH -p a30
+#SBATCH -q standby
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=1
-#SBATCH --time=00:30:00
+#SBATCH --ntasks=1
+#SBATCH --gpus-per-node=1    
+#SBATCH --cpus-per-task=5
 #SBATCH --mem=80G
+#SBATCH --time=04:00:00
+#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/SLRUM_OUTPUT_FILES/limeattack-rottom-llama31.out
+#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/SLRUM_OUTPUT_FILES/limeattack-rottom-llama31.err
 
 # Activate your virtual environment
 source /scratch/gilbreth/abelde/NLP_Research/venv/bin/activate
@@ -40,6 +44,6 @@ cd /scratch/gilbreth/abelde/Thesis/scripts/StyleGAN2/stylegan2-ada-pytorch
 #                         --dest=/scratch/gilbreth/abelde/Thesis/scripts/StyleGAN2/stylegan2-ada-pytorch/datasets/256/lsun_unlabelled.zip \
 #                         --width=256 --height=256 --resize-filter=box  
 
-python dataset_tool.py --source=/scratch/gilbreth/abelde/Thesis/dataset/EyePACS_AIROGS/release-crop/train \
+python dataset_tool.py --source=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/val2017 \
                         --dest=/scratch/gilbreth/abelde/Thesis/scripts/StyleGAN2/stylegan2-ada-pytorch/datasets/256/EyePACS_AIROGS_labelled.zip \
                         --width=256 --height=256 --resize-filter=box   

@@ -320,14 +320,14 @@ class SegTokenPool(torch.nn.Module):
 
 @persistence.persistent_class
 class IJEPAFusionMapping(torch.nn.Module):
-    """
-    MappingNetwork wrapper that fuses global CCN-I‑JEPA embeddings into the
-    StyleGAN2 W‑space and (optionally) produces FiLM parameters for the
-    early generator convolutions.
+    # 
+    # MappingNetwork wrapper that fuses global CCN-I‑JEPA embeddings into the
+    # StyleGAN2 W‑space and (optionally) produces FiLM parameters for the
+    # early generator convolutions.
 
-    ▸ proj_ijepa : (B,cnn-ijepa_dim) → (B,w_dim) —adds to the first *k*Ws
-    ▸ film_mlp   : (B,ijepa_dim) → γ,β pairs for the first *film_layers*convs
-    """
+    # ▸ proj_ijepa : (B,cnn-ijepa_dim) → (B,w_dim) —adds to the first *k*Ws
+    # ▸ film_mlp   : (B,ijepa_dim) → γ,β pairs for the first *film_layers*convs
+    # 
 
     def __init__(
         self,
