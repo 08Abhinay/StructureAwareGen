@@ -68,3 +68,5 @@ ENV/
 *.npy
 *.npz
 *.github/
+scripts/Diffusion-GAN-backup
+scripts/rcg

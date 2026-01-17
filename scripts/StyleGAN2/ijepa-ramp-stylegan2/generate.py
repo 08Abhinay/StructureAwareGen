@@ -19,6 +19,7 @@ import PIL.Image
 import torch
 
 import legacy
+from training.ijepa_encoder import build_ijepa_encoder
 
 #----------------------------------------------------------------------------
 
@@ -43,6 +44,10 @@ def num_range(s: str) -> List[int]:
 @click.option('--noise-mode', help='Noise mode', type=click.Choice(['const', 'random', 'none']), default='const', show_default=True)
 @click.option('--projected-w', help='Projection result file', type=str, metavar='FILE')
 @click.option('--outdir', help='Where to save the output images', type=str, required=True, metavar='DIR')
+@click.option('--ijepa_checkpoint', help='IJEPA checkpoint for embedding conditioning', type=str)
+@click.option('--ijepa_ref', help='Reference image used to compute IJEPA embedding', type=str, metavar='FILE')
+@click.option('--ijepa_image', help='IJEPA encoder input resolution', type=int, default=256, show_default=True)
+@click.option('--ijepa_input_channel', help='IJEPA encoder input channels', type=int)
 def generate_images(
     ctx: click.Context,
     network_pkl: str,
@@ -51,7 +56,11 @@ def generate_images(
     noise_mode: str,
     outdir: str,
     class_idx: Optional[int],
-    projected_w: Optional[str]
+    projected_w: Optional[str],
+    ijepa_checkpoint: Optional[str],
+    ijepa_ref: Optional[str],
+    ijepa_image: int,
+    ijepa_input_channel: Optional[int],
 ):
     """Generate images using pretrained network pickle.
 
@@ -85,10 +94,46 @@ def generate_images(
 
     os.makedirs(outdir, exist_ok=True)
 
+    ijepa_enabled = hasattr(G, "mapping") and hasattr(G.mapping, "proj_ijepa")
+    e_ijepa = None
+    if ijepa_checkpoint is not None or ijepa_ref is not None:
+        if ijepa_checkpoint is None or ijepa_ref is None:
+            ctx.fail('Both --ijepa_checkpoint and --ijepa_ref are required for IJEPA conditioning.')
+        ijepa_in_ch = ijepa_input_channel if ijepa_input_channel is not None else G.img_channels
+        ijepa_enc, _ = build_ijepa_encoder(
+            ijepa_checkpoint,
+            device=device,
+            in_channels_override=ijepa_in_ch,
+            img_size=ijepa_image,
+        )
+        ijepa_enc.eval().requires_grad_(False)
+        ref_img = PIL.Image.open(ijepa_ref)
+        if ijepa_in_ch == 1:
+            ref_img = ref_img.convert('L')
+        else:
+            ref_img = ref_img.convert('RGB')
+        ref_arr = np.array(ref_img)
+        if ref_arr.ndim == 2:
+            ref_arr = ref_arr[None, :, :]
+        else:
+            ref_arr = ref_arr.transpose(2, 0, 1)
+        ref_tensor = torch.from_numpy(ref_arr).unsqueeze(0).to(device).float()
+        ref_tensor = ref_tensor / 127.5 - 1.0
+        if ref_tensor.shape[1] < ijepa_in_ch:
+            ref_tensor = ref_tensor.repeat(1, ijepa_in_ch // ref_tensor.shape[1], 1, 1)
+        elif ref_tensor.shape[1] > ijepa_in_ch:
+            ref_tensor = ref_tensor.mean(1, keepdim=True)
+        with torch.no_grad():
+            e_ijepa = ijepa_enc(ref_tensor)
+    elif ijepa_enabled:
+        ctx.fail('IJEPA-enabled generator detected; pass --ijepa_checkpoint and --ijepa_ref to use embeddings.')
+
     # Synthesize the result of a W projection.
     if projected_w is not None:
         if seeds is not None:
             print ('warn: --seeds is ignored when using --projected-w')
+        if e_ijepa is not None:
+            print('warn: IJEPA embedding is ignored when using --projected-w')
         print(f'Generating images from projected W "{projected_w}"')
         ws = np.load(projected_w)['w']
         ws = torch.tensor(ws, device=device) # pylint: disable=not-callable
@@ -116,7 +161,11 @@ def generate_images(
     for seed_idx, seed in enumerate(seeds):
         print('Generating image for seed %d (%d/%d) ...' % (seed, seed_idx, len(seeds)))
         z = torch.from_numpy(np.random.RandomState(seed).randn(1, G.z_dim)).to(device)
-        img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
+        # img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
+        if e_ijepa is not None:
+            img = G(z, label, e_ijepa=e_ijepa, sem_ramp=1.0, truncation_psi=truncation_psi, noise_mode=noise_mode)
+        else:
+            img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
         img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
 

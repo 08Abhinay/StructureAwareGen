@@ -16,10 +16,14 @@ import numpy as np
 import torch
 import dnnlib
 
+from training.ijepa_encoder import build_ijepa_encoder
+
 #----------------------------------------------------------------------------
 
+# def __init__(self, G=None, G_kwargs={}, dataset_kwargs={}, num_gpus=1, rank=0, device=None, progress=None, cache=True):
 class MetricOptions:
-    def __init__(self, G=None, G_kwargs={}, dataset_kwargs={}, num_gpus=1, rank=0, device=None, progress=None, cache=True):
+    def __init__(self, G=None, G_kwargs={}, dataset_kwargs={}, num_gpus=1, rank=0, device=None, progress=None, cache=True,
+                 ijepa_ckpt=None, ijepa_in_ch=None, ijepa_img=256):
         assert 0 <= rank < num_gpus
         self.G              = G
         self.G_kwargs       = dnnlib.EasyDict(G_kwargs)
@@ -29,10 +33,36 @@ class MetricOptions:
         self.device         = device if device is not None else torch.device('cuda', rank)
         self.progress       = progress.sub() if progress is not None and rank == 0 else ProgressMonitor()
         self.cache          = cache
+        self.ijepa_ckpt     = ijepa_ckpt
+        self.ijepa_in_ch    = ijepa_in_ch
+        self.ijepa_img      = ijepa_img
 
 #----------------------------------------------------------------------------
 
 _feature_detector_cache = dict()
+_ijepa_encoder_cache = dict()
+
+def get_ijepa_encoder(ckpt_path, device, in_channels, img_size):
+    key = (ckpt_path, device, in_channels, img_size)
+    if key not in _ijepa_encoder_cache:
+        enc, meta = build_ijepa_encoder(
+            ckpt_path,
+            device=device,
+            in_channels_override=in_channels,
+            img_size=img_size,
+        )
+        _ijepa_encoder_cache[key] = (enc, meta)
+    return _ijepa_encoder_cache[key]
+
+def _prepare_ijepa_images(images, expect_c):
+    x = images.to(torch.float32)
+    if x.max() > 1.0:
+        x = x / 127.5 - 1.0
+    if x.shape[1] < expect_c:
+        x = x.repeat(1, expect_c // x.shape[1], 1, 1)
+    elif x.shape[1] > expect_c:
+        x = x.mean(1, keepdim=True)
+    return x
 
 def get_feature_detector_name(url):
     return os.path.splitext(url.split('/')[-1])[0]
@@ -238,14 +268,34 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
     G = copy.deepcopy(opts.G).eval().requires_grad_(False).to(opts.device)
     dataset = dnnlib.util.construct_class_by_name(**opts.dataset_kwargs)
 
+    ijepa_enabled = hasattr(G, "mapping") and hasattr(G.mapping, "proj_ijepa")
+    if ijepa_enabled and opts.ijepa_ckpt is None:
+        raise RuntimeError("IJEPA-enabled generator detected but --ijepa_checkpoint was not provided.")
+
+    ijepa_encoder = None
+    ijepa_in_ch = None
+    if ijepa_enabled:
+        ijepa_in_ch = opts.ijepa_in_ch if opts.ijepa_in_ch is not None else G.img_channels
+        ijepa_encoder, _ = get_ijepa_encoder(
+            opts.ijepa_ckpt,
+            device=opts.device,
+            in_channels=ijepa_in_ch,
+            img_size=opts.ijepa_img,
+        )
+
     # Image generation func.
-    def run_generator(z, c):
-        img = G(z=z, c=c, **opts.G_kwargs)
+    def run_generator(z, c, e_ijepa=None):
+        # img = G(z=z, c=c, **opts.G_kwargs)
+        if e_ijepa is not None:
+            img = G(z=z, c=c, e_ijepa=e_ijepa, sem_ramp=1.0, **opts.G_kwargs)
+        else:
+            img = G(z=z, c=c, **opts.G_kwargs)
         img = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         return img
 
     # JIT.
-    if jit:
+    # if jit:
+    if jit and ijepa_encoder is None:
         z = torch.zeros([batch_gen, G.z_dim], device=opts.device)
         c = torch.zeros([batch_gen, G.c_dim], device=opts.device)
         run_generator = torch.jit.trace(run_generator, [z, c], check_trace=False)
@@ -263,7 +313,17 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
             z = torch.randn([batch_gen, G.z_dim], device=opts.device)
             c = [dataset.get_label(np.random.randint(len(dataset))) for _i in range(batch_gen)]
             c = torch.from_numpy(np.stack(c)).pin_memory().to(opts.device)
-            images.append(run_generator(z, c))
+            # images.append(run_generator(z, c))
+            if ijepa_encoder is not None:
+                ijepa_idxs = np.random.randint(len(dataset), size=batch_gen)
+                ijepa_imgs = [dataset[i][0] for i in ijepa_idxs]
+                ijepa_imgs = torch.from_numpy(np.stack(ijepa_imgs)).to(opts.device)
+                ijepa_imgs = _prepare_ijepa_images(ijepa_imgs, ijepa_in_ch)
+                with torch.no_grad():
+                    e_ijepa = ijepa_encoder(ijepa_imgs)
+            else:
+                e_ijepa = None
+            images.append(run_generator(z, c, e_ijepa))
         images = torch.cat(images)
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])

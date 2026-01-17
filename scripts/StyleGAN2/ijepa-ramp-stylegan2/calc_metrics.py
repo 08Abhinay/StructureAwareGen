@@ -60,8 +60,11 @@ def subprocess_fn(rank, args, temp_dir):
         if rank == 0 and args.verbose:
             print(f'Calculating {metric}...')
         progress = metric_utils.ProgressMonitor(verbose=args.verbose)
+        # result_dict = metric_main.calc_metric(metric=metric, G=G, dataset_kwargs=args.dataset_kwargs,
+        #     num_gpus=args.num_gpus, rank=rank, device=device, progress=progress)
         result_dict = metric_main.calc_metric(metric=metric, G=G, dataset_kwargs=args.dataset_kwargs,
-            num_gpus=args.num_gpus, rank=rank, device=device, progress=progress)
+            num_gpus=args.num_gpus, rank=rank, device=device, progress=progress,
+            ijepa_ckpt=args.ijepa_ckpt, ijepa_in_ch=args.ijepa_in_ch, ijepa_img=args.ijepa_img)
         if rank == 0:
             metric_main.report_metric(result_dict, run_dir=args.run_dir, snapshot_pkl=args.network_pkl)
         if rank == 0 and args.verbose:
@@ -92,8 +95,12 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--mirror', help='Whether the dataset was augmented with x-flips during training [default: look up]', type=bool, metavar='BOOL')
 @click.option('--gpus', help='Number of GPUs to use', type=int, default=1, metavar='INT', show_default=True)
 @click.option('--verbose', help='Print optional information', type=bool, default=True, metavar='BOOL', show_default=True)
+@click.option('--ijepa_checkpoint', help='IJEPA checkpoint for embedding conditioning', type=str)
+@click.option('--ijepa_image', help='IJEPA encoder input resolution', type=int, default=256, show_default=True)
+@click.option('--ijepa_input_channel', help='IJEPA encoder input channels', type=int)
 
-def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose):
+def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose,
+                 ijepa_checkpoint, ijepa_image, ijepa_input_channel):
     """Calculate quality metrics for previous training run or pretrained network pickle.
 
     Examples:
@@ -131,7 +138,9 @@ def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose):
     dnnlib.util.Logger(should_flush=True)
 
     # Validate arguments.
-    args = dnnlib.EasyDict(metrics=metrics, num_gpus=gpus, network_pkl=network_pkl, verbose=verbose)
+    # args = dnnlib.EasyDict(metrics=metrics, num_gpus=gpus, network_pkl=network_pkl, verbose=verbose)
+    args = dnnlib.EasyDict(metrics=metrics, num_gpus=gpus, network_pkl=network_pkl, verbose=verbose,
+                           ijepa_ckpt=ijepa_checkpoint, ijepa_img=ijepa_image, ijepa_in_ch=ijepa_input_channel)
     if not all(metric_main.is_valid_metric(metric) for metric in args.metrics):
         ctx.fail('\n'.join(['--metrics can only contain the following values:'] + metric_main.list_valid_metrics()))
     if not args.num_gpus >= 1:
@@ -145,6 +154,8 @@ def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose):
     with dnnlib.util.open_url(network_pkl, verbose=args.verbose) as f:
         network_dict = legacy.load_network_pkl(f)
         args.G = network_dict['G_ema'] # subclass of torch.nn.Module
+    if hasattr(args.G, "mapping") and hasattr(args.G.mapping, "proj_ijepa") and args.ijepa_ckpt is None:
+        ctx.fail('IJEPA-enabled generator detected; pass --ijepa_checkpoint (and optionally --ijepa_image/--ijepa_input_channel).')
 
     # Initialize dataset options.
     if data is not None:
