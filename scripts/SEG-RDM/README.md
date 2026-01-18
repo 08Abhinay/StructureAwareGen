@@ -1,15 +1,18 @@
-SEG-RDM
+# SEG-RDM
 
 Standalone port of the RDM training pipeline from the local RCG repo. Uses OmegaConf configs with target/params blocks and preserves the original DDPM/DDIM math, conditioning flow, and pretrained encoder path.
 
-Quick start
+## Quick start
 
 1) Install minimal deps
 
+```bash
 pip install -r requirements_min.txt
+```
 
 2) Run single-GPU training
 
+```bash
 python -m rdm.main_rdm \
   --config rdm/configs/rdm_default.yaml \
   --batch_size 128 \
@@ -19,9 +22,11 @@ python -m rdm.main_rdm \
   --weight_decay 0.01 \
   --output_dir /tmp/seg_rdm_out \
   --data_path /path/to/imagenet_or_dummy
+```
 
 3) Run torchrun (DDP) if desired
 
+```bash
 torchrun --nproc_per_node=1 -m rdm.main_rdm \
   --config rdm/configs/rdm_default.yaml \
   --batch_size 128 \
@@ -31,19 +36,23 @@ torchrun --nproc_per_node=1 -m rdm.main_rdm \
   --weight_decay 0.01 \
   --output_dir /tmp/seg_rdm_out \
   --data_path /path/to/imagenet_or_dummy
+```
 
-Pretrained encoder checkpoints
+## Pretrained encoder checkpoints
 
 The default config expects a MoCo v3 ViT-B checkpoint at:
 
+```
 pretrained_enc_ckpts/mocov3/vitb.pth.tar
+```
 
-Use an absolute path if you store checkpoints elsewhere by editing rdm/configs/rdm_default.yaml or the config you pass in.
+Use an absolute path if you store checkpoints elsewhere by editing `rdm/configs/rdm_default.yaml` or the config you pass in.
 
-Smoke test
+## Smoke test
 
 A minimal smoke test is provided in code:
 
+```bash
 python - <<'PY'
 from rdm.main_rdm import smoke_test
 loss, loss_dict, samples = smoke_test('rdm/configs/rdm_default.yaml', device='cuda')
@@ -51,11 +60,13 @@ print(loss)
 print(list(loss_dict.keys()))
 print(samples.shape)
 PY
+```
 
-Notebook debug instructions
+## Notebook debug instructions
 
-Use this pattern to run main() from a notebook:
+Use this pattern to run `main()` from a notebook:
 
+```python
 import sys
 sys.path.append('/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM')
 
@@ -74,3 +85,4 @@ sys.argv = [
 from rdm.main_rdm import get_args_parser, main
 args = get_args_parser().parse_args()
 main(args)
+```
