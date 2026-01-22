@@ -574,7 +574,17 @@ class RDM(DDPM):
             x_normalized = (x - mean) / std
             x_normalized = torch.nn.functional.interpolate(x_normalized, 224, mode='bicubic', align_corners=False)
             rep = self.pretrained_encoder.forward_features(x_normalized)
-            if self.pretrained_enc_withproj:
+            if rep.dim() == 3:
+                # timm ViT returns tokens; pool before optional projection head.
+                if hasattr(self.pretrained_encoder, "forward_head"):
+                    rep = self.pretrained_encoder.forward_head(
+                        rep, pre_logits=not self.pretrained_enc_withproj
+                    )
+                else:
+                    rep = rep[:, 0]
+                    if self.pretrained_enc_withproj:
+                        rep = self.pretrained_encoder.head(rep)
+            elif self.pretrained_enc_withproj:
                 rep = self.pretrained_encoder.head(rep)
             rep_std = torch.std(rep, dim=1, keepdim=True)
             rep_mean = torch.mean(rep, dim=1, keepdim=True)

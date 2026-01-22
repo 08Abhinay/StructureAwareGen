@@ -25,7 +25,7 @@ model:
     pretrained_enc_config:
       params:
         pretrained_enc_arch: mocov3_vit_base
-        pretrained_enc_path: pretrained_enc_ckpts/mocov3/vitb.pth.tar
+        pretrained_enc_path: pretrained_enc_ckpts/mocov3/vit-b-300ep.pth.tar
         proj_dim: 256
         pretrained_enc_withproj: True
     cond_stage_config:
