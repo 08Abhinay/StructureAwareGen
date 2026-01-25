@@ -73,8 +73,8 @@ pip install ipykernel
 # Give it a clear name so you recognize it:
 python -m ipykernel install \
   --user \
-  --name seg-aware-gen \
-  --display-name "Python (SegmentationAwareGen)"
+  --name conda-clean\
+  --display-name "Python (conda-clean)"
 
 # 4) Verify the kernel exists
 jupyter kernelspec list

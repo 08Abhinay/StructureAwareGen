@@ -76,6 +76,15 @@ def get_args_parser():
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
+    
+    # Debug / smoke mode
+    parser.add_argument('--debug', action='store_true',
+                        help='Debugger-friendly mode: num_workers=0, pin_mem=False, no DDP sampler, small subset.')
+    parser.add_argument('--debug_n', default=100, type=int,
+                        help='Number of training images to use in --debug mode.')
+    parser.add_argument('--debug_steps', default=5, type=int,
+                        help='Max train iterations per epoch in --debug mode.')
+
 
     return parser
 
@@ -142,19 +151,56 @@ def main(args):
 
     dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
     print(dataset_train)
+    # -------------------------
+    # Debug subset (100 images)
+    # -------------------------
+    if args.debug:
+        from torch.utils.data import Subset
+        n = min(args.debug_n, len(dataset_train))
+        dataset_train = Subset(dataset_train, list(range(n)))
+        print(f"[DEBUG] Using subset of dataset_train: {n} samples")
 
-    sampler_train = torch.utils.data.DistributedSampler(
-        dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-    )
-    print("Sampler_train = %s" % str(sampler_train))
 
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=True,
-    )
+    # -------------------------
+    # Sampler / DataLoader
+    # -------------------------
+    if args.debug:
+        sampler_train = None
+        data_loader_train = torch.utils.data.DataLoader(
+            dataset_train,
+            shuffle=False,            # deterministic
+            batch_size=args.batch_size,
+            num_workers=0,            # KEY
+            pin_memory=False,         # KEY
+            drop_last=False,
+        )
+        print("[DEBUG] DataLoader: num_workers=0, pin_memory=False, shuffle=False, no DistributedSampler")
+    else:
+        sampler_train = torch.utils.data.DistributedSampler(
+            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+        )
+        print("Sampler_train = %s" % str(sampler_train))
+
+        data_loader_train = torch.utils.data.DataLoader(
+            dataset_train, sampler=sampler_train,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=True,
+        )
+
+    # sampler_train = torch.utils.data.DistributedSampler(
+    #     dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+    # )
+    # print("Sampler_train = %s" % str(sampler_train))
+
+    # data_loader_train = torch.utils.data.DataLoader(
+    #     dataset_train, sampler=sampler_train,
+    #     batch_size=args.batch_size,
+    #     num_workers=args.num_workers,
+    #     pin_memory=args.pin_mem,
+    #     drop_last=True,
+    # )
 
     config = OmegaConf.load(args.config)
     model = util.instantiate_from_config(config.model)
@@ -177,11 +223,17 @@ def main(args):
     print("accumulate grad iterations: %d" % args.accum_iter)
     print("effective batch size: %d" % eff_batch_size)
 
-    if args.distributed:
+    # if args.distributed:
+    #     model = torch.nn.parallel.DistributedDataParallel(
+    #         model, device_ids=[args.gpu], find_unused_parameters=True
+    #     )
+    #     model_without_ddp = model.module
+    if args.distributed and (not args.debug):
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[args.gpu], find_unused_parameters=True
         )
         model_without_ddp = model.module
+
 
     params = list(model_without_ddp.model.parameters())
     if model_without_ddp.cond_stage_model is not None:
@@ -201,7 +253,9 @@ def main(args):
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
+        # if args.distributed:
+        #     data_loader_train.sampler.set_epoch(epoch)
+        if args.distributed and (not args.debug):
             data_loader_train.sampler.set_epoch(epoch)
 
         train_stats = train_one_epoch(
