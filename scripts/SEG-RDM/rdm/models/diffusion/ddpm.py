@@ -420,10 +420,24 @@ class RDM(DDPM):
 
         self.pretrained_encoder.eval()
         self.pretrained_encoder.train = disabled_train
+        self.pretrained_enc_proj = None
         try:
             self.pretrained_enc_withproj = config.params.pretrained_enc_withproj
         except:
             self.pretrained_enc_withproj = False
+
+        if self.pretrained_enc_withproj:
+            enc_out_dim = config.params.get("proj_dim", self.channels)
+        else:
+            enc_out_dim = getattr(self.pretrained_encoder, "embed_dim", None)
+            if enc_out_dim is None:
+                enc_out_dim = getattr(self.pretrained_encoder, "num_features", None)
+            if enc_out_dim is None and hasattr(self.pretrained_encoder, "head"):
+                head = self.pretrained_encoder.head
+                if hasattr(head, "weight"):
+                    enc_out_dim = head.weight.shape[1]
+        if enc_out_dim is not None and enc_out_dim != self.channels:
+            self.pretrained_enc_proj = nn.Linear(enc_out_dim, self.channels)
 
         for param in self.pretrained_encoder.parameters():
             param.requires_grad = False
@@ -589,9 +603,11 @@ class RDM(DDPM):
                         rep = self.pretrained_encoder.head(rep)
             elif self.pretrained_enc_withproj:
                 rep = self.pretrained_encoder.head(rep)
-            rep_std = torch.std(rep, dim=1, keepdim=True)
-            rep_mean = torch.mean(rep, dim=1, keepdim=True)
-            rep = (rep - rep_mean) / rep_std
+        if self.pretrained_enc_proj is not None:
+            rep = self.pretrained_enc_proj(rep)
+        rep_std = torch.std(rep, dim=1, keepdim=True)
+        rep_mean = torch.mean(rep, dim=1, keepdim=True)
+        rep = (rep - rep_mean) / rep_std
 
         x = rep.unsqueeze(-1).unsqueeze(-1)
         x = x * self.input_scale
