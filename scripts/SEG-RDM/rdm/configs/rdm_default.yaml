@@ -24,10 +24,10 @@ model:
         num_res_blocks: 12
     pretrained_enc_config:
       params:
-        pretrained_enc_arch: mocov3_vit_base
+        pretrained_enc_arch: ijepa_vit_h14
         pretrained_enc_path: pretrained_enc_ckpts/ijepa/IN1K-vit.h.14-300e.pth.tar
         proj_dim: 256
-        pretrained_enc_withproj: True
+        pretrained_enc_withproj: False
     cond_stage_config:
       target: rdm.modules.encoders.modules.ClassEmbedder
       params:

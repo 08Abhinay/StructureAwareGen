@@ -412,6 +412,9 @@ class RDM(DDPM):
         elif 'deit' in config.params.pretrained_enc_arch:
             self.pretrained_encoder = models_pretrained_enc.load_pretrained_deit(self.pretrained_encoder,
                                                                                  config.params.pretrained_enc_path)
+        elif 'ijepa' in config.params.pretrained_enc_arch:
+            self.pretrained_encoder = models_pretrained_enc.load_pretrained_ijepa(self.pretrained_encoder,
+                                                                                  config.params.pretrained_enc_path)
         else:
             raise NotImplementedError
 

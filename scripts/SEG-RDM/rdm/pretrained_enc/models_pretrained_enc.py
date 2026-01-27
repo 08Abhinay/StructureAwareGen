@@ -4,6 +4,7 @@ from rdm.pretrained_enc.moco_v3 import vits as moco_vits
 from rdm.pretrained_enc.dino import vits as dino_vits
 from rdm.pretrained_enc.ibot import vits as ibot_vits
 from rdm.pretrained_enc.deit import vits as deit_vits
+from rdm.pretrained_enc.ijepa import vision_transformer as ijepa_vits
 
 
 def build_mlp(num_layers, input_dim, mlp_dim, output_dim, last_bn=True):
@@ -100,6 +101,36 @@ def load_pretrained_mae(model, ckpt_path):
     raise NotImplementedError("MAE checkpoints are not wired in this port.")
 
 
+def load_pretrained_ijepa(model, ckpt_path):
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(checkpoint, dict):
+        for key in ("target_encoder", "encoder", "model", "state_dict"):
+            if key in checkpoint:
+                state_dict = checkpoint[key]
+                break
+        else:
+            state_dict = checkpoint
+    else:
+        state_dict = checkpoint
+
+    cleaned_state = {}
+    for k, v in state_dict.items():
+        new_k = k
+        for prefix in ("module.", "encoder.", "backbone."):
+            if new_k.startswith(prefix):
+                new_k = new_k[len(prefix):]
+        cleaned_state[new_k] = v
+
+    model_state = model.state_dict()
+    filtered_state = {}
+    for k, v in cleaned_state.items():
+        if k in model_state and v.shape == model_state[k].shape:
+            filtered_state[k] = v
+
+    model.load_state_dict(filtered_state, strict=False)
+    return model
+
+
 def mocov3_vit_small(proj_dim, **kwargs):
     model = moco_vits.vit_small(**kwargs)
     hidden_dim = model.head.weight.shape[1]
@@ -151,3 +182,67 @@ def ibot_vit_base(proj_dim, **kwargs):
 def deit_vit_base(proj_dim, **kwargs):
     model = deit_vits.deit_base_patch16_224()
     return model
+
+
+def _ijepa_with_proj(model, proj_dim):
+    hidden_dim = model.embed_dim
+    model.head = build_mlp(3, hidden_dim, 4096, proj_dim)
+    return model
+
+
+def ijepa_vit_tiny(proj_dim, patch_size=16, **kwargs):
+    model = ijepa_vits.vit_tiny(patch_size=patch_size, **kwargs)
+    return _ijepa_with_proj(model, proj_dim)
+
+
+def ijepa_vit_small(proj_dim, patch_size=16, **kwargs):
+    model = ijepa_vits.vit_small(patch_size=patch_size, **kwargs)
+    return _ijepa_with_proj(model, proj_dim)
+
+
+def ijepa_vit_base(proj_dim, patch_size=16, **kwargs):
+    model = ijepa_vits.vit_base(patch_size=patch_size, **kwargs)
+    return _ijepa_with_proj(model, proj_dim)
+
+
+def ijepa_vit_large(proj_dim, patch_size=16, **kwargs):
+    model = ijepa_vits.vit_large(patch_size=patch_size, **kwargs)
+    return _ijepa_with_proj(model, proj_dim)
+
+
+def ijepa_vit_huge(proj_dim, patch_size=16, **kwargs):
+    model = ijepa_vits.vit_huge(patch_size=patch_size, **kwargs)
+    return _ijepa_with_proj(model, proj_dim)
+
+
+def ijepa_vit_giant(proj_dim, patch_size=16, **kwargs):
+    model = ijepa_vits.vit_giant(patch_size=patch_size, **kwargs)
+    return _ijepa_with_proj(model, proj_dim)
+
+
+def ijepa_vit_tiny_p14(proj_dim, **kwargs):
+    return ijepa_vit_tiny(proj_dim, patch_size=14, **kwargs)
+
+
+def ijepa_vit_small_p14(proj_dim, **kwargs):
+    return ijepa_vit_small(proj_dim, patch_size=14, **kwargs)
+
+
+def ijepa_vit_base_p14(proj_dim, **kwargs):
+    return ijepa_vit_base(proj_dim, patch_size=14, **kwargs)
+
+
+def ijepa_vit_large_p14(proj_dim, **kwargs):
+    return ijepa_vit_large(proj_dim, patch_size=14, **kwargs)
+
+
+def ijepa_vit_huge_p14(proj_dim, **kwargs):
+    return ijepa_vit_huge(proj_dim, patch_size=14, **kwargs)
+
+
+def ijepa_vit_giant_p14(proj_dim, **kwargs):
+    return ijepa_vit_giant(proj_dim, patch_size=14, **kwargs)
+
+
+def ijepa_vit_h14(proj_dim, **kwargs):
+    return ijepa_vit_huge(proj_dim, patch_size=14, **kwargs)
