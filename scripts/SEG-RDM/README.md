@@ -2,7 +2,6 @@
 
 Standalone port of the RDM training pipeline from the local RCG repo. Uses OmegaConf configs with target/params blocks and preserves the original DDPM/DDIM math, conditioning flow, and pretrained encoder path.
 
-Testing
 
 ## Quick start
 
