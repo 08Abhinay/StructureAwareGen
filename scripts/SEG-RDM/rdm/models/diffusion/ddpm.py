@@ -104,6 +104,8 @@ class DDPM(nn.Module):
         else:
             betas = make_beta_schedule(beta_schedule, timesteps, linear_start=linear_start, linear_end=linear_end,
                                        cosine_s=cosine_s)
+        # Ensure a plain numpy array (avoids OmegaConf/ListConfig or Tensor quirks).
+        betas = np.asarray(betas, dtype=np.float64)
         alphas = 1. - betas
         alphas_cumprod = np.cumprod(alphas, axis=0)
         alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
