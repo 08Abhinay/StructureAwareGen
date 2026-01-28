@@ -28,22 +28,22 @@ def train_one_epoch(model: torch.nn.Module,
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
-    # for data_iter_step, (samples, class_label) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (samples, class_label) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         # iterable = metric_logger.log_every(data_loader, print_freq, header)
 
         ##############
         ##############
-    iterable = data_loader  # <-- debugger friendly
-    # for data_iter_step, batch in enumerate(iterable):
-    it = iter(iterable)      # or iter(data_loader) to bypass logger
-    data_iter_step = 0
+    # iterable = data_loader  # <-- debugger friendly
+    # # for data_iter_step, batch in enumerate(iterable):
+    # it = iter(iterable)      # or iter(data_loader) to bypass logger
+    # data_iter_step = 0
 
-    while True:
-        try:
-            batch = next(it)   # <-- put breakpoint here
-        except StopIteration:
-            break
-        samples, class_label = batch
+    # while True:
+    #     try:
+    #         batch = next(it)   # <-- put breakpoint here
+    #     except StopIteration:
+    #         break
+    #     samples, class_label = batch
         ###############
         ##############
         
@@ -87,7 +87,7 @@ def train_one_epoch(model: torch.nn.Module,
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
             log_writer.add_scalar('lr', lr, epoch_1000x)
-        data_iter_step += 1
+        # data_iter_step += 1
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
