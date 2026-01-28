@@ -4,6 +4,9 @@ import torch
 import numpy as np
 
 from rdm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like
+from rdm.env_debug import print_env
+print_env(__name__, globals())
+
 
 
 class DDIMSampler(object):

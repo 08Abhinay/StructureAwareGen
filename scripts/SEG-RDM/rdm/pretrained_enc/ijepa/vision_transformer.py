@@ -17,6 +17,9 @@ from .utils import (
     repeat_interleave_batch
 )
 from .masks import apply_masks
+from rdm.env_debug import print_env
+print_env(__name__, globals())
+
 
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):

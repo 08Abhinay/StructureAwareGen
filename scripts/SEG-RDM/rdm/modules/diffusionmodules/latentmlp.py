@@ -1,6 +1,9 @@
 import torch.nn as nn
 
 from rdm.modules.diffusionmodules.util import (
+from rdm.env_debug import print_env
+print_env(__name__, globals())
+
     zero_module,
     timestep_embedding,
 )

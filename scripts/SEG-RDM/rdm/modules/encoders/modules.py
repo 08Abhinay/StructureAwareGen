@@ -1,4 +1,7 @@
 import torch.nn as nn
+from rdm.env_debug import print_env
+print_env(__name__, globals())
+
 
 
 class AbstractEncoder(nn.Module):
@@ -22,4 +25,3 @@ class ClassEmbedder(nn.Module):
         c = batch[key][:, None]
         c = self.embedding(c)
         return c
-

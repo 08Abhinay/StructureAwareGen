@@ -5,6 +5,9 @@ from rdm.pretrained_enc.dino import vits as dino_vits
 from rdm.pretrained_enc.ibot import vits as ibot_vits
 from rdm.pretrained_enc.deit import vits as deit_vits
 from rdm.pretrained_enc.ijepa import vision_transformer as ijepa_vits
+from rdm.env_debug import print_env
+print_env(__name__, globals())
+
 
 
 def build_mlp(num_layers, input_dim, mlp_dim, output_dim, last_bn=True):

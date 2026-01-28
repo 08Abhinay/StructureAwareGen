@@ -10,6 +10,9 @@ from rdm.util import exists, default, count_params, instantiate_from_config, ran
 from rdm.modules.ema import LitEma
 from rdm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from rdm.pretrained_enc import models_pretrained_enc
+from rdm.env_debug import print_env
+print_env(__name__, globals())
+
 
 
 __conditioning_keys__ = {'concat': 'c_concat',

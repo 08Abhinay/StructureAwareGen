@@ -10,6 +10,9 @@ import math
 import torch
 
 from logging import getLogger
+from rdm.env_debug import print_env
+print_env(__name__, globals())
+
 
 logger = getLogger()
 

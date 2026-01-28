@@ -14,6 +14,9 @@ from threading import Thread
 import numpy as np
 import torch
 import torch.distributed as dist
+from rdm.env_debug import print_env
+print_env(__name__, globals())
+
 
 
 def exists(x):

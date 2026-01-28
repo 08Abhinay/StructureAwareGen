@@ -15,6 +15,9 @@ import torch
 import torch.nn as nn
 
 from functools import partial
+from rdm.env_debug import print_env
+print_env(__name__, globals())
+
 
 
 def drop_path(x, drop_prob: float = 0., training: bool = False):

@@ -5,6 +5,9 @@ from typing import Iterable
 import torch
 
 from rdm import util
+from rdm.env_debug import print_env
+print_env(__name__, globals())
+
 
 
 def train_one_epoch(model: torch.nn.Module,

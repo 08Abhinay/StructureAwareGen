@@ -17,6 +17,9 @@ from omegaconf import OmegaConf
 from rdm import util
 from rdm.engine_rdm import train_one_epoch
 from rdm.models.diffusion.ddim import DDIMSampler
+from rdm.env_debug import print_env
+print_env(__name__, globals())
+
 
 
 def get_args_parser():

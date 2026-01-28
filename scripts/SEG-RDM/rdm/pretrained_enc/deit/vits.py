@@ -3,6 +3,9 @@
 import torch
 import torch.nn as nn
 from functools import partial
+from rdm.env_debug import print_env
+print_env(__name__, globals())
+
 
 try:
     from timm.models.vision_transformer import VisionTransformer, _cfg

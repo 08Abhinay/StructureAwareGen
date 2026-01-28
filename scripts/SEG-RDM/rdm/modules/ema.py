@@ -1,5 +1,8 @@
 import torch
 from torch import nn
+from rdm.env_debug import print_env
+print_env(__name__, globals())
+
 
 
 class LitEma(nn.Module):

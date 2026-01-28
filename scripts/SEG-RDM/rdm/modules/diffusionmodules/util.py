@@ -16,6 +16,9 @@ import numpy as np
 from einops import repeat
 
 from rdm.util import instantiate_from_config
+from rdm.env_debug import print_env
+print_env(__name__, globals())
+
 
 
 def make_beta_schedule(schedule, n_timestep, linear_start=1e-4, linear_end=2e-2, cosine_s=8e-3):
