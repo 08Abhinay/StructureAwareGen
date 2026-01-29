@@ -151,8 +151,31 @@ def _conv2d_gradfix(transpose, weight_shape, stride, padding, output_padding, di
             # Handle tuple return in PyTorch 2.x
             if isinstance(op, tuple):
                 op = op[0]
-            flags = [torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic, torch.backends.cudnn.allow_tf32]
-            grad_weight = op(weight_shape, grad_output, input, padding, stride, dilation, groups, *flags)
+            
+            # Ensure op is callable, otherwise fall back to PyTorch's native implementation
+            if op is None or not callable(op):
+                # Fallback: use PyTorch's autograd to compute weight gradients
+                with torch.enable_grad():
+                    input_tmp = input.detach().requires_grad_(False)
+                    grad_output_tmp = grad_output.detach().requires_grad_(False)
+                    
+                    # Compute gradient w.r.t. weights using conv backward
+                    if not transpose:
+                        # For regular convolution: grad_weight = conv(input.transpose, grad_output)
+                        grad_weight = torch.nn.grad.conv2d_weight(
+                            input_tmp, weight_shape, grad_output_tmp, 
+                            stride, padding, dilation, groups
+                        )
+                    else:
+                        # For transposed convolution
+                        grad_weight = torch.nn.grad.conv_transpose2d_weight(
+                            input_tmp, weight_shape, grad_output_tmp,
+                            stride, padding, output_padding, dilation, groups
+                        )
+            else:
+                flags = [torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic, torch.backends.cudnn.allow_tf32]
+                grad_weight = op(weight_shape, grad_output, input, padding, stride, dilation, groups, *flags)
+            
             assert grad_weight.shape == weight_shape
             ctx.save_for_backward(grad_output, input)
             return grad_weight
