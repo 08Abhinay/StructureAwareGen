@@ -50,10 +50,17 @@ def _should_use_custom_op(input):
         return False
     if input.device.type != 'cuda':
         return False
-    if any(torch.__version__.startswith(x) for x in ['1.7.', '1.8.', '1.9']):
+    if any(torch.__version__.startswith(x) for x in ['1.7.', '1.8.', '1.9', '1.10', '1.11', '1.12', '1.13', '2.']):
         return True
-    warnings.warn(f'conv2d_gradfix not supported on PyTorch {torch.__version__}. Falling back to torch.nn.functional.conv2d().')
-    return False
+    try:
+        torch._C._jit_get_operation('aten::cudnn_convolution_backward')
+        return True
+    except Exception:
+        warnings.warn(
+            f'conv2d_gradfix not supported on PyTorch {torch.__version__}. '
+            'Falling back to torch.nn.functional.conv2d().'
+        )
+        return False
 
 def _tuple_of_ints(xs, ndim):
     xs = tuple(xs) if isinstance(xs, (tuple, list)) else (xs,) * ndim
@@ -141,6 +148,9 @@ def _conv2d_gradfix(transpose, weight_shape, stride, padding, output_padding, di
         @staticmethod
         def forward(ctx, grad_output, input):
             op = torch._C._jit_get_operation('aten::cudnn_convolution_backward_weight' if not transpose else 'aten::cudnn_convolution_transpose_backward_weight')
+            # Handle tuple return in PyTorch 2.x
+            if isinstance(op, tuple):
+                op = op[0]
             flags = [torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic, torch.backends.cudnn.allow_tf32]
             grad_weight = op(weight_shape, grad_output, input, padding, stride, dilation, groups, *flags)
             assert grad_weight.shape == weight_shape

@@ -34,7 +34,7 @@ def grid_sample(input, grid):
 def _should_use_custom_op():
     if not enabled:
         return False
-    if any(torch.__version__.startswith(x) for x in ['1.7.', '1.8.', '1.9']):
+    if any(torch.__version__.startswith(x) for x in ['1.7.', '1.8.', '1.9', '1.10', '1.11', '1.12', '1.13', '2.']):
         return True
     try:
         torch._C._jit_get_operation('aten::grid_sampler_2d_backward')
@@ -69,7 +69,25 @@ class _GridSample2dBackward(torch.autograd.Function):
     @staticmethod
     def forward(ctx, grad_output, input, grid):
         op = torch._C._jit_get_operation('aten::grid_sampler_2d_backward')
-        grad_input, grad_grid = op(grad_output, input, grid, 0, 0, False)
+        if isinstance(op, tuple):
+            op = op[0]
+        # In PyTorch 2.x, need to call the operation correctly
+        if callable(op):
+            grad_input, grad_grid = op(grad_output, input, grid, 0, 0, False)
+        else:
+            # Fallback to native PyTorch grid_sample backward
+            grad_input = None
+            grad_grid = None
+            if grad_output.requires_grad:
+                # Use autograd to compute gradients
+                with torch.enable_grad():
+                    input_tmp = input.detach().requires_grad_(True)
+                    grid_tmp = grid.detach().requires_grad_(True)
+                    output = torch.nn.functional.grid_sample(input=input_tmp, grid=grid_tmp, mode='bilinear', padding_mode='zeros', align_corners=False)
+                    grad_input, grad_grid = torch.autograd.grad(
+                        outputs=output, inputs=(input_tmp, grid_tmp),
+                        grad_outputs=grad_output, allow_unused=True
+                    )
         ctx.save_for_backward(grid)
         return grad_input, grad_grid
 

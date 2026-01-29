@@ -100,7 +100,7 @@ def build_ijepa_encoder(
     - Returns pooled patch-token embeddings.
     """
     ckpt_path = os.path.expanduser(ckpt_path)
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state_dict = _strip_prefixes(_extract_state_dict(checkpoint))
 
     arch = _infer_arch(state_dict)
