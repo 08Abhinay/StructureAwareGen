@@ -2,37 +2,37 @@
 #SBATCH -A pfw-cs
 #SBATCH -p a100-40gb
 #SBATCH -q standby
-#SBATCH --job-name=rdm_ijepa_h14_2g_2n
-#SBATCH --nodes=2
+#SBATCH --job-name=rdm_ijepa_h14_2g_4n
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=2
 #SBATCH --cpus-per-task=32
 #SBATCH --mem-per-gpu=80G
 #SBATCH --time=04:00:00
-#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/rdm_ijepa_h14_2g_2n.out
-#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/rdm_ijepa_h14_2g_2n.err
+#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/rdm_ijepa_h14_2g_4n-batch_128/.out
+#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/rdm_ijepa_h14_2g_4n-batch_128/.err
 
 module load anaconda
 conda activate /scratch/gilbreth/abelde/Thesis/StructureAwareGen/SegmentationAwareGen
 
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export OMP_NUM_THREADS=$((SLURM_CPUS_PER_TASK / 2))
 
 cd /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM
 export PYTHONPATH="$PWD:$PYTHONPATH"
 
 mkdir -p /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES
-mkdir -p /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/2_nodes/ijepa_h14
+mkdir -p /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_128/ijepa_h14
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
 MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
 
 RESUME_ARG=""
-if ls /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/2_nodes/ijepa_h14/checkpoint-*.pth 1> /dev/null 2>&1; then
-  LAST_CKPT=$(ls -t /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/2_nodes/ijepa_h14/checkpoint-*.pth | head -n 1)
+if ls /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_128/ijepa_h14/checkpoint-*.pth 1> /dev/null 2>&1; then
+  LAST_CKPT=$(ls -t /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_128/ijepa_h14/checkpoint-*.pth | head -n 1)
   RESUME_ARG="--resume $LAST_CKPT"
 fi
 
-# One torchrun per node (srun launches 2 tasks total, 1 per node)
+# One torchrun per node (srun launches 4 tasks total, 1 per node)
 srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
   torchrun \
     --nnodes=$SLURM_NNODES \
@@ -47,8 +47,8 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
       --blr 1e-6 \
       --weight_decay 0.01 \
       --epochs 200 \
-      --batch_size 16 \
+      --batch_size 128 \
       --accum_iter 1 \
-      --output_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/2_nodes/ijepa_h14 \
+      --output_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_128/ijepa_h14 \
       --log_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm \
-      --data_path /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf
+      --data_path /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf \

@@ -3,14 +3,14 @@
 #SBATCH -p a30
 #SBATCH -q standby
 #SBATCH --job-name=rdm_ijepa_h14_2g
-#SBATCH --nodes=1
+#SBATCH --nodes=
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=2
 #SBATCH --cpus-per-task=10
 #SBATCH --mem-per-gpu=80G
 #SBATCH --time=04:00:00
-#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/rdm_ijepa_h14_2g-%j.out
-#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/rdm_ijepa_h14_2g-%j.err
+#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/rdm_ijepa_h14.out
+#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/rdm_ijepa_h14.err
 
 set -e
 set -o pipefail
