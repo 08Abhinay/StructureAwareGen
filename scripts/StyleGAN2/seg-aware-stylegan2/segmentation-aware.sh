@@ -42,29 +42,32 @@ python -c "import torch; print('is_available:', torch.cuda.is_available()); prin
 # ---- Prevent ~/.local pollution (important) ----
 export PYTHONNOUSERSITE=1
 
-# Keep PYTHONPATH controlled; add only the repo root.
-unset PYTHONPATH || true
-export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+# # Keep PYTHONPATH controlled; add only the repo root.
+# unset PYTHONPATH || true
+# export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
-mkdir -p "${REPO_ROOT}/SLRUM_OUTPUT_FILES"
-mkdir -p "${OUTDIR}"
+# mkdir -p "${REPO_ROOT}/SLRUM_OUTPUT_FILES"
+# mkdir -p "${OUTDIR}"
 
-cd "${REPO_ROOT}"
+# cd "${REPO_ROOT}"
 
-# ---- Run ----
-# If you later set GPUS>1, change #SBATCH --gpus-per-node too.
-# Some StyleGAN2 forks use torch.multiprocessing internally when --gpus > 1.
-python train.py \
-  --outdir "${OUTDIR}" \
-  --data "${DATA_PATH}" \
-  --gpus "${GPUS}" \
-  --cond 1 \
-  --ijepa_checkpoint "${IJEPA_CKPT}" \
-  --ijepa_lambda 1.0 \
-  --ijepa_image 256 \
-  --ijepa_input_channel 3 \
-  --extra_dim 1280 \
-  --ijepa_warmup_kimg 5.4 \
-  --sem_mixing_prob "${SEM_MIX}" \
-  --fusion_alpha "${FUSION_ALPHA}" \
-  --resume noresume
+# # ---- Run ----
+# # If you later set GPUS>1, change #SBATCH --gpus-per-node too.
+# # Some StyleGAN2 forks use torch.multiprocessing internally when --gpus > 1.
+# python train.py \
+#   --outdir "${OUTDIR}" \
+#   --data "${DATA_PATH}" \
+#   --gpus "${GPUS}" \
+#   --cond 1 \
+#   --ijepa_checkpoint "${IJEPA_CKPT}" \
+#   --ijepa_lambda 1.0 \
+#   --ijepa_image 256 \
+#   --ijepa_input_channel 3 \
+#   --extra_dim 1280 \
+#   --ijepa_warmup_kimg 5.4 \
+#   --sem_mixing_prob "${SEM_MIX}" \
+#   --fusion_alpha "${FUSION_ALPHA}" \
+#   --resume noresume
+
+
+python3 /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/StyleGAN2/seg-aware-stylegan2/versions.py
