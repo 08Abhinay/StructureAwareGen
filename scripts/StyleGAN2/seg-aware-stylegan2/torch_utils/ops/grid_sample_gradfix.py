@@ -71,9 +71,15 @@ class _GridSample2dBackward(torch.autograd.Function):
         op = torch._C._jit_get_operation('aten::grid_sampler_2d_backward')
         if isinstance(op, tuple):
             op = op[0]
-        # In PyTorch 2.x, need to call the operation correctly
+        # In PyTorch 2.x, the signature changed to include output_mask parameter
+        # output_mask is a bool[2] indicating which outputs to compute: [grad_input, grad_grid]
         if callable(op):
-            grad_input, grad_grid = op(grad_output, input, grid, 0, 0, False)
+            try:
+                # Try PyTorch 2.x signature with output_mask
+                grad_input, grad_grid = op(grad_output, input, grid, 0, 0, False, [True, True])
+            except TypeError:
+                # Fallback to PyTorch 1.x signature
+                grad_input, grad_grid = op(grad_output, input, grid, 0, 0, False)
         else:
             # Fallback to native PyTorch grid_sample backward
             grad_input = None
