@@ -154,24 +154,26 @@ def _conv2d_gradfix(transpose, weight_shape, stride, padding, output_padding, di
             
             # Ensure op is callable, otherwise fall back to PyTorch's native implementation
             if op is None or not callable(op):
-                # Fallback: use PyTorch's autograd to compute weight gradients
+                # Fallback: manually compute weight gradients using autograd
+                dummy_weight = torch.zeros(weight_shape, dtype=input.dtype, device=input.device, requires_grad=True)
                 with torch.enable_grad():
-                    input_tmp = input.detach().requires_grad_(False)
-                    grad_output_tmp = grad_output.detach().requires_grad_(False)
-                    
-                    # Compute gradient w.r.t. weights using conv backward
                     if not transpose:
-                        # For regular convolution: grad_weight = conv(input.transpose, grad_output)
-                        grad_weight = torch.nn.grad.conv2d_weight(
-                            input_tmp, weight_shape, grad_output_tmp, 
-                            stride, padding, dilation, groups
+                        # Regular convolution
+                        dummy_output = torch.nn.functional.conv2d(
+                            input, dummy_weight, None, stride, padding, dilation, groups
                         )
                     else:
-                        # For transposed convolution
-                        grad_weight = torch.nn.grad.conv_transpose2d_weight(
-                            input_tmp, weight_shape, grad_output_tmp,
-                            stride, padding, output_padding, dilation, groups
+                        # Transposed convolution
+                        dummy_output = torch.nn.functional.conv_transpose2d(
+                            input, dummy_weight, None, stride, padding, output_padding, groups, dilation
                         )
+                    # Compute gradient w.r.t. weights using chain rule
+                    grad_weight = torch.autograd.grad(
+                        outputs=dummy_output,
+                        inputs=dummy_weight,
+                        grad_outputs=grad_output,
+                        only_inputs=True
+                    )[0]
             else:
                 flags = [torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic, torch.backends.cudnn.allow_tf32]
                 grad_weight = op(weight_shape, grad_output, input, padding, stride, dilation, groups, *flags)
