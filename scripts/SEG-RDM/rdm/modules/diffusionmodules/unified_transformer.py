@@ -238,12 +238,16 @@ class UnifiedSegTransformer(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.LayerNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
+                # Only initialize if weight and bias exist (some LayerNorms don't have them)
+                if hasattr(module, 'weight') and module.weight is not None:
+                    nn.init.ones_(module.weight)
+                if hasattr(module, 'bias') and module.bias is not None:
+                    nn.init.zeros_(module.bias)
                 
         # Zero-initialize output projection for stable initialization
         nn.init.zeros_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
+        if self.output_proj.bias is not None:
+            nn.init.zeros_(self.output_proj.bias)
         
     def create_token_type_ids(self, seq_len: int, batch_size: int, device: torch.device) -> torch.Tensor:
         """
