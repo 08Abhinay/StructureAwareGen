@@ -16,8 +16,8 @@ import numpy as np
 from einops import repeat
 
 from rdm.util import instantiate_from_config
-from rdm.env_debug import print_env
-print_env(__name__, globals())
+# from rdm.env_debug import print_env
+# print_env(__name__, globals())
 
 
 

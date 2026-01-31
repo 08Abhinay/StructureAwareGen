@@ -47,8 +47,8 @@ model:
     pretrained_enc_config:
       target: rdm.pretrained_enc.models_pretrained_enc
       params:
-        pretrained_enc_arch: "vit_huge_ijepa"  # I-JEPA ViT-H/14
-        pretrained_enc_path: "/path/to/ijepa_checkpoint.pth"  # UPDATE THIS PATH
+        pretrained_enc_arch: "ijepa_vit_h14"  # I-JEPA ViT-H/14
+        pretrained_enc_path: "/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/pretrained_enc_ckpts/ijepa/IN1K-vit.h.14-300e.pth.tar"  # UPDATE THIS PATH
         proj_dim: 256  # Project I-JEPA output to 256-dim
         pretrained_enc_withproj: false
     

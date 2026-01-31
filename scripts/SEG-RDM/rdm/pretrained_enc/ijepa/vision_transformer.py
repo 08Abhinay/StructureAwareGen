@@ -17,8 +17,8 @@ from .utils import (
     repeat_interleave_batch
 )
 from .masks import apply_masks
-from rdm.env_debug import print_env
-print_env(__name__, globals())
+# from rdm.env_debug import print_env
+# print_env(__name__, globals())
 
 
 

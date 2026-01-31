@@ -5,8 +5,8 @@ from typing import Iterable
 import torch
 
 from rdm import util
-from rdm.env_debug import print_env
-print_env(__name__, globals())
+# from rdm.env_debug import print_env
+# print_env(__name__, globals())
 
 
 
