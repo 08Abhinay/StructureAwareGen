@@ -324,6 +324,12 @@ def main():
     parser.add_argument('--max_images', type=int, default=-1,
                         help='Maximum number of images to process (-1 for all)')
     
+    # Chunking support for parallel jobs
+    parser.add_argument('--start_index', type=int, default=0,
+                        help='Start index for processing (for parallel jobs)')
+    parser.add_argument('--end_index', type=int, default=-1,
+                        help='End index for processing (for parallel jobs, -1 for all)')
+    
     args = parser.parse_args()
     
     # Setup device
@@ -367,10 +373,20 @@ def main():
     
     image_paths = sorted(image_paths)
     
+    # Apply chunking for parallel jobs
+    total_images = len(image_paths)
+    start_idx = max(0, args.start_index)
+    end_idx = args.end_index if args.end_index > 0 else total_images
+    end_idx = min(end_idx, total_images)
+    
+    if start_idx > 0 or end_idx < total_images:
+        print(f"Chunking: processing images [{start_idx}:{end_idx}] out of {total_images}")
+        image_paths = image_paths[start_idx:end_idx]
+    
     if args.max_images > 0:
         image_paths = image_paths[:args.max_images]
     
-    print(f"Found {len(image_paths)} images")
+    print(f"Found {len(image_paths)} images to process")
     
     if len(image_paths) == 0:
         print("No images found! Check your image_dir path.")
