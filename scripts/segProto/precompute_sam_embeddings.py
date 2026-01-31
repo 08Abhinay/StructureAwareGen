@@ -147,6 +147,42 @@ def get_output_path(image_path, image_dir, output_dir):
     return output_base
 
 
+def validate_npz_file(npz_path, min_size_kb=1):
+    """
+    Validate that a .npz file is complete and not corrupted.
+    
+    Returns:
+        True if valid, False if corrupted/incomplete
+    """
+    try:
+        # Check file size (corrupted files are often 0 bytes or tiny)
+        file_size = npz_path.stat().st_size
+        if file_size < min_size_kb * 1024:
+            return False
+        
+        # Try to load and check required keys
+        data = np.load(npz_path)
+        required_keys = ['packed', 'shape', 'scores', 'label_map']
+        
+        for key in required_keys:
+            if key not in data:
+                data.close()
+                return False
+        
+        # Validate shapes are reasonable
+        shape = data['shape']
+        if len(shape) != 3 or shape[0] > 1000:  # More than 1000 masks is suspicious
+            data.close()
+            return False
+        
+        data.close()
+        return True
+        
+    except Exception:
+        # Any error during loading = corrupted file
+        return False
+
+
 def process_image(
     image_path,
     mask_generator,
@@ -163,8 +199,13 @@ def process_image(
     
     npz_path = output_base.parent / "masks_npz" / f"{output_base.name}.npz"
     
+    # Skip if exists AND is valid
     if skip_existing and npz_path.exists():
-        return None
+        if validate_npz_file(npz_path):
+            return None
+        else:
+            # File exists but is corrupted - reprocess
+            print(f"Warning: Corrupted file detected, reprocessing: {npz_path.name}")
     
     img_rgb = load_image_rgb(image_path)
     H, W, _ = img_rgb.shape
@@ -366,15 +407,42 @@ def main():
     
     # Get image paths
     print(f"Scanning for images in {args.image_dir}")
+    
+    # Check if directory exists
+    if not os.path.isdir(args.image_dir):
+        print(f"ERROR: Directory does not exist: {args.image_dir}")
+        return
+    
+    print(f"Directory exists. Searching for images recursively...")
     image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.JPEG', '*.JPG', '*.PNG']
     image_paths = []
+    
     for ext in image_extensions:
-        image_paths.extend(glob.glob(os.path.join(args.image_dir, '**', ext), recursive=True))
+        pattern = os.path.join(args.image_dir, '**', ext)
+        found = glob.glob(pattern, recursive=True)
+        if found:
+            print(f"  Found {len(found)} files matching {ext}")
+        image_paths.extend(found)
     
     image_paths = sorted(image_paths)
+    total_images = len(image_paths)
+    
+    print(f"Total images found: {total_images}")
+    
+    if total_images == 0:
+        print("\nNo images found! Debugging info:")
+        print(f"  Directory: {args.image_dir}")
+        print(f"  Directory exists: {os.path.isdir(args.image_dir)}")
+        print(f"  Tried patterns: {image_extensions}")
+        # Show subdirectories
+        try:
+            subdirs = [d for d in os.listdir(args.image_dir) if os.path.isdir(os.path.join(args.image_dir, d))]
+            print(f"  Subdirectories found: {subdirs[:10]} {'...' if len(subdirs) > 10 else ''}")
+        except Exception as e:
+            print(f"  Error listing subdirs: {e}")
+        return
     
     # Apply chunking for parallel jobs
-    total_images = len(image_paths)
     start_idx = max(0, args.start_index)
     end_idx = args.end_index if args.end_index > 0 else total_images
     end_idx = min(end_idx, total_images)
@@ -386,22 +454,36 @@ def main():
     if args.max_images > 0:
         image_paths = image_paths[:args.max_images]
     
-    print(f"Found {len(image_paths)} images to process")
+    print(f"Images to process (after chunking): {len(image_paths)}")
     
     if len(image_paths) == 0:
-        print("No images found! Check your image_dir path.")
+        print("No images in this chunk (all may be processed already).")
         return
     
     # Filter existing if skip_existing
     if args.skip_existing:
         filtered_paths = []
+        skipped_valid = 0
+        skipped_corrupted = 0
+        
         for img_path in image_paths:
             output_base = get_output_path(img_path, args.image_dir, args.output_dir)
             npz_path = output_base.parent / "masks_npz" / f"{output_base.name}.npz"
-            if not npz_path.exists():
-                filtered_paths.append(img_path)
+            
+            if npz_path.exists():
+                if validate_npz_file(npz_path):
+                    skipped_valid += 1
+                    continue  # Skip valid files
+                else:
+                    skipped_corrupted += 1
+                    # Will reprocess corrupted files
+            
+            filtered_paths.append(img_path)
         
-        print(f"Skipping {len(image_paths) - len(filtered_paths)} existing embeddings")
+        print(f"Skipped {skipped_valid} valid existing embeddings")
+        if skipped_corrupted > 0:
+            print(f"Found {skipped_corrupted} corrupted files - will reprocess")
+        
         image_paths = filtered_paths
         
         if len(image_paths) == 0:
