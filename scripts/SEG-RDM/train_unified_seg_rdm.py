@@ -42,6 +42,10 @@ class UnifiedSegRDMTrainer:
         print(f"Loaded config from: {config_path}")
         print(OmegaConf.to_yaml(self.config))
         
+        # Validate data alignment before training
+        print("\n=== Validating Data Alignment ===")
+        self.validate_data_alignment()
+        
         # Setup device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
@@ -84,6 +88,73 @@ class UnifiedSegRDMTrainer:
         # Initialize logging
         self.setup_logging()
         
+    def validate_data_alignment(self):
+        """Validate that images have corresponding SAM embeddings."""
+        import numpy as np
+        from PIL import Image
+        
+        image_dir = Path(self.config.data.params.image_dir)
+        mask_npz_dir = Path(self.config.data.params.mask_npz_dir)
+        
+        if not image_dir.exists():
+            print(f"Warning: Image directory not found: {image_dir}")
+            return
+        
+        if not mask_npz_dir.exists():
+            print(f"Warning: SAM embeddings directory not found: {mask_npz_dir}")
+            return
+        
+        # Find sample images
+        image_exts = ['.jpg', '.jpeg', '.png', '.JPEG', '.JPG', '.PNG']
+        sample_images = []
+        for ext in image_exts:
+            sample_images.extend(list(image_dir.rglob(f'*{ext}'))[:100])
+            if len(sample_images) >= 100:
+                break
+        
+        if len(sample_images) == 0:
+            print(f"Warning: No images found in {image_dir}")
+            return
+        
+        missing = []
+        invalid = []
+        
+        for img_path in sample_images[:20]:  # Check first 20
+            rel_path = img_path.relative_to(image_dir)
+            npz_path = mask_npz_dir / rel_path.parent / f"{rel_path.stem}.npz"
+            
+            if not npz_path.exists():
+                missing.append((str(img_path.name), str(npz_path)))
+            else:
+                try:
+                    data = np.load(npz_path)
+                    if 'emb' not in data:
+                        invalid.append((str(img_path.name), "Missing 'emb' key"))
+                    else:
+                        emb = data['emb']
+                        if emb.ndim != 2 or emb.shape[1] != 256:
+                            invalid.append((str(img_path.name), f"Invalid shape: {emb.shape}"))
+                except Exception as e:
+                    invalid.append((str(img_path.name), str(e)))
+        
+        if missing:
+            print(f"⚠ Warning: {len(missing)} sample images missing SAM embeddings")
+            for img, npz in missing[:3]:
+                print(f"  - {img} → {npz}")
+            if len(missing) > 3:
+                print(f"  ... and {len(missing) - 3} more")
+        
+        if invalid:
+            print(f"⚠ Warning: {len(invalid)} sample embeddings invalid")
+            for img, error in invalid[:3]:
+                print(f"  - {img}: {error}")
+        
+        if not missing and not invalid:
+            print(f"✓ Data alignment verified ({len(sample_images)} samples checked)")
+        else:
+            print(f"⚠ Please fix alignment issues before training")
+            print(f"  Run: python scripts/verify_data_alignment.py ...")
+    
     def setup_directories(self):
         """Create necessary directories."""
         self.checkpoint_dir = Path(self.config.training.checkpoint_dir)

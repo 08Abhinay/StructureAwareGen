@@ -115,7 +115,40 @@ def setup_training_loop_kwargs(
 
     assert data is not None
     assert isinstance(data, str)
-    args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
+    
+    # Determine if using AlignedSegDataset with pre-computed embeddings
+    use_seg_embeddings = config_kwargs.get('use_seg_embeddings', False)
+    sam_npz_dir = config_kwargs.get('sam_npz_dir', None)
+    ijepa_npz_dir = config_kwargs.get('ijepa_npz_dir', None)
+    max_segments = config_kwargs.get('max_segments', 250)
+    
+    if use_seg_embeddings:
+        if sam_npz_dir is None or ijepa_npz_dir is None:
+            raise UserError('--use-seg-embeddings requires --sam-npz-dir and --ijepa-npz-dir')
+        
+        args.training_set_kwargs = dnnlib.EasyDict(
+            class_name='training.aligned_seg_dataset.AlignedSegDataset',
+            path=data,
+            sam_npz_dir=sam_npz_dir,
+            ijepa_npz_dir=ijepa_npz_dir,
+            max_segments=max_segments,
+            use_labels=True,
+            max_size=None,
+            xflip=False
+        )
+        print(f'Using AlignedSegDataset with pre-computed embeddings')
+        print(f'  SAM embeddings: {sam_npz_dir}')
+        print(f'  I-JEPA embeddings: {ijepa_npz_dir}')
+        print(f'  Max segments: {max_segments}')
+    else:
+        args.training_set_kwargs = dnnlib.EasyDict(
+            class_name='training.dataset.ImageFolderDataset',
+            path=data,
+            use_labels=True,
+            max_size=None,
+            xflip=False
+        )
+    
     args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2)
     try:
         training_set = dnnlib.util.construct_class_by_name(**args.training_set_kwargs) # subclass of training.dataset.Dataset
@@ -466,6 +499,12 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--fusion_depth', help='How many layers of ijepa embeddings? ', type=int, default=4)
 @click.option('--sem_mixing_prob', help='Semantic cutoff? ', type=float, default=0.9)
 @click.option('--fusion_alpha', help=' Intesity of Ijepa? ', type=float, default=0.2)
+
+# Segmentation options
+@click.option('--sam-npz-dir', help='Directory with SAM .npz embeddings', metavar='DIR', type=str)
+@click.option('--ijepa-npz-dir', help='Directory with I-JEPA .npz embeddings', metavar='DIR', type=str)
+@click.option('--max-segments', help='Maximum number of segments', metavar='INT', type=int, default=250, show_default=True)
+@click.option('--use-seg-embeddings/--no-seg-embeddings', help='Use pre-computed segmentation embeddings', default=False, show_default=True)
 
 
 def main(ctx, outdir, dry_run, **config_kwargs):

@@ -259,7 +259,24 @@ def training_loop(
 
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
-            phase_real_img, phase_real_c = next(training_set_iterator)
+            batch_data = next(training_set_iterator)
+            
+            # Handle both dict format (AlignedSegDataset) and tuple format (regular dataset)
+            if isinstance(batch_data, dict):
+                phase_real_img = batch_data['image']
+                phase_real_c = batch_data['label']
+                phase_real_global_vec = batch_data['global_vec'].to(device).split(batch_gpu)
+                phase_real_seg_tokens = batch_data['seg_tokens'].to(device).split(batch_gpu)
+                phase_real_seg_pad_mask = batch_data['seg_pad_mask'].to(device).split(batch_gpu)
+                has_seg_data = True
+            else:
+                # Tuple format (image, label)
+                phase_real_img, phase_real_c = batch_data
+                phase_real_global_vec = None
+                phase_real_seg_tokens = None
+                phase_real_seg_pad_mask = None
+                has_seg_data = False
+            
             phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
@@ -283,7 +300,28 @@ def training_loop(
             for round_idx, (real_img, real_c, gen_z, gen_c) in enumerate(zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c)):
                 sync = (round_idx == batch_size // (batch_gpu * num_gpus) - 1)
                 gain = phase.interval
-                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, sync=sync, gain=gain)
+                
+                # Extract segmentation data for this round if available
+                if has_seg_data:
+                    real_global_vec = phase_real_global_vec[round_idx]
+                    real_seg_tokens = phase_real_seg_tokens[round_idx]
+                    real_seg_pad_mask = phase_real_seg_pad_mask[round_idx]
+                else:
+                    real_global_vec = None
+                    real_seg_tokens = None
+                    real_seg_pad_mask = None
+                
+                loss.accumulate_gradients(
+                    phase=phase.name,
+                    real_img=real_img,
+                    real_c=real_c,
+                    gen_z=gen_z,
+                    gen_c=gen_c,
+                    sync=sync,
+                    gain=gain,
+                    real_seg_tokens=real_seg_tokens,
+                    real_seg_pad_mask=real_seg_pad_mask
+                )
 
             # Update weights.
             phase.module.requires_grad_(False)
