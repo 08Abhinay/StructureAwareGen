@@ -193,9 +193,10 @@ def process_image(
     dedup_iou_thresh,
     save_mask_emb,
     output_base,
-    skip_existing=True
+    skip_existing=True,
+    amg_params=None
 ):
-    """Process a single image and save SAM embeddings."""
+    """Process a single image and save SAM embeddings and metadata."""
     
     npz_path = output_base.parent / "masks_npz" / f"{output_base.name}.npz"
     
@@ -313,6 +314,37 @@ def process_image(
         label_map=label_map,
         emb=embs,
     )
+    
+    # 6) Save metadata JSON
+    json_path = output_base.parent / "meta" / f"{output_base.name}.json"
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Build metadata for each mask
+    meta_masks = []
+    for new_id, k in enumerate(kept):
+        st = dict(k["stats"])
+        st.update({
+            "mask_index": int(new_id),
+            "orig_amg_index": int(k["orig_amg_index"]),
+            "score": float(k["score"]),
+            "predicted_iou": float(k["predicted_iou"]),
+            "stability_score": float(k["stability_score"]),
+            "area_px": int(k["area_px"]),
+            "bbox_xywh": k["bbox_xywh"],
+        })
+        meta_masks.append(st)
+    
+    # Save JSON
+    metadata = {
+        "image": str(image_path),
+        "device": str(device),
+        "num_masks": int(N),
+        "amg_params": amg_params or {},
+        "masks": meta_masks,
+    }
+    
+    with open(json_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
     
     return N
 
@@ -494,6 +526,20 @@ def main():
     print(f"\nProcessing {len(image_paths)} images...")
     total_masks = 0
     
+    # AMG parameters for metadata
+    amg_params = {
+        "points_per_side": args.points_per_side,
+        "pred_iou_thresh": args.pred_iou_thresh,
+        "stability_score_thresh": args.stability_score_thresh,
+        "box_nms_thresh": args.box_nms_thresh,
+        "crop_n_layers": args.crop_n_layers,
+        "crop_overlap_ratio": args.crop_overlap_ratio,
+        "crop_n_points_downscale_factor": args.crop_n_points_downscale,
+        "min_mask_region_area_post": args.min_mask_region_area,
+        "dedup_iou_thresh": args.dedup_iou_thresh,
+        "max_keep": args.max_keep,
+    }
+    
     for img_path in tqdm(image_paths, desc="Generating SAM masks"):
         output_base = get_output_path(img_path, args.image_dir, args.output_dir)
         
@@ -508,7 +554,8 @@ def main():
                 args.dedup_iou_thresh,
                 args.save_mask_emb,
                 output_base,
-                args.skip_existing
+                args.skip_existing,
+                amg_params
             )
             
             if n_masks is not None:
