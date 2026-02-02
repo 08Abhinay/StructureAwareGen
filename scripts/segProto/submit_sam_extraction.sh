@@ -10,7 +10,7 @@ set -euo pipefail
 
 # SLURM Configuration
 ACCOUNT="pfw-cs"
-PART="a30"  # or "a100" if available
+PART="a100-40gb"  # or "a100" if available
 QOS="standby"
 
 # Dataset splitting
@@ -19,11 +19,11 @@ TOTAL_IMAGES=1281167    # ImageNet-1K train set size
 CHUNK_SIZE=$((TOTAL_IMAGES / CHUNK))
 
 # Paths (UPDATE THESE!)
-IMAGE_DIR="/scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1k-hf/train"
-OUTPUT_DIR="/scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/sam_embeddings"
+IMAGE_DIR="/scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train"
+OUTPUT_DIR="/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/output_dir/sam_embeddings"
 CHECKPOINT="/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/segProto/checkpoints/sam_vit_b_01ec64.pth"
 SCRIPT="/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/segProto/precompute_sam_embeddings.py"
-LOGDIR="/scratch/gilbreth/abelde/Thesis/StructureAwareGen/logs/sam_extraction"
+LOGDIR="/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/"
 
 # SAM Parameters
 MODEL_TYPE="vit_b"
@@ -71,15 +71,15 @@ for ((job_id=0; job_id<CHUNK; job_id++)); do
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=1
-#SBATCH --cpus-per-task=20
+#SBATCH --cpus-per-task=1
 #SBATCH --mem=40G
-#SBATCH --time=24:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=${LOGDIR}/${JOBNAME}-%j.out
 #SBATCH --error=${LOGDIR}/${JOBNAME}-%j.err
 
 # Load environment
 module load anaconda
-conda activate /scratch/gilbreth/abelde/conda_env
+conda activate /scratch/gilbreth/abelde/Thesis/StructureAwareGen/SegmentationAwareGen
 
 # Job info
 echo "============================================================"
