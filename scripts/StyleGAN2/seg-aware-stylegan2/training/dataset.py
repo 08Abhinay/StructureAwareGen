@@ -90,7 +90,24 @@ class Dataset(torch.utils.data.Dataset):
         if self._xflip[idx]:
             assert image.ndim == 3 # CHW
             image = image[:, :, ::-1]
-        return image.copy(), self.get_label(idx)
+        
+        # Get image path if available (for SAM extraction)
+        image_path = self.get_path(idx)
+        
+        # Return dict format for consistency with AlignedSegDataset
+        if image_path is not None:
+            return {
+                'image': image.copy(),
+                'label': self.get_label(idx),
+                'paths': image_path
+            }
+        else:
+            # Fallback to tuple format if path not available
+            return image.copy(), self.get_label(idx)
+    
+    def get_path(self, idx):
+        """Get the file path for an image. Override in subclasses."""
+        return None
 
     def get_label(self, idx):
         label = self._get_raw_labels()[self._raw_idx[idx]]
@@ -233,5 +250,15 @@ class ImageFolderDataset(Dataset):
         labels = np.array(labels)
         labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
         return labels
+    
+    def get_path(self, idx):
+        """Get the full path to the image file."""
+        raw_idx = self._raw_idx[idx]
+        fname = self._image_fnames[raw_idx]
+        if self._type == 'dir':
+            return os.path.join(self._path, fname)
+        else:
+            # For zip files, return a virtual path
+            return f"{self._path}::{fname}"
 
 #----------------------------------------------------------------------------

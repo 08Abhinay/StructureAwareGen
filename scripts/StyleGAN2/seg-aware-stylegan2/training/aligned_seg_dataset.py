@@ -130,11 +130,15 @@ class AlignedSegDataset(ImageFolderDataset):
         if not self._use_labels:
             label = np.zeros_like(label)
         
+        # Get image path for SAM extraction (if needed)
+        image_path = super().get_path(idx)
+        
         return {
             'image': image,
             'label': label,
             'global_vec': global_vec,
             'seg_tokens': seg_tokens,
             'seg_pad_mask': seg_pad_mask,
-            'num_segments': num_segments
+            'num_segments': num_segments,
+            'paths': image_path
         }
