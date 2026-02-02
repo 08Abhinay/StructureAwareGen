@@ -29,7 +29,7 @@ python /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/segProto/precom
 
 echo "Finished!"
 # echo "Finished. Going to the next script for verifying!"
-
+#echo "Verifying data alignment now..."
 # python scripts/verify_data_alignment.py \
 #      --image_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train \
 #      --sam_npz_dir ... --ijepa_npz_dir ...
