@@ -83,8 +83,16 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
             grid_indices += [indices[x % len(indices)] for x in range(gw)]
             label_groups[label] = [indices[(i + gw) % len(indices)] for i in range(len(indices))]
 
-    # Load data.
-    images, labels = zip(*[training_set[i] for i in grid_indices])
+     # Load data.
+    data = [training_set[i] for i in grid_indices]
+    
+    # Handle both dict and tuple formats
+    if isinstance(data[0], dict):
+        images = [item['image'] for item in data]
+        labels = [item['label'] for item in data]
+    else:
+        images, labels = zip(*data)
+    
     return (gw, gh), np.stack(images), np.stack(labels)
 
 #----------------------------------------------------------------------------
