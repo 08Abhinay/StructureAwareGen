@@ -69,3 +69,4 @@ ENV/
 *.npz
 *.github/
 scripts/rcg
+*.JPEG
