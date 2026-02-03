@@ -84,7 +84,7 @@ def setup_training_loop_kwargs(
     sam_model_type = None,    # SAM model type: 'vit_b', 'vit_l', 'vit_h', default = 'vit_b'
     sam_max_masks = None,     # Maximum number of masks per image: <int>, default = 250
 ):
-
+    args = dnnlib.EasyDict()
     # ------------------------------------------
     # General options: gpus, snap, metrics, seed
     # ------------------------------------------
