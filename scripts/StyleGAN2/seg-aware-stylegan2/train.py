@@ -525,12 +525,12 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--ijepa_checkpoint', help='Provide the ijepa checkpoint for guided generation', type=str)
 @click.option('--ijepa_lambda', help='Frequency of ijepa', type=float, default=1.0)
 @click.option('--ijepa_image', help='Resolution of pretrained ijepa', type=int, default=256)
-@click.option('--ijepa_input_channel', help='RGB(3) or Grayscaled(1)?', type=int, default=1)
+@click.option('--ijepa_input_channel', help='RGB(3) or Grayscaled(1)?', type=int, default=3)
 @click.option('--extra_dim', help='what is the ijepa embedding dimension? ', type=int, default=384)
 @click.option('--ijepa_warmup_kimg', help='How many warm up images? ', type=float, default=100)
-@click.option('--fusion_depth', help='How many layers of ijepa embeddings? ', type=int, default=4)
-@click.option('--sem_mixing_prob', help='Semantic cutoff? ', type=float, default=0.9)
-@click.option('--fusion_alpha', help=' Intesity of Ijepa? ', type=float, default=0.2)
+@click.option('--fusion_depth', help='How many layers of ijepa embeddings? ', type=int, default=6)
+@click.option('--sem_mixing_prob', help='Semantic mixing probability (0=always full fusion)', type=float, default=0.0)
+@click.option('--fusion_alpha', help='Initial fusion strength (bounded by tanh)', type=float, default=0.3)
 
 # Segmentation options
 @click.option('--sam-npz-dir', help='Directory with SAM .npz embeddings', metavar='DIR', type=str)

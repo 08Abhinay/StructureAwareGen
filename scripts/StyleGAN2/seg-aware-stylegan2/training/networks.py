@@ -336,11 +336,11 @@ class IJEPAFusionMapping(torch.nn.Module):
         w_dim,                      # Intermediate latentW dimensionality.
         num_ws,                     # Number of Ws the generator expects.
         ijepa_dim        = 1280,    # Dimensionality of I‑JEPA embeddings.
-        fusion_depth     = 4,       # How many leading Ws receive additive fusion.
-        sem_mixing_prob  = 0.70,    # Chance to *truncate* the fusion depth.
+        fusion_depth     = 6,       # How many leading Ws receive additive fusion.
+        sem_mixing_prob  = 0.0,    # Chance to *truncate* the fusion depth.
         proj_hidden      = 1024,    # Hidden size inside the FC “MLPs”.
         lr_multiplier    = 0.01,     # LR multiplier for the FC layers.
-        fusion_alpha     = 0.2,
+        fusion_alpha     = 0.3,
         **map_kwargs,               # Forwarded to MappingNetwork.
     ):
         super().__init__()
@@ -407,8 +407,9 @@ class IJEPAFusionMapping(torch.nn.Module):
         mask   = mask.unsqueeze(2).to(w.dtype)                           # (B, num_ws, 1)
 
         # 5) Compute strength & apply in one go
-        strength = (self.alpha * sem_ramp)                  # (B,1,1)
-        shift = e_proj.view(B, 1, w_dim) * strength                  # (B,1,w_dim)
+        # Use tanh to bound alpha to [-1, 1] for stability
+        strength = (torch.tanh(self.alpha) * sem_ramp)     # (B,1,1)
+        shift = e_proj.view(B, 1, w_dim) * strength        # (B,1,w_dim)
         w = w + mask * shift
 
         return w
