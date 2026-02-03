@@ -76,6 +76,12 @@ def setup_training_loop_kwargs(
     sem_mixing_prob=0.9,
     fusion_alpha=0.2,
     
+    # Segmentation options (pre-computed embeddings)
+    sam_npz_dir = None,        # Directory with SAM .npz embeddings: <path>
+    ijepa_npz_dir = None,      # Directory with I-JEPA .npz embeddings: <path>
+    max_segments = None,       # Maximum number of segments: <int>, default = 250
+    use_seg_embeddings = None, # Use pre-computed segmentation embeddings: <bool>, default = False
+    
     # SAM kwargs (on-the-fly extraction with stochastic conditioning)
     sam_enabled = None,        # Enable SAM extraction: <bool>, default = False
     sam_prob = None,          # Probability of using SAM per batch: <float>, default = 0.25
@@ -85,6 +91,8 @@ def setup_training_loop_kwargs(
     sam_max_masks = None,     # Maximum number of masks per image: <int>, default = 250
 ):
     args = dnnlib.EasyDict()
+    desc = ''
+    
     # ------------------------------------------
     # General options: gpus, snap, metrics, seed
     # ------------------------------------------
@@ -124,10 +132,10 @@ def setup_training_loop_kwargs(
     assert isinstance(data, str)
     
     # Determine if using AlignedSegDataset with pre-computed embeddings
-    use_seg_embeddings = config_kwargs.get('use_seg_embeddings', False)
-    sam_npz_dir = config_kwargs.get('sam_npz_dir', None)
-    ijepa_npz_dir = config_kwargs.get('ijepa_npz_dir', None)
-    max_segments = config_kwargs.get('max_segments', 250)
+    if use_seg_embeddings is None:
+        use_seg_embeddings = False
+    if max_segments is None:
+        max_segments = 250
     
     if use_seg_embeddings:
         if sam_npz_dir is None or ijepa_npz_dir is None:
