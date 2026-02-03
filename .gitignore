@@ -70,3 +70,6 @@ ENV/
 *.github/
 scripts/rcg
 *JPEG
+
+# Ignore playground notebook in StyleGAN2 training
+scripts/StyleGAN2/seg-aware-stylegan2/training/playground.ipynb

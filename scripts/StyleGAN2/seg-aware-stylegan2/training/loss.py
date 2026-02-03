@@ -265,13 +265,15 @@ class StyleGAN2Loss(Loss):
                 # gen_img, gen_ws = self.run_G(gen_z[:batch_size], gen_c[:batch_size], e_ijepa=zero_embed[:batch_size],
                 #                              sem_ramp=0.0, sync=sync)
                 
+                # Disable segmentation conditioning during Gpl to avoid double-gradient error
+                # with efficient attention kernels (create_graph=True incompatible)
                 gen_img, gen_ws = self.run_G(
                     gen_z[:batch_size_pl], gen_c[:batch_size_pl],
                     e_ijepa=target_f_small,
                     sem_ramp=sem_ramp,
-                    seg_tokens=seg_tokens_pl,
-                    seg_pad_mask=seg_pad_mask_pl,
-                    seg_ramp=seg_ramp,
+                    seg_tokens=None,
+                    seg_pad_mask=None,
+                    seg_ramp=0.0,
                     sync=sync,
                 )
                 
