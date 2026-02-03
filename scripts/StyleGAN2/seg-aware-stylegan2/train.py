@@ -459,6 +459,11 @@ def subprocess_fn(rank, args, temp_dir):
     training_stats.init_multiprocessing(rank=rank, sync_device=sync_device)
     if rank != 0:
         custom_ops.verbosity = 'none'
+    
+    # Add rank and num_gpus to loss_kwargs for SAMExtractor
+    if hasattr(args, 'loss_kwargs'):
+        args.loss_kwargs.rank = rank
+        args.loss_kwargs.num_gpus = args.num_gpus
 
     # Execute training loop.
     training_loop.training_loop(rank=rank, **args)

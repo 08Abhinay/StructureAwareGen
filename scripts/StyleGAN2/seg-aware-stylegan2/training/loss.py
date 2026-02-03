@@ -34,7 +34,8 @@ class StyleGAN2Loss(Loss):
                  ijepa_ckpt=None, lambda_ijepa=0.0, ijepa_img=256, ijepa_in_ch=3,
                  ijepa_warmup_kimg=500,
                  sam_enabled=False, sam_prob=0.25, sam_checkpoint=None,
-                 sam_cache_dir=None, sam_model_type='vit_b', sam_max_masks=250):
+                 sam_cache_dir=None, sam_model_type='vit_b', sam_max_masks=250,
+                 rank=0, num_gpus=1):
         super().__init__()
         self.device = device
         self.G_mapping = G_mapping
@@ -62,7 +63,9 @@ class StyleGAN2Loss(Loss):
                 cache_dir=sam_cache_dir,
                 device=device,
                 model_type=sam_model_type,
-                max_masks=sam_max_masks
+                max_masks=sam_max_masks,
+                rank=rank,
+                world_size=num_gpus
             )
             print(f"[Loss] SAM extractor enabled with prob={sam_prob}")
         

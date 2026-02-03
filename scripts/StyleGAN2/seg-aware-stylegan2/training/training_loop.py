@@ -15,6 +15,7 @@ import psutil
 import PIL.Image
 import numpy as np
 import torch
+import torch.distributed as dist
 import dnnlib
 from torch_utils import misc
 from torch_utils import training_stats
@@ -23,6 +24,7 @@ from torch_utils.ops import grid_sample_gradfix
 
 import legacy
 from metrics import metric_main
+from training.sam_extractor import SAMExtractor, is_distributed, barrier
 
 #----------------------------------------------------------------------------
 
@@ -47,6 +49,113 @@ def custom_collate_fn(batch):
     else:
         # Tuple format - use default collate
         return torch.utils.data.default_collate(batch)
+
+#----------------------------------------------------------------------------
+
+def pre_extract_sam_embeddings(training_set, loss_kwargs, rank, num_gpus, device):
+    """
+    Pre-extract SAM embeddings for entire dataset in parallel across GPUs.
+    Each GPU processes a subset: images[rank::num_gpus]
+    
+    Args:
+        training_set: Training dataset
+        loss_kwargs: Loss kwargs containing SAM configuration
+        rank: Current process rank
+        num_gpus: Total number of GPUs
+        device: CUDA device
+    """
+    # Check if SAM is enabled
+    if not loss_kwargs.get('sam_enabled', False):
+        return
+    
+    sam_checkpoint = loss_kwargs.get('sam_checkpoint')
+    sam_cache_dir = loss_kwargs.get('sam_cache_dir')
+    
+    if sam_checkpoint is None or sam_cache_dir is None:
+        if rank == 0:
+            print("[Pre-extract] SAM enabled but checkpoint/cache_dir not provided, skipping pre-extraction")
+        return
+    
+    if rank == 0:
+        print()
+        print(f"Pre-extracting SAM embeddings across {num_gpus} GPU(s)...")
+        print(f"Total images: {len(training_set)}")
+        print(f"Cache directory: {sam_cache_dir}")
+    
+    # Create SAM extractor
+    extractor = SAMExtractor(
+        sam_checkpoint=sam_checkpoint,
+        cache_dir=sam_cache_dir,
+        device=device,
+        model_type=loss_kwargs.get('sam_model_type', 'vit_b'),
+        max_masks=loss_kwargs.get('sam_max_masks', 250),
+        rank=rank,
+        world_size=num_gpus
+    )
+    
+    # Collect all image paths
+    all_paths = []
+    for idx in range(len(training_set)):
+        data = training_set[idx]
+        if isinstance(data, dict) and 'paths' in data:
+            all_paths.append(data['paths'])
+        elif hasattr(training_set, 'get_path'):
+            path = training_set.get_path(idx)
+            if path:
+                all_paths.append(path)
+    
+    if len(all_paths) == 0:
+        if rank == 0:
+            print("[Pre-extract] No image paths found in dataset, skipping")
+        return
+    
+    # Get subset for this rank
+    rank_paths = extractor._get_rank_subset(all_paths)
+    
+    if rank == 0:
+        print(f"Each GPU will process ~{len(rank_paths)} images")
+    
+    # Process images for this rank
+    start_time = time.time()
+    processed = 0
+    total_rank = len(rank_paths)
+    
+    # Process in batches to show progress
+    batch_size = 10
+    for batch_start in range(0, total_rank, batch_size):
+        batch_end = min(batch_start + batch_size, total_rank)
+        batch_paths = rank_paths[batch_start:batch_end]
+        
+        # Extract or load from cache
+        _ = extractor.extract_or_load(batch_paths, image_tensors=None)
+        
+        processed += len(batch_paths)
+        
+        # Print progress every 50 images
+        if rank == 0 and processed % 50 == 0:
+            elapsed = time.time() - start_time
+            rate = processed / elapsed if elapsed > 0 else 0
+            print(f"  GPU {rank}: {processed}/{total_rank} images ({rate:.1f} img/sec)")
+    
+    # Wait for async writes to complete
+    extractor.async_writer.queue.join()
+    
+    elapsed = time.time() - start_time
+    if rank == 0:
+        stats = extractor.get_stats()
+        print(f"\nGPU {rank} completed: {processed} images in {elapsed:.1f}s")
+        print(f"  Cache hits: {stats['cache_hits']}, Cache misses: {stats['cache_misses']}")
+        print(f"  Hit rate: {stats['hit_rate']*100:.1f}%")
+    
+    # Synchronize all GPUs before proceeding
+    if num_gpus > 1:
+        if rank == 0:
+            print(f"\nWaiting for all {num_gpus} GPUs to complete...")
+        barrier()
+        
+        if rank == 0:
+            print(f"SAM extraction complete! All {len(all_paths)} images cached.")
+            print()
 
 #----------------------------------------------------------------------------
 
@@ -174,7 +283,9 @@ def training_loop(
         print('Image shape:', training_set.image_shape)
         print('Label shape:', training_set.label_shape)
         print()
-        
+    
+    # Pre-extract SAM embeddings if enabled (parallel across GPUs)
+    pre_extract_sam_embeddings(training_set, loss_kwargs, rank, num_gpus, device)
     
     # Construct networks.
     if rank == 0:
