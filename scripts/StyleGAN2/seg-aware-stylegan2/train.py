@@ -76,6 +76,12 @@ def setup_training_loop_kwargs(
     sem_mixing_prob=0.9,
     fusion_alpha=0.2,
     
+    # Pre-computed segmentation embeddings (NPZ files)
+    sam_npz_dir = None,       # Directory with SAM .npz files: <path>
+    ijepa_npz_dir = None,     # Directory with I-JEPA .npz files: <path>
+    max_segments = None,      # Maximum number of segments: <int>, default = 250
+    use_seg_embeddings = None, # Use pre-computed embeddings: <bool>, default = False
+    
     # SAM kwargs (on-the-fly extraction with stochastic conditioning)
     sam_enabled = None,        # Enable SAM extraction: <bool>, default = False
     sam_prob = None,          # Probability of using SAM per batch: <float>, default = 0.25
