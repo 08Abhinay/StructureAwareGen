@@ -276,7 +276,31 @@ def training_loop(
         print('Loading training set...')
     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs) # subclass of training.dataset.Dataset
     training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
-    training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, collate_fn=custom_collate_fn, **data_loader_kwargs))
+    # training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, collate_fn=custom_collate_fn, **data_loader_kwargs))
+    # Debug-friendly DataLoader: disable workers if debugging or single-GPU
+    debug_mode = os.environ.get('STYLEGAN_DEBUG', '0') == '1'
+    loader_kwargs = dict(data_loader_kwargs)
+    if debug_mode or num_gpus == 1:
+        if rank == 0:
+            print('[DEBUG MODE] Disabling DataLoader workers for debugging compatibility')
+        loader_kwargs['num_workers'] = 0
+        loader_kwargs['pin_memory'] = False
+        loader_kwargs['persistent_workers'] = False
+        loader_kwargs.pop('prefetch_factor', None)  # Only valid with num_workers>0
+
+    if rank == 0:
+        print(f'DataLoader config: {loader_kwargs}')
+
+    # Create DataLoader iterator (split for clearer debugging)
+    data_loader = torch.utils.data.DataLoader(
+        dataset=training_set,
+        sampler=training_set_sampler,
+        batch_size=batch_size//num_gpus,
+        collate_fn=custom_collate_fn,
+        **loader_kwargs
+    )
+    training_set_iterator = iter(data_loader)
+
     if rank == 0:
         print()
         print('Num images: ', len(training_set))
