@@ -10,6 +10,9 @@ from rdm.util import exists, default, count_params, instantiate_from_config, ran
 from rdm.modules.ema import LitEma
 from rdm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from rdm.pretrained_enc import models_pretrained_enc
+# from rdm.env_debug import print_env
+# print_env(__name__, globals())
+
 
 
 __conditioning_keys__ = {'concat': 'c_concat',
@@ -104,6 +107,8 @@ class DDPM(nn.Module):
         else:
             betas = make_beta_schedule(beta_schedule, timesteps, linear_start=linear_start, linear_end=linear_end,
                                        cosine_s=cosine_s)
+        # Ensure a plain numpy array (avoids OmegaConf/ListConfig or Tensor quirks).
+        betas = np.asarray(betas, dtype=np.float64)
         alphas = 1. - betas
         alphas_cumprod = np.cumprod(alphas, axis=0)
         alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
@@ -141,9 +146,9 @@ class DDPM(nn.Module):
 
         if self.parameterization == "eps":
             lvlb_weights = self.betas ** 2 / (
-                        2 * self.posterior_variance * to_torch(alphas) * (1 - self.alphas_cumprod))
+                        2 * self.posterior_variance * self.alphas_cumprod * (1 - self.alphas_cumprod))
         elif self.parameterization == "x0":
-            lvlb_weights = 0.5 * np.sqrt(torch.Tensor(alphas_cumprod)) / (2. * 1 - torch.Tensor(alphas_cumprod))
+            lvlb_weights = 0.5 * torch.sqrt(self.alphas_cumprod) / (2. * 1 - self.alphas_cumprod)
         else:
             raise NotImplementedError("mu not supported")
         # TODO how to choose this term
@@ -914,6 +919,261 @@ class RDM(DDPM):
                                   mask=mask, x0=x0)
 
 
+class UnifiedSegRDM(RDM):
+    """Unified Representation Diffusion Model for Global + Segmentation Tokens.
+    
+    Extends RDM to handle variable-length sequences:
+    - 1 global token (from I-JEPA encoder)
+    - N segmentation tokens (from SAM, N=145-200)
+    
+    Uses pre-computed SAM embeddings instead of computing them during training.
+    """
+    
+    def __init__(self, seg_npz_dir: str = None, max_segments: int = 250, *args, **kwargs):
+        """
+        Args:
+            seg_npz_dir: Path to directory containing SAM .npz files
+            max_segments: Maximum number of segments (for padding)
+        """
+        super().__init__(*args, **kwargs)
+        self.seg_npz_dir = seg_npz_dir
+        self.max_segments = max_segments
+        print(f"UnifiedSegRDM: max_segments={max_segments}, seg_npz_dir={seg_npz_dir}")
+        
+    def _to_diffusion_format(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Convert [B, N, C] to [B, C, 1, N] for DDPM compatibility."""
+        return tokens.permute(0, 2, 1).unsqueeze(2)
+    
+    def _from_diffusion_format(self, x: torch.Tensor) -> torch.Tensor:
+        """Convert [B, C, 1, N] to [B, N, C]."""
+        return x.squeeze(2).permute(0, 2, 1)
+    
+    @torch.no_grad()
+    def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
+                  cond_key=None, return_original_cond=False, bs=None):
+        """
+        Extract unified token sequence from batch.
+        
+        Returns:
+            x: [B, 256, 1, N+1] unified tokens (global + segments)
+            padding_mask: [B, N+1] boolean mask (True = padded)
+            c: conditioning (if any)
+        """
+        # Get global vector from I-JEPA (same as RDM)
+        x_img = super(UnifiedSegRDM, self).get_input(batch, k)  # Skip RDM.get_input, use DDPM.get_input
+        if bs is not None:
+            x_img = x_img[:bs]
+            
+        device = x_img.device
+        
+        # Extract global token using I-JEPA encoder (reuse existing code)
+        with torch.no_grad():
+            self.pretrained_encoder.eval()
+            mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+            x_normalized = (x_img - mean) / std
+            x_normalized = torch.nn.functional.interpolate(x_normalized, 224, mode='bicubic', align_corners=False)
+            rep = self.pretrained_encoder.forward_features(x_normalized)
+            
+            if rep.dim() == 3:
+                if hasattr(self.pretrained_encoder, "forward_head"):
+                    rep = self.pretrained_encoder.forward_head(
+                        rep, pre_logits=not self.pretrained_enc_withproj
+                    )
+                else:
+                    rep = rep[:, 0]
+                    if self.pretrained_enc_withproj:
+                        rep = self.pretrained_encoder.head(rep)
+            elif self.pretrained_enc_withproj:
+                rep = self.pretrained_encoder.head(rep)
+                
+        if self.pretrained_enc_proj is not None:
+            rep = self.pretrained_enc_proj(rep)
+            
+        # Normalize global vector
+        rep_std = torch.std(rep, dim=1, keepdim=True)
+        rep_mean = torch.mean(rep, dim=1, keepdim=True)
+        rep = (rep - rep_mean) / rep_std
+        rep = rep * self.input_scale
+        
+        global_vec = rep  # [B, 256]
+        
+        # Get segmentation tokens from batch (pre-computed SAM embeddings)
+        if 'seg_embs' in batch:
+            seg_tokens = batch['seg_embs'].to(device)  # [B, max_segments, 256]
+            num_segments = batch['num_segments']  # [B] actual segment counts
+        else:
+            raise ValueError("Batch must contain 'seg_embs' and 'num_segments' from SAM")
+            
+        # Create padding mask
+        B, max_seg, C = seg_tokens.shape
+        padding_mask = torch.zeros(B, max_seg + 1, dtype=torch.bool, device=device)
+        for i, n in enumerate(num_segments):
+            if n < max_seg:
+                padding_mask[i, n+1:] = True  # +1 to account for global token
+        
+        # Concatenate: [global, seg_1, ..., seg_N]
+        unified_tokens = torch.cat([
+            global_vec.unsqueeze(1),  # [B, 1, 256]
+            seg_tokens                # [B, max_segments, 256]
+        ], dim=1)  # [B, max_segments+1, 256]
+        
+        # Convert to DDPM format
+        x = self._to_diffusion_format(unified_tokens)  # [B, 256, 1, max_segments+1]
+        
+        # Handle conditioning (same as RDM)
+        if self.model.conditioning_key is not None:
+            if cond_key is None:
+                cond_key = self.cond_stage_key
+            if cond_key != self.first_stage_key:
+                if cond_key in ['caption', 'coordinates_bbox']:
+                    xc = batch[cond_key]
+                elif cond_key == 'class_label':
+                    xc = batch
+                else:
+                    xc = super(UnifiedSegRDM, self).get_input(batch, cond_key).to(device)
+            else:
+                xc = x
+            if not self.cond_stage_trainable or force_c_encode:
+                if isinstance(xc, dict) or isinstance(xc, list):
+                    c = self.get_learned_conditioning(xc)
+                else:
+                    c = self.get_learned_conditioning(xc.to(device))
+            else:
+                c = xc
+            if bs is not None:
+                c = c[:bs]
+        else:
+            c = None
+            xc = None
+            
+        out = [x, c, padding_mask]
+        if return_original_cond:
+            out.append(xc)
+        return out
+    
+    def apply_model(self, x_noisy, t, cond, padding_mask=None, return_ids=False):
+        """Apply model with padding mask support."""
+        if isinstance(cond, dict):
+            pass
+        else:
+            if not isinstance(cond, list):
+                cond = [cond]
+            key = 'c_concat' if self.model.conditioning_key == 'concat' else 'c_crossattn'
+            cond = {key: cond}
+        
+        # Pass padding mask to model
+        x_recon = self.model(x_noisy, t, padding_mask=padding_mask, **cond)
+        
+        if isinstance(x_recon, tuple) and not return_ids:
+            return x_recon[0]
+        else:
+            return x_recon
+    
+    def p_losses(self, x_start, cond, t, padding_mask=None, noise=None):
+        """Compute losses with padding mask support."""
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        model_output = self.apply_model(x_noisy, t, cond, padding_mask=padding_mask)
+        
+        loss_dict = {}
+        prefix = 'train' if self.training else 'val'
+        
+        if self.parameterization == "x0":
+            target = x_start
+        elif self.parameterization == "eps":
+            target = noise
+        else:
+            raise NotImplementedError()
+        
+        # Compute per-element loss
+        loss_simple = self.get_loss(model_output, target, mean=False)  # [B, C, 1, N]
+        
+        # Apply padding mask if provided
+        if padding_mask is not None:
+            # Expand mask to match loss shape: [B, N] -> [B, 1, 1, N]
+            mask_expanded = (~padding_mask).float().unsqueeze(1).unsqueeze(2)
+            loss_simple = loss_simple * mask_expanded
+            # Average over non-padded tokens only
+            loss_simple = loss_simple.sum(dim=[1, 2, 3]) / mask_expanded.sum(dim=[1, 2, 3]).clamp(min=1)
+        else:
+            loss_simple = loss_simple.mean(dim=[1, 2, 3])
+        
+        loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
+        
+        logvar = self.logvar.to(x_start.device)
+        logvar_t = logvar[t]
+        loss = loss_simple / torch.exp(logvar_t) + logvar_t
+        
+        if self.learn_logvar:
+            loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
+            loss_dict.update({'logvar': self.logvar.data.mean()})
+        
+        loss = self.l_simple_weight * loss.mean()
+        
+        # VLB loss with masking
+        loss_vlb_per_elem = self.get_loss(model_output, target, mean=False)
+        if padding_mask is not None:
+            loss_vlb_per_elem = loss_vlb_per_elem * mask_expanded
+            loss_vlb = (loss_vlb_per_elem.sum(dim=[1, 2, 3]) / mask_expanded.sum(dim=[1, 2, 3]).clamp(min=1))
+        else:
+            loss_vlb = loss_vlb_per_elem.mean(dim=(1, 2, 3))
+            
+        loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
+        loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
+        loss += (self.original_elbo_weight * loss_vlb)
+        loss_dict.update({f'{prefix}/loss': loss})
+        
+        return loss, loss_dict
+    
+    def forward(self, x, c, batch=None, gen_img=False, cfg=0.0, class_label_gen=None, *args, **kwargs):
+        """Forward pass with padding mask extraction."""
+        if gen_img:
+            return self.gen_imgs(cfg=cfg, class_label_gen=class_label_gen)
+        if batch is not None:
+            result = self.get_input(batch, self.first_stage_key)
+            x, c, padding_mask = result[0], result[1], result[2]
+            if isinstance(c, dict) and 'class_label' in c:
+                c = {'class_label': c['class_label']}
+        else:
+            padding_mask = kwargs.get('padding_mask', None)
+            
+        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=x.device).long()
+        if self.model.conditioning_key is not None:
+            assert c is not None
+            if self.cond_stage_trainable:
+                c = self.get_learned_conditioning(c)
+            if self.shorten_cond_schedule:
+                cond_ids = self.cond_ids.to(t.device)
+                tc = cond_ids[t]
+                c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
+        
+        loss, loss_dict = self.p_losses(x, c, t, padding_mask=padding_mask, *args, **kwargs)
+        if self.use_ema and batch is not None:
+            self.model_ema(self.model)
+        return loss, loss_dict
+    
+    @torch.no_grad()
+    def sample(self, cond, batch_size=16, return_intermediates=False, x_T=None,
+               verbose=True, timesteps=None, quantize_denoised=False,
+               mask=None, x0=None, shape=None, num_segments=180, **kwargs):
+        """Sample unified tokens (global + segments)."""
+        if shape is None:
+            # Shape: [B, 256, 1, num_segments+1]
+            shape = (batch_size, self.channels, 1, num_segments + 1)
+        if cond is not None:
+            if isinstance(cond, dict):
+                cond = {key: cond[key][:batch_size] if not isinstance(cond[key], list) else
+                list(map(lambda x: x[:batch_size], cond[key])) for key in cond}
+            else:
+                cond = [c[:batch_size] for c in cond] if isinstance(cond, list) else cond[:batch_size]
+        return self.p_sample_loop(cond,
+                                  shape,
+                                  return_intermediates=return_intermediates, x_T=x_T,
+                                  verbose=verbose, timesteps=timesteps, quantize_denoised=quantize_denoised,
+                                  mask=mask, x0=x0)
+
+
 class DiffusionWrapper(nn.Module):
     def __init__(self, diff_model_config, conditioning_key):
         super().__init__()
@@ -921,22 +1181,23 @@ class DiffusionWrapper(nn.Module):
         self.conditioning_key = conditioning_key
         assert self.conditioning_key in [None, 'concat', 'crossattn', 'hybrid', 'adm']
 
-    def forward(self, x, t, c_concat: list = None, c_crossattn: list = None):
+    def forward(self, x, t, c_concat: list = None, c_crossattn: list = None, padding_mask: torch.Tensor = None):
+        """Forward with optional padding mask support for variable-length sequences."""
         if self.conditioning_key is None:
-            out = self.diffusion_model(x, t)
+            out = self.diffusion_model(x, t, padding_mask=padding_mask)
         elif self.conditioning_key == 'concat':
             xc = torch.cat([x] + c_concat, dim=1)
-            out = self.diffusion_model(xc, t)
+            out = self.diffusion_model(xc, t, padding_mask=padding_mask)
         elif self.conditioning_key == 'crossattn':
             cc = torch.cat(c_crossattn, 1)
-            out = self.diffusion_model(x, t, context=cc)
+            out = self.diffusion_model(x, t, context=cc, padding_mask=padding_mask)
         elif self.conditioning_key == 'hybrid':
             xc = torch.cat([x] + c_concat, dim=1)
             cc = torch.cat(c_crossattn, 1)
-            out = self.diffusion_model(xc, t, context=cc)
+            out = self.diffusion_model(xc, t, context=cc, padding_mask=padding_mask)
         elif self.conditioning_key == 'adm':
             cc = c_crossattn[0]
-            out = self.diffusion_model(x, t, y=cc)
+            out = self.diffusion_model(x, t, y=cc, padding_mask=padding_mask)
         else:
             raise NotImplementedError()
 

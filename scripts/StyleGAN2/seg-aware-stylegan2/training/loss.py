@@ -12,8 +12,10 @@ from torch_utils import training_stats
 from torch_utils import misc
 from torch_utils.ops import conv2d_gradfix
 from training.ijepa_encoder import build_ijepa_encoder
+from training.sam_extractor import SAMExtractor, pad_embeddings_batch
 import torch.nn.functional as F
 import torch.nn as nn
+import random
 
 
 # ----------------------------------------------------------------------------
@@ -30,7 +32,9 @@ class StyleGAN2Loss(Loss):
                  augment_pipe=None, style_mixing_prob=0.9, r1_gamma=10,
                  pl_batch_shrink=2, pl_decay=0.01, pl_weight=2,
                  ijepa_ckpt=None, lambda_ijepa=0.0, ijepa_img=256, ijepa_in_ch=3,
-                 ijepa_warmup_kimg=500):
+                 ijepa_warmup_kimg=500,
+                 sam_enabled=False, sam_prob=0.25, sam_checkpoint=None,
+                 sam_cache_dir=None, sam_model_type='vit_b', sam_max_masks=250):
         super().__init__()
         self.device = device
         self.G_mapping = G_mapping
@@ -43,6 +47,27 @@ class StyleGAN2Loss(Loss):
         self.pl_decay = pl_decay
         self.pl_weight = pl_weight
         self.pl_mean = torch.zeros([], device=device)
+        
+        # ------------ SAM extractor (optional) -----------------------
+        self.sam_enabled = sam_enabled
+        self.sam_prob = sam_prob
+        self.sam_extractor = None
+        
+        if sam_enabled:
+            if sam_checkpoint is None or sam_cache_dir is None:
+                raise ValueError("sam_checkpoint and sam_cache_dir required when sam_enabled=True")
+            
+            self.sam_extractor = SAMExtractor(
+                sam_checkpoint=sam_checkpoint,
+                cache_dir=sam_cache_dir,
+                device=device,
+                model_type=sam_model_type,
+                max_masks=sam_max_masks
+            )
+            print(f"[Loss] SAM extractor enabled with prob={sam_prob}")
+        
+        # Separate RNG for SAM decisions (independent of training seed)
+        self.sam_rng = random.Random(42)
 
         # ------------ frozen I‑JEPA encoder ---------------------------
         self.enc, _ = build_ijepa_encoder(
@@ -80,6 +105,34 @@ class StyleGAN2Loss(Loss):
         elif c > self.expect_c:
             img = img.mean(1, keepdim=True)
         return self.enc(img)  # pool patch tokens
+    
+    # ------------------------------------------------------------------
+    # helper: SAM embeddings extraction or loading from cache
+    # ------------------------------------------------------------------
+    def _get_sam_embeddings(self, real_img, image_paths):
+        """
+        Extract or load SAM embeddings for a batch of images.
+        
+        Args:
+            real_img: (B, C, H, W) tensor in [-1, 1] range
+            image_paths: List of B image file paths
+            
+        Returns:
+            Tuple of (seg_tokens, seg_pad_mask) or (None, None) if no paths
+        """
+        if image_paths is None or len(image_paths) == 0:
+            return None, None
+        
+        if self.sam_extractor is None:
+            return None, None
+        
+        # Extract or load from cache
+        embeddings_list = self.sam_extractor.extract_or_load(image_paths, real_img)
+        
+        # Pad to batch format
+        seg_tokens, seg_pad_mask = pad_embeddings_batch(embeddings_list, device=self.device)
+        
+        return seg_tokens, seg_pad_mask
 
     def run_G(self, z, c, e_ijepa, sem_ramp, sync, seg_tokens=None, seg_pad_mask=None, seg_ramp=1.0):
         # Mapping (always returns ws, film)
@@ -115,13 +168,33 @@ class StyleGAN2Loss(Loss):
         return logits
     
     def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, sync, gain,
-                             real_seg_tokens=None, real_seg_pad_mask=None):
+                             real_seg_tokens=None, real_seg_pad_mask=None, image_paths=None):
 
         assert phase in ['Gmain', 'Greg', 'Gboth', 'Dmain', 'Dreg', 'Dboth']
         do_Gmain = (phase in ['Gmain', 'Gboth'])
         do_Dmain = (phase in ['Dmain', 'Dboth'])
         do_Gpl = (phase in ['Greg', 'Gboth']) and (self.pl_weight != 0)
         do_Dr1 = (phase in ['Dreg', 'Dboth']) and (self.r1_gamma != 0)
+        
+        # ───────────────── Stochastic SAM Conditioning ─────────────────────────
+        # Mode 2: sam_prob controls both extraction and usage (extract and use together)
+        # This is like dropout for conditioning - regularization and robustness
+        use_sam = False
+        if self.sam_enabled and image_paths is not None:
+            use_sam = self.sam_rng.random() < self.sam_prob
+            
+            if use_sam:
+                # Extract or load SAM embeddings from cache
+                sam_seg_tokens, sam_seg_pad_mask = self._get_sam_embeddings(real_img, image_paths)
+                
+                # Override pre-computed segmentation with SAM (if available)
+                if sam_seg_tokens is not None:
+                    real_seg_tokens = sam_seg_tokens
+                    real_seg_pad_mask = sam_seg_pad_mask
+            else:
+                # Don't use SAM this batch (stochastic conditioning)
+                real_seg_tokens = None
+                real_seg_pad_mask = None
 
 
         zero_embed = torch.zeros(gen_z.size(0), 2048, device=self.device)
@@ -192,13 +265,15 @@ class StyleGAN2Loss(Loss):
                 # gen_img, gen_ws = self.run_G(gen_z[:batch_size], gen_c[:batch_size], e_ijepa=zero_embed[:batch_size],
                 #                              sem_ramp=0.0, sync=sync)
                 
+                # Disable segmentation conditioning during Gpl to avoid double-gradient error
+                # with efficient attention kernels (create_graph=True incompatible)
                 gen_img, gen_ws = self.run_G(
                     gen_z[:batch_size_pl], gen_c[:batch_size_pl],
                     e_ijepa=target_f_small,
                     sem_ramp=sem_ramp,
-                    seg_tokens=seg_tokens_pl,
-                    seg_pad_mask=seg_pad_mask_pl,
-                    seg_ramp=seg_ramp,
+                    seg_tokens=None,
+                    seg_pad_mask=None,
+                    seg_ramp=0.0,
                     sync=sync,
                 )
                 

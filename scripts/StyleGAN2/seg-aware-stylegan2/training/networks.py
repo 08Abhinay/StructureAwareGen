@@ -255,10 +255,10 @@ class MappingNetwork(torch.nn.Module):
 class MLP(torch.nn.Sequential):
     """
     2‑layer MLP: (in_dim → hidden → out_dim) with LeakyReLU.
-    Default = 2048→1024→512, but dims are configurable.
+    Default = 1280→1024→512, but dims are configurable.
     """
 
-    def __init__(self, in_dim=2048, out_dim=512, hidden=1024):
+    def __init__(self, in_dim=1280, out_dim=512, hidden=1024):
         super().__init__(
             torch.nn.Linear(in_dim, hidden),
             torch.nn.LeakyReLU(0.2, inplace=True),
@@ -335,7 +335,7 @@ class IJEPAFusionMapping(torch.nn.Module):
         c_dim,                      # LabelC dimensionality.
         w_dim,                      # Intermediate latentW dimensionality.
         num_ws,                     # Number of Ws the generator expects.
-        ijepa_dim        = 2048,    # Dimensionality of I‑JEPA embeddings.
+        ijepa_dim        = 1280,    # Dimensionality of I‑JEPA embeddings.
         fusion_depth     = 4,       # How many leading Ws receive additive fusion.
         sem_mixing_prob  = 0.70,    # Chance to *truncate* the fusion depth.
         proj_hidden      = 1024,    # Hidden size inside the FC “MLPs”.
@@ -901,7 +901,7 @@ class Discriminator(torch.nn.Module):
                  block_kwargs={},  # Arguments for DiscriminatorBlock.
                  mapping_kwargs={},  # Arguments for MappingNetwork.
                  epilogue_kwargs={},  # Arguments for DiscriminatorEpilogue.
-                 ijepa_dim=2048,
+                 ijepa_dim=1280,
                  ):
         super().__init__()
         self.c_dim = c_dim
