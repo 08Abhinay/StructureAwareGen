@@ -26,6 +26,30 @@ from metrics import metric_main
 
 #----------------------------------------------------------------------------
 
+def custom_collate_fn(batch):
+    """
+    Custom collate function that handles dict batches with string paths.
+    PyTorch's default collate can't batch strings, so we keep them as lists.
+    Module-level function so it can be pickled for multiprocessing.
+    """
+    if isinstance(batch[0], dict):
+        # Dict format - batch each key separately
+        result = {}
+        for key in batch[0].keys():
+            values = [item[key] for item in batch]
+            if key == 'paths':
+                # Keep paths as list (can't stack strings)
+                result[key] = values
+            else:
+                # Stack tensors/arrays normally
+                result[key] = torch.utils.data.default_collate(values)
+        return result
+    else:
+        # Tuple format - use default collate
+        return torch.utils.data.default_collate(batch)
+
+#----------------------------------------------------------------------------
+
 def setup_snapshot_image_grid(training_set, random_seed=0):
     rnd = np.random.RandomState(random_seed)
     gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
@@ -129,28 +153,6 @@ def training_loop(
     torch.backends.cudnn.allow_tf32 = allow_tf32        # Allow PyTorch to internally use tf32 for convolutions
     conv2d_gradfix.enabled = True                       # Improves training speed.
     grid_sample_gradfix.enabled = True                  # Avoids errors with the augmentation pipe.
-
-    # Custom collate function for handling dict data with string paths
-    def custom_collate_fn(batch):
-        """
-        Custom collate function that handles dict batches with string paths.
-        PyTorch's default collate can't batch strings, so we keep them as lists.
-        """
-        if isinstance(batch[0], dict):
-            # Dict format - batch each key separately
-            result = {}
-            for key in batch[0].keys():
-                values = [item[key] for item in batch]
-                if key == 'paths':
-                    # Keep paths as list (can't stack strings)
-                    result[key] = values
-                else:
-                    # Stack tensors/arrays normally
-                    result[key] = torch.utils.data.default_collate(values)
-            return result
-        else:
-            # Tuple format - use default collate
-            return torch.utils.data.default_collate(batch)
 
     # Load training set.
     if rank == 0:
