@@ -75,9 +75,24 @@ def setup_training_loop_kwargs(
     fusion_depth=4,
     sem_mixing_prob=0.9,
     fusion_alpha=0.2,
+    
+    # Segmentation options (pre-computed embeddings)
+    sam_npz_dir = None,        # Directory with SAM .npz embeddings: <path>
+    ijepa_npz_dir = None,      # Directory with I-JEPA .npz embeddings: <path>
+    max_segments = None,       # Maximum number of segments: <int>, default = 250
+    use_seg_embeddings = None, # Use pre-computed segmentation embeddings: <bool>, default = False
+    
+    # SAM kwargs (on-the-fly extraction with stochastic conditioning)
+    sam_enabled = None,        # Enable SAM extraction: <bool>, default = False
+    sam_prob = None,          # Probability of using SAM per batch: <float>, default = 0.25
+    sam_checkpoint = None,    # Path to SAM checkpoint: <path>
+    sam_cache_dir = None,     # Directory to cache SAM embeddings: <path>
+    sam_model_type = None,    # SAM model type: 'vit_b', 'vit_l', 'vit_h', default = 'vit_b'
+    sam_max_masks = None,     # Maximum number of masks per image: <int>, default = 250
 ):
     args = dnnlib.EasyDict()
-
+    desc = ''
+    
     # ------------------------------------------
     # General options: gpus, snap, metrics, seed
     # ------------------------------------------
@@ -115,7 +130,40 @@ def setup_training_loop_kwargs(
 
     assert data is not None
     assert isinstance(data, str)
-    args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
+    
+    # Determine if using AlignedSegDataset with pre-computed embeddings
+    if use_seg_embeddings is None:
+        use_seg_embeddings = False
+    if max_segments is None:
+        max_segments = 250
+    
+    if use_seg_embeddings:
+        if sam_npz_dir is None or ijepa_npz_dir is None:
+            raise UserError('--use-seg-embeddings requires --sam-npz-dir and --ijepa-npz-dir')
+        
+        args.training_set_kwargs = dnnlib.EasyDict(
+            class_name='training.aligned_seg_dataset.AlignedSegDataset',
+            path=data,
+            sam_npz_dir=sam_npz_dir,
+            ijepa_npz_dir=ijepa_npz_dir,
+            max_segments=max_segments,
+            use_labels=True,
+            max_size=None,
+            xflip=False
+        )
+        print(f'Using AlignedSegDataset with pre-computed embeddings')
+        print(f'  SAM embeddings: {sam_npz_dir}')
+        print(f'  I-JEPA embeddings: {ijepa_npz_dir}')
+        print(f'  Max segments: {max_segments}')
+    else:
+        args.training_set_kwargs = dnnlib.EasyDict(
+            class_name='training.dataset.ImageFolderDataset',
+            path=data,
+            use_labels=True,
+            max_size=None,
+            xflip=False
+        )
+    
     args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2)
     try:
         training_set = dnnlib.util.construct_class_by_name(**args.training_set_kwargs) # subclass of training.dataset.Dataset
@@ -199,13 +247,25 @@ def setup_training_loop_kwargs(
 
     args.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=spec.lrate, betas=[0,0.99], eps=1e-8)
     args.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=spec.lrate, betas=[0,0.99], eps=1e-8)
-    # args.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss', r1_gamma=spec.gamma)
-    args.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss', r1_gamma=spec.gamma, 
-                                       ijepa_ckpt=ijepa_checkpoint,
-                                       lambda_ijepa=ijepa_lambda,
-                                       ijepa_img=ijepa_image,
-                                       ijepa_in_ch=ijepa_input_channel,
-                                       ijepa_warmup_kimg=ijepa_warmup_kimg)
+    
+    # Loss kwargs with I-JEPA and SAM parameters
+    args.loss_kwargs = dnnlib.EasyDict(
+        class_name='training.loss.StyleGAN2Loss',
+        r1_gamma=spec.gamma,
+        # I-JEPA parameters
+        ijepa_ckpt=ijepa_checkpoint,
+        lambda_ijepa=ijepa_lambda,
+        ijepa_img=ijepa_image,
+        ijepa_in_ch=ijepa_input_channel,
+        ijepa_warmup_kimg=ijepa_warmup_kimg,
+        # SAM parameters
+        sam_enabled=sam_enabled if sam_enabled is not None else False,
+        sam_prob=sam_prob if sam_prob is not None else 0.25,
+        sam_checkpoint=sam_checkpoint,
+        sam_cache_dir=sam_cache_dir,
+        sam_model_type=sam_model_type if sam_model_type is not None else 'vit_b',
+        sam_max_masks=sam_max_masks if sam_max_masks is not None else 250
+    )
     
     args.total_kimg = spec.kimg
     args.batch_size = spec.mb
@@ -466,6 +526,20 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--fusion_depth', help='How many layers of ijepa embeddings? ', type=int, default=4)
 @click.option('--sem_mixing_prob', help='Semantic cutoff? ', type=float, default=0.9)
 @click.option('--fusion_alpha', help=' Intesity of Ijepa? ', type=float, default=0.2)
+
+# Segmentation options
+@click.option('--sam-npz-dir', help='Directory with SAM .npz embeddings', metavar='DIR', type=str)
+@click.option('--ijepa-npz-dir', help='Directory with I-JEPA .npz embeddings', metavar='DIR', type=str)
+@click.option('--max-segments', help='Maximum number of segments', metavar='INT', type=int, default=250, show_default=True)
+@click.option('--use-seg-embeddings/--no-seg-embeddings', help='Use pre-computed segmentation embeddings', default=False, show_default=True)
+
+# SAM on-the-fly extraction options
+@click.option('--sam-enabled', help='Enable on-the-fly SAM extraction with stochastic conditioning', type=bool, default=False, show_default=True)
+@click.option('--sam-prob', help='Probability of using SAM per batch (stochastic conditioning)', type=float, default=0.25, show_default=True)
+@click.option('--sam-checkpoint', help='Path to SAM checkpoint file (e.g., sam_vit_b_01ec64.pth)', metavar='PATH', type=str)
+@click.option('--sam-cache-dir', help='Directory to cache SAM embeddings', metavar='DIR', type=str)
+@click.option('--sam-model-type', help='SAM model type', type=click.Choice(['vit_b', 'vit_l', 'vit_h']), default='vit_b', show_default=True)
+@click.option('--sam-max-masks', help='Maximum number of SAM masks per image', type=int, default=250, show_default=True)
 
 
 def main(ctx, outdir, dry_run, **config_kwargs):

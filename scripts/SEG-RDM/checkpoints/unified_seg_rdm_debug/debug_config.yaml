@@ -1,0 +1,99 @@
+data:
+  batch_size: 32
+  num_workers: 8
+  params:
+    batch_size: 2
+    file_ext: '*.jpg'
+    image_dir: /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/val2017/train
+    image_size: 256
+    mask_npz_dir: /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/sam_embeddings/
+    max_segments: 250
+    normalize: true
+    num_workers: 0
+  pin_memory: true
+  shuffle: true
+  target: rdm.data.seg_dataset.SegmentationMaskDataset
+inference:
+  batch_size: 8
+  ddpm_eta: 0.0
+  ddpm_steps: 1000
+  num_samples: 16
+  num_segments: 180
+  output_dir: samples/unified_seg_rdm
+  save_intermediates: false
+  visualize_attention: false
+  visualize_masks: true
+logging:
+  log_gradients: false
+  log_images: true
+  log_model_architecture: true
+  tensorboard_dir: /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/checkpoints/unified_seg_rdm_debug/tensorboard
+  use_tensorboard: true
+  use_wandb: true
+  wandb_entity: null
+  wandb_project: unified-seg-rdm
+  wandb_run_name: unified-seg-rdm-v1
+model:
+  params:
+    beta_schedule: linear
+    channels: 256
+    clip_denoised: false
+    cond_stage_config: __is_unconditional__
+    conditioning_key: null
+    image_size: 251
+    input_scale: 1.0
+    l_simple_weight: 1.0
+    learn_logvar: false
+    linear_end: 0.02
+    linear_start: 0.0001
+    loss_type: l2
+    max_segments: 250
+    original_elbo_weight: 0.0
+    parameterization: x0
+    pretrained_enc_config:
+      params:
+        pretrained_enc_arch: ijepa_vit_h14
+        pretrained_enc_path: /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/pretrained_enc_ckpts/ijepa/IN1K-vit.h.14-300e.pth.tar
+        pretrained_enc_withproj: false
+        proj_dim: 256
+      target: rdm.pretrained_enc.models_pretrained_enc
+    scale_by_std: false
+    scale_factor: 1.0
+    seg_npz_dir: /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/segProto/out/masks_npz
+    timesteps: 1000
+    unet_config:
+      params:
+        d_ff: 3072
+        d_model: 768
+        dropout: 0.1
+        max_seq_len: 256
+        n_heads: 12
+        n_layers: 8
+        time_emb_dim: 256
+        token_dim: 256
+      target: rdm.modules.diffusionmodules.unified_transformer.UnifiedSegTransformer
+    use_ema: true
+  target: rdm.models.diffusion.ddpm.UnifiedSegRDM
+training:
+  accumulate_grad_batches: 1
+  checkpoint_dir: /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/checkpoints/unified_seg_rdm_debug
+  checkpoint_interval: 25
+  gradient_clip_val: 1.0
+  learning_rate: 0.0001
+  log_every_n_steps: 100
+  log_interval: 5
+  max_steps: 50
+  num_gpus: 1
+  num_val_samples: 8
+  resume_from_checkpoint: null
+  save_checkpoint_every_n_steps: 10000
+  scheduler:
+    params:
+      T_max: 500000
+      eta_min: 1.0e-06
+    target: torch.optim.lr_scheduler.CosineAnnealingLR
+  strategy: ddp
+  use_fp16: false
+  val_check_interval: 5000
+  warmup_steps: 5000
+  weight_decay: 0.0

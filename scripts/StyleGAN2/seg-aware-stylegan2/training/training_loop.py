@@ -26,6 +26,30 @@ from metrics import metric_main
 
 #----------------------------------------------------------------------------
 
+def custom_collate_fn(batch):
+    """
+    Custom collate function that handles dict batches with string paths.
+    PyTorch's default collate can't batch strings, so we keep them as lists.
+    Module-level function so it can be pickled for multiprocessing.
+    """
+    if isinstance(batch[0], dict):
+        # Dict format - batch each key separately
+        result = {}
+        for key in batch[0].keys():
+            values = [item[key] for item in batch]
+            if key == 'paths':
+                # Keep paths as list (can't stack strings)
+                result[key] = values
+            else:
+                # Stack tensors/arrays normally
+                result[key] = torch.utils.data.default_collate(values)
+        return result
+    else:
+        # Tuple format - use default collate
+        return torch.utils.data.default_collate(batch)
+
+#----------------------------------------------------------------------------
+
 def setup_snapshot_image_grid(training_set, random_seed=0):
     rnd = np.random.RandomState(random_seed)
     gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
@@ -59,8 +83,16 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
             grid_indices += [indices[x % len(indices)] for x in range(gw)]
             label_groups[label] = [indices[(i + gw) % len(indices)] for i in range(len(indices))]
 
-    # Load data.
-    images, labels = zip(*[training_set[i] for i in grid_indices])
+     # Load data.
+    data = [training_set[i] for i in grid_indices]
+    
+    # Handle both dict and tuple formats
+    if isinstance(data[0], dict):
+        images = [item['image'] for item in data]
+        labels = [item['label'] for item in data]
+    else:
+        images, labels = zip(*data)
+    
     return (gw, gh), np.stack(images), np.stack(labels)
 
 #----------------------------------------------------------------------------
@@ -135,7 +167,7 @@ def training_loop(
         print('Loading training set...')
     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs) # subclass of training.dataset.Dataset
     training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
-    training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, **data_loader_kwargs))
+    training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, collate_fn=custom_collate_fn, **data_loader_kwargs))
     if rank == 0:
         print()
         print('Num images: ', len(training_set))
@@ -259,7 +291,35 @@ def training_loop(
 
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
-            phase_real_img, phase_real_c = next(training_set_iterator)
+            batch_data = next(training_set_iterator)
+            
+            # Handle both dict format and tuple format
+            if isinstance(batch_data, dict):
+                phase_real_img = batch_data['image']
+                phase_real_c = batch_data['label']
+                phase_image_paths = batch_data.get('paths', None)  # Extract image paths if available
+                
+                # Check if this is AlignedSegDataset (has pre-computed segmentations)
+                if 'global_vec' in batch_data and 'seg_tokens' in batch_data:
+                    phase_real_global_vec = batch_data['global_vec'].to(device).split(batch_gpu)
+                    phase_real_seg_tokens = batch_data['seg_tokens'].to(device).split(batch_gpu)
+                    phase_real_seg_pad_mask = batch_data['seg_pad_mask'].to(device).split(batch_gpu)
+                    has_seg_data = True
+                else:
+                    # Regular ImageFolderDataset with dict format (just paths)
+                    phase_real_global_vec = None
+                    phase_real_seg_tokens = None
+                    phase_real_seg_pad_mask = None
+                    has_seg_data = False
+            else:
+                # Tuple format (image, label) - legacy support
+                phase_real_img, phase_real_c = batch_data
+                phase_real_global_vec = None
+                phase_real_seg_tokens = None
+                phase_real_seg_pad_mask = None
+                phase_image_paths = None
+                has_seg_data = False
+            
             phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
@@ -283,7 +343,37 @@ def training_loop(
             for round_idx, (real_img, real_c, gen_z, gen_c) in enumerate(zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c)):
                 sync = (round_idx == batch_size // (batch_gpu * num_gpus) - 1)
                 gain = phase.interval
-                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, sync=sync, gain=gain)
+                
+                # Extract segmentation data for this round if available
+                if has_seg_data:
+                    real_global_vec = phase_real_global_vec[round_idx]
+                    real_seg_tokens = phase_real_seg_tokens[round_idx]
+                    real_seg_pad_mask = phase_real_seg_pad_mask[round_idx]
+                else:
+                    real_global_vec = None
+                    real_seg_tokens = None
+                    real_seg_pad_mask = None
+                
+                # Extract image paths for this round (for SAM extraction)
+                round_image_paths = None
+                if phase_image_paths is not None and len(phase_image_paths) > 0:
+                    # Split paths for this GPU/round
+                    start_idx = round_idx * batch_gpu
+                    end_idx = start_idx + batch_gpu
+                    round_image_paths = phase_image_paths[start_idx:end_idx]
+                
+                loss.accumulate_gradients(
+                    phase=phase.name,
+                    real_img=real_img,
+                    real_c=real_c,
+                    gen_z=gen_z,
+                    gen_c=gen_c,
+                    sync=sync,
+                    gain=gain,
+                    real_seg_tokens=real_seg_tokens,
+                    real_seg_pad_mask=real_seg_pad_mask,
+                    image_paths=round_image_paths
+                )
 
             # Update weights.
             phase.module.requires_grad_(False)

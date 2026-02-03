@@ -30,7 +30,7 @@ def load_checkpoint(
     scaler,
 ):
     try:
-        checkpoint = torch.load(r_path, map_location=torch.device('cpu'))
+        checkpoint = torch.load(r_path, map_location=torch.device('cpu'), weights_only=False)
         epoch = checkpoint['epoch']
 
         # -- loading encoder
