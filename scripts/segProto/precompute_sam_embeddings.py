@@ -520,6 +520,10 @@ def main():
     
     # Print workload for ALL ranks to verify distribution
     print(f"[Rank {rank}] Assigned {len(image_paths)} images to process")
+    # Show first 3 images to verify different assignments
+    if len(image_paths) >= 3:
+        sample_names = [os.path.basename(p) for p in image_paths[:3]]
+        print(f"[Rank {rank}] First 3 images: {sample_names}")
     
     if len(image_paths) == 0:
         print(f"[Rank {rank}] No images to process on this GPU.")
