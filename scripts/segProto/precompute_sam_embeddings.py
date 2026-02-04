@@ -500,17 +500,43 @@ def main():
             print(f"  Tried patterns: {image_extensions}")
         return
     
-    # Apply subset selection (deterministic across all ranks)
+    # Apply stratified subset selection (balanced per-class sampling)
     if args.subset_fraction < 1.0:
+        if rank == 0:
+            print(f"Performing stratified sampling: {args.subset_fraction:.1%} per class...")
+        
+        # Group images by class (ImageNet folder structure: .../train/n01440764/image.JPEG)
+        from collections import defaultdict
+        class_images = defaultdict(list)
+        
+        for idx, img_path in enumerate(image_paths):
+            # Extract class ID from parent directory name
+            class_id = Path(img_path).parent.name
+            class_images[class_id].append(idx)
+        
+        # Sample subset_fraction from each class independently
         rng = np.random.RandomState(args.seed)
-        n_total = len(image_paths)
-        n_subset = int(n_total * args.subset_fraction)
-        indices = rng.choice(n_total, size=n_subset, replace=False)
-        indices = sorted(indices)  # Keep sorted for reproducibility
-        image_paths = [image_paths[i] for i in indices]
+        selected_indices = []
+        
+        for class_id in sorted(class_images.keys()):
+            indices = class_images[class_id]
+            n_class = len(indices)
+            n_sample = int(n_class * args.subset_fraction)
+            
+            # Ensure at least 1 image per class if fraction rounds to 0
+            if n_sample == 0 and n_class > 0:
+                n_sample = 1
+            
+            sampled = rng.choice(indices, size=n_sample, replace=False)
+            selected_indices.extend(sampled)
+        
+        selected_indices = sorted(selected_indices)
+        image_paths = [image_paths[i] for i in selected_indices]
         
         if rank == 0:
-            print(f"Subset selection: {args.subset_fraction:.1%} of dataset ({len(image_paths)} images)")
+            avg_per_class = len(image_paths) // len(class_images) if class_images else 0
+            print(f"Stratified selection: {len(image_paths)} images across {len(class_images)} classes")
+            print(f"Average per class: ~{avg_per_class} images ({args.subset_fraction:.1%} of each class)")
     
     # Distribute images across GPUs (strided for load balancing)
     image_paths = image_paths[rank::world_size]
