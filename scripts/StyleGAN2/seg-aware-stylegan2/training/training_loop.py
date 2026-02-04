@@ -362,6 +362,46 @@ def training_loop(
         print('Setting up training phases...')
     loss = dnnlib.util.construct_class_by_name(device=device, **ddp_modules, **loss_kwargs) # subclass of training.loss.Loss
     
+    # Initialize RDM sampler for mixed training (if enabled)
+    rdm_sampler = None
+    rdm_cache = None
+    rdm_checkpoint = loss_kwargs.get('rdm_checkpoint', None)
+    rdm_mix_prob = loss_kwargs.get('rdm_mix_prob', 0.0)
+    rdm_warmup_kimg = loss_kwargs.get('rdm_warmup_kimg', 10000)
+    
+    if rdm_checkpoint is not None and rdm_mix_prob > 0:
+        if rank == 0:
+            print(f'[RDM] Initializing RDM sampler from: {rdm_checkpoint}')
+            print(f'  Mix probability: {rdm_mix_prob}')
+            print(f'  Warmup kimg: {rdm_warmup_kimg}')
+        
+        try:
+            from training.rdm_sampler import RDMSampler, CachedRDMSampler
+            
+            # Initialize base sampler
+            base_sampler = RDMSampler(
+                rdm_checkpoint_path=rdm_checkpoint,
+                device=device,
+                use_ema=True,
+                ddim_steps=50  # Fast sampling
+            )
+            
+            # Use cached sampler for efficiency (only on rank 0 for now)
+            if rank == 0:
+                rdm_sampler = CachedRDMSampler(
+                    base_sampler,
+                    cache_size=500,  # Pre-generate 500 samples
+                    num_segments=180
+                )
+            
+            if rank == 0:
+                print('[RDM] Sampler initialized successfully')
+        except Exception as e:
+            if rank == 0:
+                print(f'[RDM] Warning: Failed to initialize RDM sampler: {e}')
+                print('[RDM] Continuing without RDM mixed training')
+            rdm_sampler = None
+    
     phases = []
     for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
         if reg_interval is None:
@@ -462,6 +502,39 @@ def training_loop(
             all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
             all_gen_c = torch.from_numpy(np.stack(all_gen_c)).pin_memory().to(device)
             all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
+            
+            # RDM Mixed Training: Replace real embeddings with RDM-sampled ones
+            # with probability rdm_mix_prob (after warmup)
+            if rdm_sampler is not None and has_seg_data and cur_nimg >= rdm_warmup_kimg * 1000:
+                # Compute current mix probability (gradual ramp-up)
+                progress = (cur_nimg - rdm_warmup_kimg * 1000) / (10000 * 1000)  # Ramp over 10M images
+                current_mix_prob = min(rdm_mix_prob, rdm_mix_prob * progress)
+                
+                # Decide whether to use RDM samples this batch
+                if np.random.rand() < current_mix_prob and rank == 0:
+                    try:
+                        # Sample from RDM (only rank 0 for simplicity)
+                        rdm_batch = rdm_sampler.sample(batch_size=batch_size)
+                        
+                        # Replace real embeddings with RDM-sampled ones
+                        # Note: We keep real images but use synthetic embeddings for conditioning
+                        # This teaches the decoder to handle RDM-sampled embeddings
+                        phase_real_seg_tokens = rdm_batch['seg_tokens'].to(device).split(batch_gpu)
+                        
+                        # Create padding masks (RDM generates fixed length, no padding)
+                        num_segments = rdm_batch['seg_tokens'].shape[1]
+                        rdm_pad_mask = torch.zeros(
+                            batch_size, num_segments, 
+                            dtype=torch.bool, device=device
+                        )
+                        phase_real_seg_pad_mask = rdm_pad_mask.split(batch_gpu)
+                        
+                        training_stats.report('Training/rdm_mixed_batch', 1.0)
+                    except Exception as e:
+                        if rank == 0:
+                            print(f'[RDM] Warning: Failed to sample from RDM: {e}')
+                        # Continue with real embeddings on error
+                        pass
 
         # Execute training phases.
         for phase, phase_gen_z, phase_gen_c in zip(phases, all_gen_z, all_gen_c):
