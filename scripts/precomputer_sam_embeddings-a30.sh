@@ -1,16 +1,16 @@
 #!/bin/bash
 #SBATCH -A pfw-cs
-#SBATCH -p a100-40gb
+#SBATCH -p a30
 #SBATCH -q standby
 #SBATCH --job-name=SAM_emb_extract
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=2
-#SBATCH --cpus-per-task=32
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=10
 #SBATCH --mem-per-gpu=80G
 #SBATCH --time=04:00:00
-#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/sam_embeddings.out
-#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/sam_embeddings.err
+#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/sam_embeddings-a30.out
+#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/sam_embeddings-a30.err
 
 set -e
 set -o pipefail
@@ -36,14 +36,14 @@ echo "Master node: $MASTER_ADDR:$MASTER_PORT"
 srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
   torchrun \
     --nnodes=$SLURM_NNODES \
-    --nproc_per_node=2 \
+    --nproc_per_node=1 \
     --node_rank=$SLURM_PROCID \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
     --rdzv_id=$SLURM_JOB_ID \
     /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/precompute_sam_embeddings.py \
       --data_path /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train \
-      --cache_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/StyleGAN2/seg-aware-stylegan2/sam_cache_unified \
+      --cache_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/StyleGAN2/seg-aware-stylegan2/sam_cache_unified-a30 \
       --subset_fraction 0.4 \
       --seed 42 \
       --batch_size 8 \
@@ -58,7 +58,7 @@ echo "Verifying cache completeness..."
 if [ $SLURM_PROCID -eq 0 ]; then
     python /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/verify_sam_cache.py \
          --data_path /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train \
-         --cache_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/StyleGAN2/seg-aware-stylegan2/sam_cache_unified \
+         --cache_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/StyleGAN2/seg-aware-stylegan2/sam_cache_unified-a30 \
          --subset_fraction 0.4 \
          --seed 42
 fi
