@@ -41,26 +41,13 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
     --rdzv_id=$SLURM_JOB_ID \
-    /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/precompute_sam_embeddings.py \
-      --data_path /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train \
-      --cache_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/StyleGAN2/seg-aware-stylegan2/sam_cache_unified \
+    /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/segProto/precompute_sam_embeddings.py \
+      --image_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train \
+      --output_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/sam_cache_unified \
+      --checkpoint /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/segProto/checkpoints/sam_vit_b_01ec64.pth \
       --subset_fraction 0.4 \
       --seed 42 \
-      --batch_size 8 \
-      --num_workers 4 \
-      --sam_model vit_b \
       --skip_existing
 
 echo "SAM extraction finished!"
-echo "Verifying cache completeness..."
-
-# Verify cache completeness (run on master node only)
-if [ $SLURM_PROCID -eq 0 ]; then
-    python /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/verify_sam_cache.py \
-         --data_path /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train \
-         --cache_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/StyleGAN2/seg-aware-stylegan2/sam_cache_unified \
-         --subset_fraction 0.4 \
-         --seed 42
-fi
-
-echo "All done! Cache ready for RDM and StyleGAN2 training."
+echo "Cache ready for RDM and StyleGAN2 training."
