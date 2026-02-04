@@ -36,14 +36,21 @@ def setup_ddp():
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ["LOCAL_RANK"])
         
+        # Debug: Print from all ranks before init
+        print(f"[Pre-init] Rank {rank}/{world_size}, Local rank {local_rank}, Hostname: {os.uname().nodename}")
+        
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
+        
+        # Debug: Confirm initialization
+        print(f"[Post-init] Rank {rank} successfully initialized on device {device}")
     else:
         rank = 0
         world_size = 1
         local_rank = 0
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[Single GPU mode] Using device {device}")
     
     return rank, world_size, local_rank, device
 
@@ -511,12 +518,11 @@ def main():
     if args.max_images > 0:
         image_paths = image_paths[:args.max_images]
     
-    if rank == 0:
-        print(f"Images per GPU (rank {rank}): {len(image_paths)}")
+    # Print workload for ALL ranks to verify distribution
+    print(f"[Rank {rank}] Assigned {len(image_paths)} images to process")
     
     if len(image_paths) == 0:
-        if rank == 0:
-            print("No images to process on this GPU.")
+        print(f"[Rank {rank}] No images to process on this GPU.")
         return
     
     # Filter existing if skip_existing
@@ -552,8 +558,7 @@ def main():
             return
     
     # Process images
-    if rank == 0:
-        print(f"\nProcessing {len(image_paths)} images on GPU {rank}...")
+    print(f"[Rank {rank}] Starting processing of {len(image_paths)} images...")
     total_masks = 0
     
     # AMG parameters for metadata
