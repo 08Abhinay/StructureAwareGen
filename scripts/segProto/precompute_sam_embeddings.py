@@ -575,7 +575,14 @@ def main():
         "max_keep": args.max_keep,
     }
     
-    pbar = tqdm(image_paths, desc=f"GPU {rank}") if rank == 0 else image_paths
+    # Show progress bar for all ranks with position to avoid overlap
+    pbar = tqdm(
+        image_paths, 
+        desc=f"Rank {rank}", 
+        position=rank, 
+        leave=True,
+        dynamic_ncols=True
+    )
     
     for img_path in pbar:
         output_base = get_output_path(img_path, args.image_dir, args.output_dir)
