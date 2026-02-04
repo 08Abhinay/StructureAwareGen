@@ -3,13 +3,14 @@
 Pre-compute SAM (Segment Anything Model) segmentation masks and embeddings.
 Saves masks, embeddings, and metadata as .npz and .json files.
 
-Usage:
-    python scripts/segProto/precompute_sam_embeddings.py \
+Usage (multi-GPU with DDP):
+    torchrun --nproc_per_node=4 scripts/segProto/precompute_sam_embeddings.py \
         --image_dir /path/to/images \
         --output_dir /path/to/output \
         --checkpoint /path/to/sam_checkpoint.pth \
         --model_type vit_b \
-        --max_keep 250
+        --max_keep 250 \
+        --subset_fraction 0.4
 """
 
 import os
@@ -19,12 +20,32 @@ import argparse
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from PIL import Image
 from tqdm import tqdm
 from scipy import ndimage as ndi
 from pathlib import Path
 
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
+
+
+def setup_ddp():
+    """Initialize DDP for multi-GPU processing."""
+    if "RANK" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        rank = 0
+        world_size = 1
+        local_rank = 0
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    return rank, world_size, local_rank, device
 
 
 def load_image_rgb(path: str) -> np.ndarray:
@@ -397,29 +418,28 @@ def main():
     parser.add_argument('--max_images', type=int, default=-1,
                         help='Maximum number of images to process (-1 for all)')
     
-    # Chunking support for parallel jobs
-    parser.add_argument('--start_index', type=int, default=0,
-                        help='Start index for processing (for parallel jobs)')
-    parser.add_argument('--end_index', type=int, default=-1,
-                        help='End index for processing (for parallel jobs, -1 for all)')
+    # DDP and subset support
+    parser.add_argument('--subset_fraction', type=float, default=1.0,
+                        help='Fraction of dataset to process (0.4 = 40%)')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for deterministic subset selection')
     
     args = parser.parse_args()
     
-    # Setup device
-    if torch.cuda.is_available() and 'cuda' in args.device:
-        device = torch.device(args.device)
-    else:
-        device = torch.device('cpu')
-        print("Warning: CUDA not available, using CPU (this will be slow)")
+    # Setup DDP (handles device automatically)
+    rank, world_size, local_rank, device = setup_ddp()
     
-    print(f"Using device: {device}")
+    if rank == 0:
+        print(f"Using {world_size} GPUs for parallel processing")
+        print(f"Device (rank {rank}): {device}")
     
     # Check checkpoint
     if not os.path.isfile(args.checkpoint):
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
     
     # Load SAM model
-    print(f"Loading SAM model ({args.model_type})...")
+    if rank == 0:
+        print(f"Loading SAM model ({args.model_type})...")
     sam = sam_model_registry[args.model_type](checkpoint=args.checkpoint).to(device)
     sam.eval()
     
@@ -438,58 +458,65 @@ def main():
     )
     
     # Get image paths
-    print(f"Scanning for images in {args.image_dir}")
+    if rank == 0:
+        print(f"Scanning for images in {args.image_dir}")
     
     # Check if directory exists
     if not os.path.isdir(args.image_dir):
-        print(f"ERROR: Directory does not exist: {args.image_dir}")
+        if rank == 0:
+            print(f"ERROR: Directory does not exist: {args.image_dir}")
         return
     
-    print(f"Directory exists. Searching for images recursively...")
+    if rank == 0:
+        print(f"Directory exists. Searching for images recursively...")
     image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.JPEG', '*.JPG', '*.PNG']
     image_paths = []
     
     for ext in image_extensions:
         pattern = os.path.join(args.image_dir, '**', ext)
         found = glob.glob(pattern, recursive=True)
-        if found:
+        if found and rank == 0:
             print(f"  Found {len(found)} files matching {ext}")
         image_paths.extend(found)
     
     image_paths = sorted(image_paths)
     total_images = len(image_paths)
     
-    print(f"Total images found: {total_images}")
+    if rank == 0:
+        print(f"Total images found: {total_images}")
     
     if total_images == 0:
-        print("\nNo images found! Debugging info:")
-        print(f"  Directory: {args.image_dir}")
-        print(f"  Directory exists: {os.path.isdir(args.image_dir)}")
-        print(f"  Tried patterns: {image_extensions}")
-        # Show subdirectories
-        try:
-            subdirs = [d for d in os.listdir(args.image_dir) if os.path.isdir(os.path.join(args.image_dir, d))]
-            print(f"  Subdirectories found: {subdirs[:10]} {'...' if len(subdirs) > 10 else ''}")
-        except Exception as e:
-            print(f"  Error listing subdirs: {e}")
+        if rank == 0:
+            print("\nNo images found! Debugging info:")
+            print(f"  Directory: {args.image_dir}")
+            print(f"  Directory exists: {os.path.isdir(args.image_dir)}")
+            print(f"  Tried patterns: {image_extensions}")
         return
     
-    # Apply chunking for parallel jobs
-    start_idx = max(0, args.start_index)
-    end_idx = args.end_index if args.end_index > 0 else total_images
-    end_idx = min(end_idx, total_images)
+    # Apply subset selection (deterministic across all ranks)
+    if args.subset_fraction < 1.0:
+        rng = np.random.RandomState(args.seed)
+        n_total = len(image_paths)
+        n_subset = int(n_total * args.subset_fraction)
+        indices = rng.choice(n_total, size=n_subset, replace=False)
+        indices = sorted(indices)  # Keep sorted for reproducibility
+        image_paths = [image_paths[i] for i in indices]
+        
+        if rank == 0:
+            print(f"Subset selection: {args.subset_fraction:.1%} of dataset ({len(image_paths)} images)")
     
-    if start_idx > 0 or end_idx < total_images:
-        print(f"Chunking: processing images [{start_idx}:{end_idx}] out of {total_images}")
-        image_paths = image_paths[start_idx:end_idx]
+    # Distribute images across GPUs (strided for load balancing)
+    image_paths = image_paths[rank::world_size]
     
     if args.max_images > 0:
         image_paths = image_paths[:args.max_images]
     
-    print(f"Images to process (after chunking): {len(image_paths)}")
+    if rank == 0:
+        print(f"Images per GPU (rank {rank}): {len(image_paths)}")
     
     if len(image_paths) == 0:
-        print("No images in this chunk (all may be processed already).")
+        if rank == 0:
+            print("No images to process on this GPU.")
         return
     
     # Filter existing if skip_existing
@@ -512,18 +539,21 @@ def main():
             
             filtered_paths.append(img_path)
         
-        print(f"Skipped {skipped_valid} valid existing embeddings")
-        if skipped_corrupted > 0:
+        if rank == 0:
+            print(f"Skipped {skipped_valid} valid existing embeddings")
+        if skipped_corrupted > 0 and rank == 0:
             print(f"Found {skipped_corrupted} corrupted files - will reprocess")
         
         image_paths = filtered_paths
         
         if len(image_paths) == 0:
-            print("All embeddings already exist!")
+            if rank == 0:
+                print("All embeddings already exist on this GPU!")
             return
     
     # Process images
-    print(f"\nProcessing {len(image_paths)} images...")
+    if rank == 0:
+        print(f"\nProcessing {len(image_paths)} images on GPU {rank}...")
     total_masks = 0
     
     # AMG parameters for metadata
@@ -540,7 +570,9 @@ def main():
         "max_keep": args.max_keep,
     }
     
-    for img_path in tqdm(image_paths, desc="Generating SAM masks"):
+    pbar = tqdm(image_paths, desc=f"GPU {rank}") if rank == 0 else image_paths
+    
+    for img_path in pbar:
         output_base = get_output_path(img_path, args.image_dir, args.output_dir)
         
         try:
@@ -562,13 +594,35 @@ def main():
                 total_masks += n_masks
                 
         except Exception as e:
-            print(f"\nError processing {img_path}: {e}")
+            if rank == 0:
+                print(f"\nError processing {img_path}: {e}")
             continue
     
-    print(f"\n✓ Successfully processed {len(image_paths)} images")
-    print(f"✓ Total masks generated: {total_masks}")
-    print(f"✓ Average masks per image: {total_masks / len(image_paths):.1f}")
-    print(f"✓ Saved to {args.output_dir}/masks_npz/")
+    # Aggregate statistics across GPUs
+    if world_size > 1:
+        dist.barrier()
+        
+        processed_tensor = torch.tensor([len(image_paths)], device=device)
+        masks_tensor = torch.tensor([total_masks], device=device)
+        
+        dist.all_reduce(processed_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(masks_tensor, op=dist.ReduceOp.SUM)
+        
+        total_processed = processed_tensor.item()
+        total_masks_all = masks_tensor.item()
+    else:
+        total_processed = len(image_paths)
+        total_masks_all = total_masks
+    
+    if rank == 0:
+        print(f"\n✓ Successfully processed {total_processed} images")
+        print(f"✓ Total masks generated: {total_masks_all}")
+        print(f"✓ Average masks per image: {total_masks_all / total_processed:.1f}")
+        print(f"✓ Saved to {args.output_dir}/masks_npz/")
+    
+    # Cleanup DDP
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
