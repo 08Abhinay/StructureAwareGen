@@ -1,14 +1,15 @@
 #!/bin/bash
 #SBATCH -A pfw-cs
-#SBATCH -p a100-40gb
-#SBATCH -q standby
+#SBATCH -p training
+#SBATCH -q training
 #SBATCH --job-name=SAM_emb_extract
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=2
+#SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem-per-gpu=80G
-#SBATCH --time=04:00:00
+#SBATCH --time=09:13:00
+#SBATCH --constraint=J
 #SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/sam_embeddings.out
 #SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/sam_embeddings.err
 
@@ -26,18 +27,15 @@ export OMP_NUM_THREADS=$((SLURM_CPUS_PER_TASK / 2))
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
 MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
 
-# Pre-extract SAM embeddings for 40% of ImageNet (parallel across 2 nodes × 2 GPUs)
+# Pre-extract SAM embeddings for 40% of ImageNet (parallel across 4 GPUs on 1 node)
 # This cache will be shared between RDM and StyleGAN2 training
 echo "Starting SAM embedding extraction..."
-echo "Using 2 nodes with 2 GPUs each (4 total GPUs) for 40% of ImageNet"
+echo "Using 1 node with 4 GPUs for 40% of ImageNet"
 echo "Master node: $MASTER_ADDR:$MASTER_PORT"
 
-# One torchrun per node (srun launches 2 tasks total, 1 per node)
-srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
-  torchrun \
-    --nnodes=$SLURM_NNODES \
-    --nproc_per_node=2 \
-    --node_rank=$SLURM_PROCID \
+torchrun \
+    --nnodes=1 \
+    --nproc_per_node=4 \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
     --rdzv_id=$SLURM_JOB_ID \
@@ -45,9 +43,13 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
       --image_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train \
       --output_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/sam_cache_unified \
       --checkpoint /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/segProto/checkpoints/sam_vit_b_01ec64.pth \
-      --subset_fraction 0.4 \
+      --subset_fraction 0.40 \
       --seed 42 \
-      --skip_existing
+      --skip_existing \
+      --points_per_side 32 \
+      --crop_n_layers 0 \
+      --max_keep 100 \
+      --pred_iou_thresh 0.82
 
 echo "SAM extraction finished!"
 echo "Cache ready for RDM and StyleGAN2 training."
