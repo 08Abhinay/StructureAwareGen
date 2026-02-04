@@ -514,29 +514,47 @@ def main():
             class_id = Path(img_path).parent.name
             class_images[class_id].append(idx)
         
-        # Sample subset_fraction from each class independently
+        # Sample subset_fraction from each class independently, considering existing files
         rng = np.random.RandomState(args.seed)
         selected_indices = []
         
         for class_id in sorted(class_images.keys()):
             indices = class_images[class_id]
             n_class = len(indices)
-            n_sample = int(n_class * args.subset_fraction)
+            n_target = int(n_class * args.subset_fraction)
             
             # Ensure at least 1 image per class if fraction rounds to 0
-            if n_sample == 0 and n_class > 0:
-                n_sample = 1
+            if n_target == 0 and n_class > 0:
+                n_target = 1
             
-            sampled = rng.choice(indices, size=n_sample, replace=False)
-            selected_indices.extend(sampled)
+            # Count existing extractions for this class
+            class_output_dir = Path(args.output_dir) / class_id / "masks_npz"
+            n_existing = 0
+            if class_output_dir.exists():
+                existing_npz = list(class_output_dir.glob("*.npz"))
+                n_existing = len(existing_npz)
+            
+            # Calculate how many more we need (can be 0 or negative if we have extras)
+            n_needed = max(0, n_target - n_existing)
+            
+            if rank == 0 and (n_existing > 0 or n_needed > 0):
+                status = f"existing={n_existing}, target={n_target}"
+                if n_needed > 0:
+                    print(f"  Class {class_id}: {status}, extracting {n_needed} more")
+                else:
+                    print(f"  Class {class_id}: {status}, sufficient (skipping)")
+            
+            # Only sample if we need more images
+            if n_needed > 0:
+                sampled = rng.choice(indices, size=n_needed, replace=False)
+                selected_indices.extend(sampled)
         
         selected_indices = sorted(selected_indices)
         image_paths = [image_paths[i] for i in selected_indices]
         
         if rank == 0:
-            avg_per_class = len(image_paths) // len(class_images) if class_images else 0
-            print(f"Stratified selection: {len(image_paths)} images across {len(class_images)} classes")
-            print(f"Average per class: ~{avg_per_class} images ({args.subset_fraction:.1%} of each class)")
+            print(f"Total images to extract: {len(image_paths)}")
+            print(f"Classes with sufficient data will be skipped by skip_existing logic")
     
     # Distribute images across GPUs (strided for load balancing)
     image_paths = image_paths[rank::world_size]
