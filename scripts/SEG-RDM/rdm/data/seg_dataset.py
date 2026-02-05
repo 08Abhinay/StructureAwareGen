@@ -95,8 +95,27 @@ class SegmentationMaskDataset(Dataset):
         npz_files = sorted(npz_files)
         print(f"Found {len(npz_files)} SAM .npz files")
         
-        # Build image paths by matching npz basenames
-        # For ImageNet structure: imagenet/train/{class_id}/{image_name}.JPEG
+        # Build image lookup table (fast: scan images once instead of checking each npz)
+        print(f"Building image lookup table from {image_dir}...")
+        image_lookup = {}  # {(class_id, basename): full_path}
+        
+        # Scan image directory structure
+        try:
+            class_dirs = [d for d in os.listdir(image_dir) 
+                         if os.path.isdir(os.path.join(image_dir, d)) and d.isdigit()]
+            
+            for class_id in class_dirs:
+                class_path = os.path.join(image_dir, class_id)
+                for img_file in os.listdir(class_path):
+                    if img_file.endswith(('.JPEG', '.jpg', '.jpeg', '.JPG', '.png', '.PNG')):
+                        basename = os.path.splitext(img_file)[0]
+                        image_lookup[(class_id, basename)] = os.path.join(class_path, img_file)
+            
+            print(f"  Found {len(image_lookup)} images")
+        except Exception as e:
+            print(f"  WARNING: Failed to build lookup: {e}")
+        
+        # Match npz files to images using lookup
         self.image_paths = []
         self.npz_paths = []  # Store corresponding npz paths for __getitem__
         missing_images = []
@@ -107,7 +126,6 @@ class SegmentationMaskDataset(Dataset):
             
             # Extract class folder from path structure
             # Path format: .../sam_cache_unified/{class_id}/masks_npz/{image_id}.npz
-            # Image format: imagenet/train/{class_id}/{image_id}.JPEG
             path_parts = npz_path.split(os.sep)
             class_folder = None
             for i, part in enumerate(path_parts):
@@ -115,26 +133,12 @@ class SegmentationMaskDataset(Dataset):
                     class_folder = path_parts[i-1]
                     break
             
-            found = False
-            for ext in ['.JPEG', '.jpg', '.jpeg', '.JPG', '.png', '.PNG']:
-                # Try with class folder first (ImageNet structure)
-                if class_folder:
-                    img_path = os.path.join(image_dir, class_folder, f"{npz_name}{ext}")
-                    if os.path.exists(img_path):
-                        self.image_paths.append(img_path)
-                        self.npz_paths.append(npz_path)
-                        found = True
-                        break
-                
-                # Fallback: try top-level
-                img_path = os.path.join(image_dir, f"{npz_name}{ext}")
-                if os.path.exists(img_path):
-                    self.image_paths.append(img_path)
-                    self.npz_paths.append(npz_path)
-                    found = True
-                    break
-            
-            if not found:
+            # Fast O(1) lookup instead of filesystem checks
+            if class_folder and (class_folder, npz_name) in image_lookup:
+                img_path = image_lookup[(class_folder, npz_name)]
+                self.image_paths.append(img_path)
+                self.npz_paths.append(npz_path)
+            else:
                 missing_images.append(npz_name)
         
         if missing_images and len(missing_images) < 10:
