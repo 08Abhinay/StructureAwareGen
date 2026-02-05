@@ -9,6 +9,10 @@ model:
     lambda_diversity: 0.1  # Diversity loss weight (prevents segment collapse)
     lambda_alignment: 0.05  # Alignment loss weight (global-segment consistency)
     
+    # IJEPA cache (optional - speeds up training by using pre-extracted embeddings)
+    # Set to null or omit to use runtime extraction instead
+    ijepa_cache_dir: /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/output_dir/ijepa_embeddings
+    
     # Diffusion parameters
     timesteps: 1000
     beta_schedule: "linear"

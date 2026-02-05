@@ -36,6 +36,7 @@ class SegmentationMaskDataset(Dataset):
         image_size: int = 256,
         file_ext: str = "*.jpg",
         normalize: bool = True,
+        ijepa_cache_dir: Optional[str] = None,
     ):
         """
         Args:
@@ -45,12 +46,14 @@ class SegmentationMaskDataset(Dataset):
             image_size: Target image size for resizing
             file_ext: File extension pattern for images (e.g., "*.jpg", "*.png")
             normalize: Whether to normalize images to [-1, 1] range (DDPM expects this)
+            ijepa_cache_dir: Optional directory with pre-cached IJEPA embeddings (speeds up training)
         """
         self.image_dir = image_dir
         self.mask_npz_dir = mask_npz_dir
         self.max_segments = max_segments
         self.image_size = image_size
         self.normalize = normalize
+        self.ijepa_cache_dir = ijepa_cache_dir
         
         # Find all images with corresponding SAM embeddings
         # Scan mask_npz_dir first, then find matching images
@@ -213,6 +216,28 @@ class SegmentationMaskDataset(Dataset):
                 scores = torch.zeros(0)
                 seg_masks = None
         
+        # Load pre-cached IJEPA embedding if available
+        ijepa_emb = None
+        if self.ijepa_cache_dir is not None:
+            # Extract class ID from image path (ImageNet structure: class_folder/image.JPEG)
+            # Try to find the class folder (parent directory of the image)
+            try:
+                # Get parent directory name (class ID for ImageNet)
+                parent_dir = os.path.basename(os.path.dirname(img_path))
+                # Try to find npz file in ijepa_cache_dir/{class_id}/{name}.npz
+                ijepa_npz_path = os.path.join(self.ijepa_cache_dir, parent_dir, f"{name}.npz")
+                
+                if os.path.exists(ijepa_npz_path):
+                    ijepa_data = np.load(ijepa_npz_path, allow_pickle=False)
+                    if 'emb' in ijepa_data:
+                        ijepa_emb = torch.from_numpy(ijepa_data['emb']).float()  # [1280] from ViT-H/14
+                    else:
+                        print(f"WARNING: 'emb' key not found in {ijepa_npz_path}")
+                # If not found, will fall back to runtime extraction in get_input()
+            except Exception as e:
+                print(f"Error loading IJEPA cache for {name}: {e}")
+                # Fall back to runtime extraction
+        
         # Build output dict
         output = {
             'image': image,
@@ -221,6 +246,10 @@ class SegmentationMaskDataset(Dataset):
             'scores': scores,  # [N]
             'filename': name,
         }
+        
+        # Add IJEPA embedding if loaded from cache
+        if ijepa_emb is not None:
+            output['ijepa_emb'] = ijepa_emb  # [1280] raw ViT-H/14 dimension
         
         if seg_masks is not None:
             output['seg_masks'] = seg_masks
@@ -322,6 +351,10 @@ def collate_seg_batch(batch):
         'scores': scores,
         'filename': [item['filename'] for item in batch],
     }
+    
+    # Add pre-cached IJEPA embeddings if present
+    if 'ijepa_emb' in batch[0]:
+        output['ijepa_emb'] = torch.stack([item['ijepa_emb'] for item in batch])
     
     # Add class labels if present
     if 'class_label' in batch[0]:

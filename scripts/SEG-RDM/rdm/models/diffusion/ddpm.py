@@ -1083,37 +1083,54 @@ class UnifiedSegRDM(RDM):
             
         device = x_img.device
         
-        # Extract global token using I-JEPA encoder (reuse existing code)
-        with torch.no_grad():
-            self.pretrained_encoder.eval()
-            mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-            std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-            x_normalized = (x_img - mean) / std
-            x_normalized = torch.nn.functional.interpolate(x_normalized, 224, mode='bicubic', align_corners=False)
-            rep = self.pretrained_encoder.forward_features(x_normalized)
+        # Check if pre-cached IJEPA embeddings are available in batch
+        if 'ijepa_emb' in batch and batch['ijepa_emb'] is not None:
+            # Use pre-cached embeddings (much faster!)
+            rep = batch['ijepa_emb'].to(device)  # [B, 1280] raw ViT-H/14 dimension
             
-            if rep.dim() == 3:
-                if hasattr(self.pretrained_encoder, "forward_head"):
-                    rep = self.pretrained_encoder.forward_head(
-                        rep, pre_logits=not self.pretrained_enc_withproj
-                    )
-                else:
-                    rep = rep[:, 0]
-                    if self.pretrained_enc_withproj:
-                        rep = self.pretrained_encoder.head(rep)
-            elif self.pretrained_enc_withproj:
-                rep = self.pretrained_encoder.head(rep)
+            # Project to 256-dim if needed
+            if self.pretrained_enc_proj is not None:
+                rep = self.pretrained_enc_proj(rep)
                 
-        if self.pretrained_enc_proj is not None:
-            rep = self.pretrained_enc_proj(rep)
+            # Normalize global vector
+            rep_std = torch.std(rep, dim=1, keepdim=True)
+            rep_mean = torch.mean(rep, dim=1, keepdim=True)
+            rep = (rep - rep_mean) / rep_std
+            rep = rep * self.input_scale
             
-        # Normalize global vector
-        rep_std = torch.std(rep, dim=1, keepdim=True)
-        rep_mean = torch.mean(rep, dim=1, keepdim=True)
-        rep = (rep - rep_mean) / rep_std
-        rep = rep * self.input_scale
-        
-        global_vec = rep  # [B, 256]
+            global_vec = rep  # [B, 256]
+        else:
+            # Fall back to runtime extraction using I-JEPA encoder
+            with torch.no_grad():
+                self.pretrained_encoder.eval()
+                mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+                x_normalized = (x_img - mean) / std
+                x_normalized = torch.nn.functional.interpolate(x_normalized, 224, mode='bicubic', align_corners=False)
+                rep = self.pretrained_encoder.forward_features(x_normalized)
+                
+                if rep.dim() == 3:
+                    if hasattr(self.pretrained_encoder, "forward_head"):
+                        rep = self.pretrained_encoder.forward_head(
+                            rep, pre_logits=not self.pretrained_enc_withproj
+                        )
+                    else:
+                        rep = rep[:, 0]
+                        if self.pretrained_enc_withproj:
+                            rep = self.pretrained_encoder.head(rep)
+                elif self.pretrained_enc_withproj:
+                    rep = self.pretrained_encoder.head(rep)
+                    
+            if self.pretrained_enc_proj is not None:
+                rep = self.pretrained_enc_proj(rep)
+                
+            # Normalize global vector
+            rep_std = torch.std(rep, dim=1, keepdim=True)
+            rep_mean = torch.mean(rep, dim=1, keepdim=True)
+            rep = (rep - rep_mean) / rep_std
+            rep = rep * self.input_scale
+            
+            global_vec = rep  # [B, 256]
         
         # Get segmentation tokens from batch (pre-computed SAM embeddings)
         if 'seg_embs' in batch:
