@@ -11,7 +11,7 @@ model:
     
     # IJEPA cache (optional - speeds up training by using pre-extracted embeddings)
     # Set to null or omit to use runtime extraction instead
-    ijepa_cache_dir: /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/output_dir/ijepa_embeddings
+    # ijepa_cache_dir: /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/output_dir/ijepa_embeddings
     
     # Diffusion parameters
     timesteps: 1000

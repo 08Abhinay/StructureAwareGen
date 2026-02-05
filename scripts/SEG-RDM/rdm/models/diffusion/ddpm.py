@@ -944,6 +944,7 @@ class UnifiedSegRDM(RDM):
         self.max_segments = max_segments
         self.lambda_diversity = lambda_diversity
         self.lambda_alignment = lambda_alignment
+        self.first_stage_key = "image"
         print(f"UnifiedSegRDM: max_segments={max_segments}, seg_npz_dir={seg_npz_dir}")
         print(f"  Diversity loss weight: {lambda_diversity}")
         print(f"  Alignment loss weight: {lambda_alignment}")
