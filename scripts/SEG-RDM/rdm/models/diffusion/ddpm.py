@@ -1075,12 +1075,19 @@ class UnifiedSegRDM(RDM):
             padding_mask: [B, N+1] boolean mask (True = padded)
             c: conditioning (if any)
         """
-        # Get raw image from batch using DDPM.get_input (NOT RDM.get_input)
-        # DDPM.get_input extracts batch[k] and converts to [B, C, H, W]
-        x_img = DDPM.get_input(self, batch, k)
+        # Extract raw image from batch dict directly (skip DDPM.get_input's buggy rearrange)
+        # Our dataset returns [B, C, H, W] format already (PyTorch standard from ToTensor)
+        # DDPM.get_input assumes [B, H, W, C] and does rearrange, which breaks our data
+        if isinstance(batch, dict) and k in batch:
+            x_img = batch[k]
+        else:
+            # Fallback for non-dict batches
+            x_img = batch
+        
         if bs is not None:
             x_img = x_img[:bs]
-            
+        
+        x_img = x_img.to(memory_format=torch.contiguous_format).float()
         device = x_img.device
         
         # Check if pre-cached IJEPA embeddings are available in batch
