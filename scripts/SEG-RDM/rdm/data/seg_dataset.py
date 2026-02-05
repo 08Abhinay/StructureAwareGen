@@ -56,33 +56,41 @@ class SegmentationMaskDataset(Dataset):
         self.ijepa_cache_dir = ijepa_cache_dir
         
         # Find all images with corresponding SAM embeddings
-        # Scan mask_npz_dir/masks_npz subdirectories (0/, 1/, 2/, ...)
+        # Scan mask_npz_dir subdirectories: {mask_npz_dir}/0/masks_npz/, /1/masks_npz/, etc.
         print(f"Scanning for SAM .npz files in {mask_npz_dir}...")
         
-        masks_npz_path = os.path.join(mask_npz_dir, "masks_npz")
-        if not os.path.exists(masks_npz_path):
-            # Fallback to root if masks_npz subdirectory doesn't exist
-            masks_npz_path = mask_npz_dir
-        
-        # Check for numeric subdirectories (0/, 1/, 2/, ...)
+        # Check for numeric subdirectories at root (0/, 1/, 2/, ...)
         try:
-            subdirs = [d for d in os.listdir(masks_npz_path) 
-                      if os.path.isdir(os.path.join(masks_npz_path, d)) and d.isdigit()]
+            subdirs = [d for d in os.listdir(mask_npz_dir) 
+                      if os.path.isdir(os.path.join(mask_npz_dir, d)) and d.isdigit()]
         except FileNotFoundError:
             subdirs = []
         
         if subdirs:
-            # Fast path: scan each numeric subdirectory
-            print(f"  Found {len(subdirs)} numeric subdirectories in masks_npz/")
+            # Structure: mask_npz_dir/{class_id}/masks_npz/*.npz
+            print(f"  Found {len(subdirs)} numeric subdirectories at root")
             npz_files = []
             for subdir in sorted(subdirs, key=int):
-                subdir_path = os.path.join(masks_npz_path, subdir)
-                npz_files.extend(glob.glob(os.path.join(subdir_path, "*.npz")))
+                masks_npz_path = os.path.join(mask_npz_dir, subdir, "masks_npz")
+                if os.path.exists(masks_npz_path):
+                    npz_files.extend(glob.glob(os.path.join(masks_npz_path, "*.npz")))
         else:
-            # Fallback: try top-level or recursive search
-            npz_files = glob.glob(os.path.join(masks_npz_path, "*.npz"))
-            if len(npz_files) == 0:
-                npz_files = glob.glob(os.path.join(masks_npz_path, "**", "*.npz"), recursive=True)
+            # Fallback: try various structures
+            masks_npz_path = os.path.join(mask_npz_dir, "masks_npz")
+            if os.path.exists(masks_npz_path):
+                # Try masks_npz/{0,1,2,...}/*.npz
+                subdirs = [d for d in os.listdir(masks_npz_path) 
+                          if os.path.isdir(os.path.join(masks_npz_path, d)) and d.isdigit()]
+                if subdirs:
+                    npz_files = []
+                    for subdir in sorted(subdirs, key=int):
+                        npz_files.extend(glob.glob(os.path.join(masks_npz_path, subdir, "*.npz")))
+                else:
+                    # Try flat structure
+                    npz_files = glob.glob(os.path.join(masks_npz_path, "*.npz"))
+            else:
+                # Last resort: recursive search
+                npz_files = glob.glob(os.path.join(mask_npz_dir, "**", "*.npz"), recursive=True)
         
         npz_files = sorted(npz_files)
         print(f"Found {len(npz_files)} SAM .npz files")
