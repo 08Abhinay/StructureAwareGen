@@ -96,22 +96,35 @@ class SegmentationMaskDataset(Dataset):
         print(f"Found {len(npz_files)} SAM .npz files")
         
         # Build image paths by matching npz basenames
+        # For ImageNet structure: imagenet/train/{class_id}/{image_name}.JPEG
         self.image_paths = []
+        self.npz_paths = []  # Store corresponding npz paths for __getitem__
         missing_images = []
+        
+        print(f"Matching {len(npz_files)} npz files to images...")
         for npz_path in npz_files:
             npz_name = self._get_basename(npz_path)
-            # Try different extensions
+            
+            # Extract class folder from image name (ImageNet format: n01440764_10026)
+            # The class is the prefix before the underscore
+            class_folder = npz_name.split('_')[0] if '_' in npz_name else None
+            
             found = False
-            for ext in ['.jpg', '.jpeg', '.JPEG', '.JPG', '.png', '.PNG']:
-                img_path = os.path.join(image_dir, f"{npz_name}{ext}")
-                if not os.path.exists(img_path):
-                    # Try recursive search
-                    matches = glob.glob(os.path.join(image_dir, "**", f"{npz_name}{ext}"), recursive=True)
-                    if matches:
-                        img_path = matches[0]
+            for ext in ['.JPEG', '.jpg', '.jpeg', '.JPG', '.png', '.PNG']:
+                # Try with class folder first (ImageNet structure)
+                if class_folder:
+                    img_path = os.path.join(image_dir, class_folder, f"{npz_name}{ext}")
+                    if os.path.exists(img_path):
+                        self.image_paths.append(img_path)
+                        self.npz_paths.append(npz_path)
+                        found = True
+                        break
                 
+                # Fallback: try top-level
+                img_path = os.path.join(image_dir, f"{npz_name}{ext}")
                 if os.path.exists(img_path):
                     self.image_paths.append(img_path)
+                    self.npz_paths.append(npz_path)
                     found = True
                     break
             
@@ -183,9 +196,9 @@ class SegmentationMaskDataset(Dataset):
             # Return a dummy black image on error
             image = torch.zeros(3, self.image_size, self.image_size)
         
-        # Load SAM embeddings from npz
+        # Load SAM embeddings from npz (use pre-stored path)
         name = self._get_basename(img_path)
-        npz_path = os.path.join(self.mask_npz_dir, f"{name}.npz")
+        npz_path = self.npz_paths[idx]  # Use stored path instead of reconstructing
         
         if not os.path.exists(npz_path):
             # Handle missing npz gracefully
