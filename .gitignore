@@ -76,3 +76,6 @@ scripts/StyleGAN2/seg-aware-stylegan2/training/playground.ipynb
 *tex
 # Wandb logs
 wandb/
+
+# Jupyter Notebooks
+*.ipynb
