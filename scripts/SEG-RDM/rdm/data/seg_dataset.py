@@ -105,9 +105,15 @@ class SegmentationMaskDataset(Dataset):
         for npz_path in npz_files:
             npz_name = self._get_basename(npz_path)
             
-            # Extract class folder from image name (ImageNet format: n01440764_10026)
-            # The class is the prefix before the underscore
-            class_folder = npz_name.split('_')[0] if '_' in npz_name else None
+            # Extract class folder from path structure
+            # Path format: .../sam_cache_unified/{class_id}/masks_npz/{image_id}.npz
+            # Image format: imagenet/train/{class_id}/{image_id}.JPEG
+            path_parts = npz_path.split(os.sep)
+            class_folder = None
+            for i, part in enumerate(path_parts):
+                if part == "masks_npz" and i > 0:
+                    class_folder = path_parts[i-1]
+                    break
             
             found = False
             for ext in ['.JPEG', '.jpg', '.jpeg', '.JPG', '.png', '.PNG']:
