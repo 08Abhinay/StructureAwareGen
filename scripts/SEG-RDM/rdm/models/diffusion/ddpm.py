@@ -1075,8 +1075,9 @@ class UnifiedSegRDM(RDM):
             padding_mask: [B, N+1] boolean mask (True = padded)
             c: conditioning (if any)
         """
-        # Get global vector from I-JEPA (same as RDM)
-        x_img = super(UnifiedSegRDM, self).get_input(batch, k)  # Skip RDM.get_input, use DDPM.get_input
+        # Get raw image from batch using DDPM.get_input (NOT RDM.get_input)
+        # DDPM.get_input extracts batch[k] and converts to [B, C, H, W]
+        x_img = DDPM.get_input(self, batch, k)
         if bs is not None:
             x_img = x_img[:bs]
             
@@ -1147,7 +1148,8 @@ class UnifiedSegRDM(RDM):
                 elif cond_key == 'class_label':
                     xc = batch
                 else:
-                    xc = super(UnifiedSegRDM, self).get_input(batch, cond_key).to(device)
+                    # Get conditioning data (not the main image)
+                    xc = DDPM.get_input(self, batch, cond_key).to(device)
             else:
                 xc = x
             if not self.cond_stage_trainable or force_c_encode:

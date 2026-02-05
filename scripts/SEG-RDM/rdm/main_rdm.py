@@ -49,6 +49,14 @@ def get_args_parser():
     parser.add_argument('--cosine_lr', action='store_true',
                         help='Use cosine lr scheduling.')
     parser.add_argument('--warmup_epochs', default=0, type=int)
+    
+    # Segmentation dataset parameters
+    parser.add_argument('--use_seg_dataset', action='store_true',
+                        help='Use SegmentationMaskDataset with pre-computed SAM embeddings')
+    parser.add_argument('--mask_npz_dir', type=str, default=None,
+                        help='Directory containing SAM .npz embeddings (required if use_seg_dataset=True)')
+    parser.add_argument('--max_segments', type=int, default=250,
+                        help='Maximum number of segments for padding')
 
     # Dataset parameters
     parser.add_argument('--data_path', default='./data/imagenet', type=str,
@@ -145,15 +153,42 @@ def main(args):
     else:
         log_writer = None
 
-    transform_train = transforms.Compose([
-        transforms.Resize(args.input_size, interpolation=3),
-        transforms.RandomCrop(args.input_size),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-    ])
-
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    print(dataset_train)
+    # -------------------------
+    # Conditional Dataset Loading
+    # -------------------------
+    if args.use_seg_dataset:
+        # Import SegmentationMaskDataset
+        from rdm.data.seg_dataset import SegmentationMaskDataset
+        
+        # Validate required arguments
+        if args.mask_npz_dir is None:
+            raise ValueError("--mask_npz_dir must be specified when --use_seg_dataset is True")
+        
+        # Create segmentation dataset (will filter to only images with SAM embeddings)
+        dataset_train = SegmentationMaskDataset(
+            image_dir=os.path.join(args.data_path, 'train'),
+            mask_npz_dir=args.mask_npz_dir,
+            max_segments=args.max_segments,
+            image_size=args.input_size,
+            file_ext="*.JPEG",  # ImageNet uses .JPEG
+            normalize=True,  # DDPM expects [-1, 1] range
+        )
+        print(f"Using SegmentationMaskDataset: {len(dataset_train)} samples")
+        print(f"  SAM embeddings: {args.mask_npz_dir}")
+        print(f"  max_segments: {args.max_segments}")
+        
+    else:
+        # Original ImageFolder pipeline (unchanged)
+        transform_train = transforms.Compose([
+            transforms.Resize(args.input_size, interpolation=3),
+            transforms.RandomCrop(args.input_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+        ])
+        
+        dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+        print(f"Using ImageFolder: {len(dataset_train)} samples")
+    
     # -------------------------
     # Debug subset (100 images)
     # -------------------------
@@ -164,6 +199,16 @@ def main(args):
         print(f"[DEBUG] Using subset of dataset_train: {n} samples")
 
 
+    # -------------------------
+    # Conditional collate function
+    # -------------------------
+    if args.use_seg_dataset:
+        from rdm.data.seg_dataset import collate_seg_batch
+        collate_fn = collate_seg_batch
+        print("Using collate_seg_batch for dict batches")
+    else:
+        collate_fn = None
+    
     # -------------------------
     # Sampler / DataLoader
     # -------------------------
@@ -176,6 +221,7 @@ def main(args):
             num_workers=0,            # KEY
             pin_memory=False,         # KEY
             drop_last=False,
+            collate_fn=collate_fn,
         )
         print("[DEBUG] DataLoader: num_workers=0, pin_memory=False, shuffle=False, no DistributedSampler")
     else:
@@ -190,6 +236,7 @@ def main(args):
             num_workers=args.num_workers,
             pin_memory=args.pin_mem,
             drop_last=True,
+            collate_fn=collate_fn,
         )
 
     # sampler_train = torch.utils.data.DistributedSampler(
@@ -261,12 +308,22 @@ def main(args):
         if args.distributed and (not args.debug):
             data_loader_train.sampler.set_epoch(epoch)
 
-        train_stats = train_one_epoch(
-            model, data_loader_train,
-            optimizer, device, epoch, loss_scaler,
-            log_writer=log_writer,
-            args=args
-        )
+        # Conditional training function based on dataset type
+        if args.use_seg_dataset:
+            from rdm.engine_rdm import train_one_epoch_seg
+            train_stats = train_one_epoch_seg(
+                model, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                log_writer=log_writer,
+                args=args
+            )
+        else:
+            train_stats = train_one_epoch(
+                model, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                log_writer=log_writer,
+                args=args
+            )
         if args.output_dir and (epoch % 25 == 0 or epoch + 1 == args.epochs):
             util.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,

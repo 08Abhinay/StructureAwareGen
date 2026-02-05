@@ -52,12 +52,43 @@ class SegmentationMaskDataset(Dataset):
         self.image_size = image_size
         self.normalize = normalize
         
-        # Find all images
-        self.image_paths = sorted(glob.glob(os.path.join(image_dir, file_ext)))
-        if len(self.image_paths) == 0:
-            self.image_paths = sorted(glob.glob(os.path.join(image_dir, "**", file_ext), recursive=True))
+        # Find all images with corresponding SAM embeddings
+        # Scan mask_npz_dir first, then find matching images
+        npz_files = sorted(glob.glob(os.path.join(mask_npz_dir, "*.npz")))
+        if len(npz_files) == 0:
+            npz_files = sorted(glob.glob(os.path.join(mask_npz_dir, "**", "*.npz"), recursive=True))
+        print(f"Found {len(npz_files)} SAM .npz files in {mask_npz_dir}")
         
-        print(f"SegmentationMaskDataset: Found {len(self.image_paths)} images")
+        # Build image paths by matching npz basenames
+        self.image_paths = []
+        missing_images = []
+        for npz_path in npz_files:
+            npz_name = self._get_basename(npz_path)
+            # Try different extensions
+            found = False
+            for ext in ['.jpg', '.jpeg', '.JPEG', '.JPG', '.png', '.PNG']:
+                img_path = os.path.join(image_dir, f"{npz_name}{ext}")
+                if not os.path.exists(img_path):
+                    # Try recursive search
+                    matches = glob.glob(os.path.join(image_dir, "**", f"{npz_name}{ext}"), recursive=True)
+                    if matches:
+                        img_path = matches[0]
+                
+                if os.path.exists(img_path):
+                    self.image_paths.append(img_path)
+                    found = True
+                    break
+            
+            if not found:
+                missing_images.append(npz_name)
+        
+        if missing_images and len(missing_images) < 10:
+            print(f"WARNING: {len(missing_images)} npz files have no matching images: {missing_images[:5]}")
+        elif missing_images:
+            print(f"WARNING: {len(missing_images)} npz files have no matching images")
+        
+        print(f"SegmentationMaskDataset: Loaded {len(self.image_paths)} images with SAM embeddings")
+        print(f"  (filtered from {len(npz_files)} npz files)")
         print(f"  image_dir: {image_dir}")
         print(f"  mask_npz_dir: {mask_npz_dir}")
         print(f"  max_segments: {max_segments}")
