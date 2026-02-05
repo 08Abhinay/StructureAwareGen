@@ -56,11 +56,36 @@ class SegmentationMaskDataset(Dataset):
         self.ijepa_cache_dir = ijepa_cache_dir
         
         # Find all images with corresponding SAM embeddings
-        # Scan mask_npz_dir first, then find matching images
-        npz_files = sorted(glob.glob(os.path.join(mask_npz_dir, "*.npz")))
-        if len(npz_files) == 0:
-            npz_files = sorted(glob.glob(os.path.join(mask_npz_dir, "**", "*.npz"), recursive=True))
-        print(f"Found {len(npz_files)} SAM .npz files in {mask_npz_dir}")
+        # Scan mask_npz_dir/masks_npz subdirectories (0/, 1/, 2/, ...)
+        print(f"Scanning for SAM .npz files in {mask_npz_dir}...")
+        
+        masks_npz_path = os.path.join(mask_npz_dir, "masks_npz")
+        if not os.path.exists(masks_npz_path):
+            # Fallback to root if masks_npz subdirectory doesn't exist
+            masks_npz_path = mask_npz_dir
+        
+        # Check for numeric subdirectories (0/, 1/, 2/, ...)
+        try:
+            subdirs = [d for d in os.listdir(masks_npz_path) 
+                      if os.path.isdir(os.path.join(masks_npz_path, d)) and d.isdigit()]
+        except FileNotFoundError:
+            subdirs = []
+        
+        if subdirs:
+            # Fast path: scan each numeric subdirectory
+            print(f"  Found {len(subdirs)} numeric subdirectories in masks_npz/")
+            npz_files = []
+            for subdir in sorted(subdirs, key=int):
+                subdir_path = os.path.join(masks_npz_path, subdir)
+                npz_files.extend(glob.glob(os.path.join(subdir_path, "*.npz")))
+        else:
+            # Fallback: try top-level or recursive search
+            npz_files = glob.glob(os.path.join(masks_npz_path, "*.npz"))
+            if len(npz_files) == 0:
+                npz_files = glob.glob(os.path.join(masks_npz_path, "**", "*.npz"), recursive=True)
+        
+        npz_files = sorted(npz_files)
+        print(f"Found {len(npz_files)} SAM .npz files")
         
         # Build image paths by matching npz basenames
         self.image_paths = []
