@@ -416,8 +416,8 @@ def collate_seg_batch(batch):
     if 'class_label' in batch[0]:
         output['class_label'] = torch.stack([item['class_label'] for item in batch])
     
-    # Add masks if present
-    if 'seg_masks' in batch[0] and batch[0]['seg_masks'] is not None:
+    # Add masks if present (check all items have the key to avoid KeyError)
+    if all('seg_masks' in item for item in batch):
         # Note: masks may have different sizes, so we keep them as list
         output['seg_masks'] = [item['seg_masks'] for item in batch]
     
