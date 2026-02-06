@@ -132,6 +132,10 @@ def train_one_epoch_seg(model: torch.nn.Module,
             'seg_embs': batch['seg_embs'].to(device, non_blocking=True),
             'num_segments': batch['num_segments'].to(device, non_blocking=True),
         }
+
+        # Add IJEPA embeddings if available (for cached mode)
+        if 'ijepa_emb' in batch:
+            batch_device['ijepa_emb'] = batch['ijepa_emb'].to(device, non_blocking=True)
         
         # Forward pass - UnifiedSegRDM.forward() accepts batch=dict
         loss, loss_dict = model(x=None, c=None, batch=batch_device)

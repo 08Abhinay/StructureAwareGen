@@ -2,15 +2,15 @@
 #SBATCH -A pfw-cs
 #SBATCH -p a100-40gb
 #SBATCH -q standby
-#SBATCH --job-name=rdm_ijepa_h14_2g_4n
+#SBATCH --job-name=ijepa_and_seg_aware
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=2
 #SBATCH --cpus-per-task=32
 #SBATCH --mem-per-gpu=80G
 #SBATCH --time=04:00:00
-#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/rdm_ijepa_h14_2g_4n-batch_128/.out
-#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/rdm_ijepa_h14_2g_4n-batch_128/.err
+#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/ijepa_and_seg_aware-batch_32/.out
+#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/ijepa_and_seg_aware-batch_32/.err
 
 module load anaconda
 conda activate /scratch/gilbreth/abelde/Thesis/StructureAwareGen/SegmentationAwareGen
@@ -47,9 +47,9 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
       --blr 1e-6 \
       --weight_decay 0.01 \
       --epochs 200 \
-      --batch_size 128 \
+      --batch_size 32 \
       --accum_iter 1 \
-      --output_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_128/ijepa_h14 \
+      --output_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_32/ijepa_and_seg_aware \
       --log_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm \
       --data_path /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf \
       --resume /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_128/ijepa_h14/checkpoint-last.pth
