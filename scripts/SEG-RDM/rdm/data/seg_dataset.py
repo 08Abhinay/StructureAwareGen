@@ -219,7 +219,7 @@ class SegmentationMaskDataset(Dataset):
             seg_masks = None
         else:
             try:
-                data = np.load(npz_path, allow_pickle=False)
+                data = np.load(npz_path, allow_pickle=True)
                 
                 # Get embeddings (already 256-dim from SAM)
                 if 'emb' in data and data['emb'] is not None:
@@ -284,7 +284,7 @@ class SegmentationMaskDataset(Dataset):
                 ijepa_npz_path = os.path.join(self.ijepa_cache_dir, parent_dir, f"{name}.npz")
                 
                 if os.path.exists(ijepa_npz_path):
-                    ijepa_data = np.load(ijepa_npz_path, allow_pickle=False)
+                    ijepa_data = np.load(ijepa_npz_path, allow_pickle=True)
                     if 'emb' in ijepa_data:
                         ijepa_emb = torch.from_numpy(ijepa_data['emb']).float()  # [1280] from ViT-H/14
                     else:
