@@ -150,7 +150,7 @@ class SAMExtractor:
         world_size: Optional[int] = None
     ):
         """
-        Initialize SAM extractor.
+        Initialize SAM extractor
         
         Args:
             sam_checkpoint: Path to SAM checkpoint file
