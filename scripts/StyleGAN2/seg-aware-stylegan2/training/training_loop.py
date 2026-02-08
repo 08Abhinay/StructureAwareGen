@@ -237,6 +237,8 @@ def training_loop(
     augment_kwargs          = None,     # Options for augmentation pipeline. None = disable.
     loss_kwargs             = {},       # Options for loss function.
     metrics                 = [],       # Metrics to evaluate during training.
+    metrics_seg_mode        = 'none',   # Structure conditioning mode for metrics: 'none', 'real', 'rdm'
+    metrics_rdm_checkpoint  = None,     # RDM checkpoint for metrics (if metrics_seg_mode='rdm')
     random_seed             = 0,        # Global random seed.
     num_gpus                = 1,        # Number of GPUs participating in the training.
     rank                    = 0,        # Rank of the current process in [0, num_gpus[.
@@ -672,7 +674,8 @@ def training_loop(
                 print('Evaluating metrics...')
             for metric in metrics:
                 result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
-                    dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
+                    dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device,
+                    seg_mode=metrics_seg_mode, rdm_checkpoint=metrics_rdm_checkpoint)
                 if rank == 0:
                     metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
                 stats_metrics.update(result_dict.results)

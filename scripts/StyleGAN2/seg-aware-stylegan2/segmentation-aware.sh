@@ -64,7 +64,7 @@ python train.py \
   --ijepa_lambda 1.0 \
   --ijepa_image 256 \
   --ijepa_input_channel 3 \
-  --extra_dim 1280 \
+  --ijepa_dim 1280 \
   --ijepa_warmup_kimg 5.4 \
   --sem_mixing_prob "${SEM_MIX}" \
   --fusion_alpha "${FUSION_ALPHA}" \

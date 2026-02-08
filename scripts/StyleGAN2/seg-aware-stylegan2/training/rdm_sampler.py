@@ -47,19 +47,33 @@ class RDMSampler:
             )
         
         # Load checkpoint
-        ckpt = torch.load(checkpoint_path, map_location='cpu')
+        ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         
         # Handle different checkpoint formats
-        if 'state_dict' in ckpt:
-            state_dict = ckpt['state_dict']
-        elif 'model' in ckpt:
+        if 'model' in ckpt:
             state_dict = ckpt['model']
+        elif 'model_state_dict' in ckpt:
+            state_dict = ckpt['model_state_dict']
+        elif 'state_dict' in ckpt:
+            state_dict = ckpt['state_dict']
         else:
             state_dict = ckpt
         
         # Extract model config (if available)
         if 'config' in ckpt:
             config = ckpt['config']
+        elif 'args' in ckpt and hasattr(ckpt['args'], 'max_segments'):
+            # Extract from args (SEG-RDM checkpoint format)
+            max_segments = ckpt['args'].max_segments
+            print(f"Extracted max_segments={max_segments} from checkpoint args")
+            config = {
+                'model': {
+                    'params': {
+                        'channels': 256,
+                        'max_segments': max_segments,
+                    }
+                }
+            }
         else:
             # Use default config
             print("Warning: No config found in checkpoint, using defaults")
