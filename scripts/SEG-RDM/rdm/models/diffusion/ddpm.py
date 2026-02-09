@@ -929,16 +929,25 @@ class UnifiedSegRDM(RDM):
     Uses pre-computed SAM embeddings instead of computing them during training.
     """
     
-    def __init__(self, seg_npz_dir: str = None, max_segments: int = 250, *args, **kwargs):
+    def __init__(self, seg_npz_dir: str = None, max_segments: int = 250, 
+                 lambda_diversity: float = 0.1, lambda_alignment: float = 0.05,
+                 *args, **kwargs):
         """
         Args:
             seg_npz_dir: Path to directory containing SAM .npz files
             max_segments: Maximum number of segments (for padding)
+            lambda_diversity: Weight for diversity loss (default: 0.1)
+            lambda_alignment: Weight for alignment loss (default: 0.05)
         """
         super().__init__(*args, **kwargs)
         self.seg_npz_dir = seg_npz_dir
         self.max_segments = max_segments
+        self.lambda_diversity = lambda_diversity
+        self.lambda_alignment = lambda_alignment
+        self.first_stage_key = "image"
         print(f"UnifiedSegRDM: max_segments={max_segments}, seg_npz_dir={seg_npz_dir}")
+        print(f"  Diversity loss weight: {lambda_diversity}")
+        print(f"  Alignment loss weight: {lambda_alignment}")
         
     def _to_diffusion_format(self, tokens: torch.Tensor) -> torch.Tensor:
         """Convert [B, N, C] to [B, C, 1, N] for DDPM compatibility."""
@@ -947,6 +956,114 @@ class UnifiedSegRDM(RDM):
     def _from_diffusion_format(self, x: torch.Tensor) -> torch.Tensor:
         """Convert [B, C, 1, N] to [B, N, C]."""
         return x.squeeze(2).permute(0, 2, 1)
+    
+    def compute_diversity_loss(self, seg_tokens, padding_mask=None, eps=1e-6):
+        """
+        Diversity loss: -log det(C + εI) encourages diverse segment embeddings.
+        Prevents collapse where all masks encode the same information.
+        
+        Args:
+            seg_tokens: [B, N_seg, C] segment embeddings (excluding global token)
+            padding_mask: [B, N_seg+1] boolean mask (True = padded), includes global
+            eps: Small constant for numerical stability
+            
+        Returns:
+            Scalar diversity loss (higher = more collapsed)
+        """
+        import torch.nn.functional as F
+        
+        B, N, C = seg_tokens.shape
+        
+        # Remove padding
+        if padding_mask is not None:
+            mask = ~padding_mask[:, 1:]  # Exclude global token position
+        else:
+            mask = torch.ones(B, N, dtype=torch.bool, device=seg_tokens.device)
+        
+        losses = []
+        for i in range(B):
+            valid_tokens = seg_tokens[i, mask[i]]  # [N_valid, C]
+            if valid_tokens.shape[0] < 2:
+                continue  # Need at least 2 tokens for covariance
+            
+            # Compute covariance matrix
+            mean = valid_tokens.mean(dim=0, keepdim=True)  # [1, C]
+            centered = valid_tokens - mean  # [N_valid, C]
+            cov = (centered.T @ centered) / valid_tokens.shape[0]  # [C, C]
+            
+            # Regularize and compute log determinant
+            cov_reg = cov + eps * torch.eye(C, device=cov.device)
+            
+            # Use slogdet for numerical stability
+            sign, logdet = torch.slogdet(cov_reg)
+            if sign > 0:  # Only use if positive definite
+                losses.append(-logdet)
+        
+        return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=seg_tokens.device)
+    
+    def compute_alignment_loss(self, global_vec, seg_tokens, padding_mask=None, tau=0.07):
+        """
+        Alignment loss: Encourages global and segment embeddings to be semantically aligned.
+        Uses InfoNCE-style contrastive loss.
+        
+        Args:
+            global_vec: [B, C] global I-JEPA embeddings
+            seg_tokens: [B, N_seg, C] segment SAM embeddings
+            padding_mask: [B, N_seg+1] boolean mask (True = padded)
+            tau: Temperature for contrastive loss
+            
+        Returns:
+            Scalar alignment loss
+        """
+        import torch.nn.functional as F
+        
+        B, N, C = seg_tokens.shape
+        
+        # L2 normalize
+        global_norm = F.normalize(global_vec, dim=1)  # [B, C]
+        seg_norm = F.normalize(seg_tokens, dim=2)  # [B, N, C]
+        
+        # Compute similarities: global[i] with all segments
+        sim = torch.einsum('bc,bnc->bn', global_norm, seg_norm) / tau  # [B, N]
+        
+        # Apply padding mask
+        if padding_mask is not None:
+            mask = ~padding_mask[:, 1:]  # [B, N] exclude global token
+            sim = sim.masked_fill(~mask, -1e9)
+        
+        # Positive: mean similarity with own segments
+        if padding_mask is not None:
+            mask_float = (~padding_mask[:, 1:]).float()
+            pos_sim = (sim * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp(min=1)  # [B]
+        else:
+            pos_sim = sim.mean(dim=1)  # [B]
+        
+        # Negative: cross-image similarities (in-batch negatives)
+        # For each sample, compute mean similarity with other samples' segments
+        neg_sims = []
+        for i in range(B):
+            neg_indices = [j for j in range(B) if j != i]
+            if neg_indices:
+                if padding_mask is not None:
+                    mask_neg = ~padding_mask[neg_indices, 1:]  # [B-1, N]
+                    sim_neg = torch.einsum('c,bnc->bn', global_norm[i], seg_norm[neg_indices])  # [B-1, N]
+                    sim_neg = (sim_neg * mask_neg.float()).sum(dim=1) / mask_neg.float().sum(dim=1).clamp(min=1)
+                    neg_sims.append(sim_neg.mean())
+                else:
+                    sim_neg = torch.einsum('c,bnc->bn', global_norm[i], seg_norm[neg_indices]).mean()
+                    neg_sims.append(sim_neg)
+        
+        if not neg_sims:
+            return torch.tensor(0.0, device=global_vec.device)
+        
+        neg_sim = torch.stack(neg_sims)  # [B]
+        
+        # InfoNCE loss: -log(exp(pos) / (exp(pos) + exp(neg)))
+        loss = -torch.log(
+            torch.exp(pos_sim) / (torch.exp(pos_sim) + torch.exp(neg_sim) + 1e-8)
+        )
+        
+        return loss.mean()
     
     @torch.no_grad()
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
@@ -959,44 +1076,69 @@ class UnifiedSegRDM(RDM):
             padding_mask: [B, N+1] boolean mask (True = padded)
             c: conditioning (if any)
         """
-        # Get global vector from I-JEPA (same as RDM)
-        x_img = super(UnifiedSegRDM, self).get_input(batch, k)  # Skip RDM.get_input, use DDPM.get_input
+        # Extract raw image from batch dict directly (skip DDPM.get_input's buggy rearrange)
+        # Our dataset returns [B, C, H, W] format already (PyTorch standard from ToTensor)
+        # DDPM.get_input assumes [B, H, W, C] and does rearrange, which breaks our data
+        if isinstance(batch, dict) and k in batch:
+            x_img = batch[k]
+        else:
+            # Fallback for non-dict batches
+            x_img = batch
+        
         if bs is not None:
             x_img = x_img[:bs]
-            
+        
+        x_img = x_img.to(memory_format=torch.contiguous_format).float()
         device = x_img.device
         
-        # Extract global token using I-JEPA encoder (reuse existing code)
-        with torch.no_grad():
-            self.pretrained_encoder.eval()
-            mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-            std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-            x_normalized = (x_img - mean) / std
-            x_normalized = torch.nn.functional.interpolate(x_normalized, 224, mode='bicubic', align_corners=False)
-            rep = self.pretrained_encoder.forward_features(x_normalized)
+        # Check if pre-cached IJEPA embeddings are available in batch
+        if 'ijepa_emb' in batch and batch['ijepa_emb'] is not None:
+            # Use pre-cached embeddings (much faster!)
+            rep = batch['ijepa_emb'].to(device)  # [B, 1280] raw ViT-H/14 dimension
             
-            if rep.dim() == 3:
-                if hasattr(self.pretrained_encoder, "forward_head"):
-                    rep = self.pretrained_encoder.forward_head(
-                        rep, pre_logits=not self.pretrained_enc_withproj
-                    )
-                else:
-                    rep = rep[:, 0]
-                    if self.pretrained_enc_withproj:
-                        rep = self.pretrained_encoder.head(rep)
-            elif self.pretrained_enc_withproj:
-                rep = self.pretrained_encoder.head(rep)
+            # Project to 256-dim if needed
+            if self.pretrained_enc_proj is not None:
+                rep = self.pretrained_enc_proj(rep)
                 
-        if self.pretrained_enc_proj is not None:
-            rep = self.pretrained_enc_proj(rep)
+            # Normalize global vector
+            rep_std = torch.std(rep, dim=1, keepdim=True)
+            rep_mean = torch.mean(rep, dim=1, keepdim=True)
+            rep = (rep - rep_mean) / rep_std
+            rep = rep * self.input_scale
             
-        # Normalize global vector
-        rep_std = torch.std(rep, dim=1, keepdim=True)
-        rep_mean = torch.mean(rep, dim=1, keepdim=True)
-        rep = (rep - rep_mean) / rep_std
-        rep = rep * self.input_scale
-        
-        global_vec = rep  # [B, 256]
+            global_vec = rep  # [B, 256]
+        else:
+            # Fall back to runtime extraction using I-JEPA encoder
+            with torch.no_grad():
+                self.pretrained_encoder.eval()
+                mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+                x_normalized = (x_img - mean) / std
+                x_normalized = torch.nn.functional.interpolate(x_normalized, 224, mode='bicubic', align_corners=False)
+                rep = self.pretrained_encoder.forward_features(x_normalized)
+                
+                if rep.dim() == 3:
+                    if hasattr(self.pretrained_encoder, "forward_head"):
+                        rep = self.pretrained_encoder.forward_head(
+                            rep, pre_logits=not self.pretrained_enc_withproj
+                        )
+                    else:
+                        rep = rep[:, 0]
+                        if self.pretrained_enc_withproj:
+                            rep = self.pretrained_encoder.head(rep)
+                elif self.pretrained_enc_withproj:
+                    rep = self.pretrained_encoder.head(rep)
+                    
+            if self.pretrained_enc_proj is not None:
+                rep = self.pretrained_enc_proj(rep)
+                
+            # Normalize global vector
+            rep_std = torch.std(rep, dim=1, keepdim=True)
+            rep_mean = torch.mean(rep, dim=1, keepdim=True)
+            rep = (rep - rep_mean) / rep_std
+            rep = rep * self.input_scale
+            
+            global_vec = rep  # [B, 256]
         
         # Get segmentation tokens from batch (pre-computed SAM embeddings)
         if 'seg_embs' in batch:
@@ -1031,7 +1173,8 @@ class UnifiedSegRDM(RDM):
                 elif cond_key == 'class_label':
                     xc = batch
                 else:
-                    xc = super(UnifiedSegRDM, self).get_input(batch, cond_key).to(device)
+                    # Get conditioning data (not the main image)
+                    xc = DDPM.get_input(self, batch, cond_key).to(device)
             else:
                 xc = x
             if not self.cond_stage_trainable or force_c_encode:
@@ -1122,6 +1265,37 @@ class UnifiedSegRDM(RDM):
         loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
         loss += (self.original_elbo_weight * loss_vlb)
+        
+        # Add diversity and alignment losses (only during training)
+        if self.training and (self.lambda_diversity > 0 or self.lambda_alignment > 0):
+            # Reconstruct x_0 from model output
+            if self.parameterization == "eps":
+                # Predict x_0 from noise prediction
+                x_recon = self.predict_start_from_noise(x_noisy, t, model_output)
+            elif self.parameterization == "x0":
+                x_recon = model_output
+            else:
+                x_recon = x_start  # Fallback
+            
+            # Convert to token space: [B, C, 1, N+1] -> [B, N+1, C]
+            tokens_recon = self._from_diffusion_format(x_recon)  # [B, N+1, C]
+            
+            # Split global and segment tokens
+            global_recon = tokens_recon[:, 0, :]  # [B, C]
+            seg_recon = tokens_recon[:, 1:, :]  # [B, N, C]
+            
+            # Compute diversity loss
+            if self.lambda_diversity > 0:
+                loss_div = self.compute_diversity_loss(seg_recon, padding_mask)
+                loss_dict[f'{prefix}/loss_diversity'] = loss_div
+                loss = loss + self.lambda_diversity * loss_div
+            
+            # Compute alignment loss
+            if self.lambda_alignment > 0:
+                loss_align = self.compute_alignment_loss(global_recon, seg_recon, padding_mask)
+                loss_dict[f'{prefix}/loss_alignment'] = loss_align
+                loss = loss + self.lambda_alignment * loss_align
+        
         loss_dict.update({f'{prefix}/loss': loss})
         
         return loss, loss_dict

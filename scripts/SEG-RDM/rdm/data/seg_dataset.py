@@ -36,6 +36,7 @@ class SegmentationMaskDataset(Dataset):
         image_size: int = 256,
         file_ext: str = "*.jpg",
         normalize: bool = True,
+        ijepa_cache_dir: Optional[str] = None,
     ):
         """
         Args:
@@ -45,19 +46,108 @@ class SegmentationMaskDataset(Dataset):
             image_size: Target image size for resizing
             file_ext: File extension pattern for images (e.g., "*.jpg", "*.png")
             normalize: Whether to normalize images to [-1, 1] range (DDPM expects this)
+            ijepa_cache_dir: Optional directory with pre-cached IJEPA embeddings (speeds up training)
         """
         self.image_dir = image_dir
         self.mask_npz_dir = mask_npz_dir
         self.max_segments = max_segments
         self.image_size = image_size
         self.normalize = normalize
+        self.ijepa_cache_dir = ijepa_cache_dir
         
-        # Find all images
-        self.image_paths = sorted(glob.glob(os.path.join(image_dir, file_ext)))
-        if len(self.image_paths) == 0:
-            self.image_paths = sorted(glob.glob(os.path.join(image_dir, "**", file_ext), recursive=True))
+        # Find all images with corresponding SAM embeddings
+        # Scan mask_npz_dir subdirectories: {mask_npz_dir}/0/masks_npz/, /1/masks_npz/, etc.
+        print(f"Scanning for SAM .npz files in {mask_npz_dir}...")
         
-        print(f"SegmentationMaskDataset: Found {len(self.image_paths)} images")
+        # Check for numeric subdirectories at root (0/, 1/, 2/, ...)
+        try:
+            subdirs = [d for d in os.listdir(mask_npz_dir) 
+                      if os.path.isdir(os.path.join(mask_npz_dir, d)) and d.isdigit()]
+        except FileNotFoundError:
+            subdirs = []
+        
+        if subdirs:
+            # Structure: mask_npz_dir/{class_id}/masks_npz/*.npz
+            print(f"  Found {len(subdirs)} numeric subdirectories at root")
+            npz_files = []
+            for subdir in sorted(subdirs, key=int):
+                masks_npz_path = os.path.join(mask_npz_dir, subdir, "masks_npz")
+                if os.path.exists(masks_npz_path):
+                    npz_files.extend(glob.glob(os.path.join(masks_npz_path, "*.npz")))
+        else:
+            # Fallback: try various structures
+            masks_npz_path = os.path.join(mask_npz_dir, "masks_npz")
+            if os.path.exists(masks_npz_path):
+                # Try masks_npz/{0,1,2,...}/*.npz
+                subdirs = [d for d in os.listdir(masks_npz_path) 
+                          if os.path.isdir(os.path.join(masks_npz_path, d)) and d.isdigit()]
+                if subdirs:
+                    npz_files = []
+                    for subdir in sorted(subdirs, key=int):
+                        npz_files.extend(glob.glob(os.path.join(masks_npz_path, subdir, "*.npz")))
+                else:
+                    # Try flat structure
+                    npz_files = glob.glob(os.path.join(masks_npz_path, "*.npz"))
+            else:
+                # Last resort: recursive search
+                npz_files = glob.glob(os.path.join(mask_npz_dir, "**", "*.npz"), recursive=True)
+        
+        npz_files = sorted(npz_files)
+        print(f"Found {len(npz_files)} SAM .npz files")
+        
+        # Build image lookup table (fast: scan images once instead of checking each npz)
+        print(f"Building image lookup table from {image_dir}...")
+        image_lookup = {}  # {(class_id, basename): full_path}
+        
+        # Scan image directory structure
+        try:
+            class_dirs = [d for d in os.listdir(image_dir) 
+                         if os.path.isdir(os.path.join(image_dir, d)) and d.isdigit()]
+            
+            for class_id in class_dirs:
+                class_path = os.path.join(image_dir, class_id)
+                for img_file in os.listdir(class_path):
+                    if img_file.endswith(('.JPEG', '.jpg', '.jpeg', '.JPG', '.png', '.PNG')):
+                        basename = os.path.splitext(img_file)[0]
+                        image_lookup[(class_id, basename)] = os.path.join(class_path, img_file)
+            
+            print(f"  Found {len(image_lookup)} images")
+        except Exception as e:
+            print(f"  WARNING: Failed to build lookup: {e}")
+        
+        # Match npz files to images using lookup
+        self.image_paths = []
+        self.npz_paths = []  # Store corresponding npz paths for __getitem__
+        missing_images = []
+        
+        print(f"Matching {len(npz_files)} npz files to images...")
+        for npz_path in npz_files:
+            npz_name = self._get_basename(npz_path)
+            
+            # Extract class folder from path structure
+            # Path format: .../sam_cache_unified/{class_id}/masks_npz/{image_id}.npz
+            path_parts = npz_path.split(os.sep)
+            class_folder = None
+            for i, part in enumerate(path_parts):
+                if part == "masks_npz" and i > 0:
+                    class_folder = path_parts[i-1]
+                    break
+            
+            # Fast O(1) lookup instead of filesystem checks
+            if class_folder and (class_folder, npz_name) in image_lookup:
+                img_path = image_lookup[(class_folder, npz_name)]
+                self.image_paths.append(img_path)
+                self.npz_paths.append(npz_path)
+            else:
+                missing_images.append(npz_name)
+        
+        if missing_images and len(missing_images) < 10:
+            print(f"WARNING: {len(missing_images)} npz files have no matching images: {missing_images[:5]}")
+        elif missing_images:
+            print(f"WARNING: {len(missing_images)} npz files have no matching images")
+        
+        print(f"SegmentationMaskDataset: Loaded {len(self.image_paths)} images with SAM embeddings")
+        print(f"  (filtered from {len(npz_files)} npz files)")
         print(f"  image_dir: {image_dir}")
         print(f"  mask_npz_dir: {mask_npz_dir}")
         print(f"  max_segments: {max_segments}")
@@ -116,9 +206,9 @@ class SegmentationMaskDataset(Dataset):
             # Return a dummy black image on error
             image = torch.zeros(3, self.image_size, self.image_size)
         
-        # Load SAM embeddings from npz
+        # Load SAM embeddings from npz (use pre-stored path)
         name = self._get_basename(img_path)
-        npz_path = os.path.join(self.mask_npz_dir, f"{name}.npz")
+        npz_path = self.npz_paths[idx]  # Use stored path instead of reconstructing
         
         if not os.path.exists(npz_path):
             # Handle missing npz gracefully
@@ -129,7 +219,7 @@ class SegmentationMaskDataset(Dataset):
             seg_masks = None
         else:
             try:
-                data = np.load(npz_path, allow_pickle=False)
+                data = np.load(npz_path, allow_pickle=True)
                 
                 # Get embeddings (already 256-dim from SAM)
                 if 'emb' in data and data['emb'] is not None:
@@ -182,6 +272,28 @@ class SegmentationMaskDataset(Dataset):
                 scores = torch.zeros(0)
                 seg_masks = None
         
+        # Load pre-cached IJEPA embedding if available
+        ijepa_emb = None
+        if self.ijepa_cache_dir is not None:
+            # Extract class ID from image path (ImageNet structure: class_folder/image.JPEG)
+            # Try to find the class folder (parent directory of the image)
+            try:
+                # Get parent directory name (class ID for ImageNet)
+                parent_dir = os.path.basename(os.path.dirname(img_path))
+                # Try to find npz file in ijepa_cache_dir/{class_id}/{name}.npz
+                ijepa_npz_path = os.path.join(self.ijepa_cache_dir, parent_dir, f"{name}.npz")
+                
+                if os.path.exists(ijepa_npz_path):
+                    ijepa_data = np.load(ijepa_npz_path, allow_pickle=True)
+                    if 'emb' in ijepa_data:
+                        ijepa_emb = torch.from_numpy(ijepa_data['emb']).float()  # [1280] from ViT-H/14
+                    else:
+                        print(f"WARNING: 'emb' key not found in {ijepa_npz_path}")
+                # If not found, will fall back to runtime extraction in get_input()
+            except Exception as e:
+                print(f"Error loading IJEPA cache for {name}: {e}")
+                # Fall back to runtime extraction
+        
         # Build output dict
         output = {
             'image': image,
@@ -190,6 +302,10 @@ class SegmentationMaskDataset(Dataset):
             'scores': scores,  # [N]
             'filename': name,
         }
+        
+        # Add IJEPA embedding if loaded from cache
+        if ijepa_emb is not None:
+            output['ijepa_emb'] = ijepa_emb  # [1280] raw ViT-H/14 dimension
         
         if seg_masks is not None:
             output['seg_masks'] = seg_masks
@@ -292,12 +408,16 @@ def collate_seg_batch(batch):
         'filename': [item['filename'] for item in batch],
     }
     
+    # Add pre-cached IJEPA embeddings if present
+    if 'ijepa_emb' in batch[0]:
+        output['ijepa_emb'] = torch.stack([item['ijepa_emb'] for item in batch])
+    
     # Add class labels if present
     if 'class_label' in batch[0]:
         output['class_label'] = torch.stack([item['class_label'] for item in batch])
     
-    # Add masks if present
-    if 'seg_masks' in batch[0] and batch[0]['seg_masks'] is not None:
+    # Add masks if present (check all items have the key to avoid KeyError)
+    if all('seg_masks' in item for item in batch):
         # Note: masks may have different sizes, so we keep them as list
         output['seg_masks'] = [item['seg_masks'] for item in batch]
     

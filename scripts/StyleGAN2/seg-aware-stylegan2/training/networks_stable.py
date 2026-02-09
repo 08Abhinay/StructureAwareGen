@@ -182,7 +182,6 @@ class MappingNetwork(torch.nn.Module):
         activation      = 'lrelu',  # Activation function: 'relu', 'lrelu', etc.
         lr_multiplier   = 0.01,     # Learning rate multiplier for the mapping layers.
         w_avg_beta      = 0.995,    # Decay for tracking the moving average of W during training, None = do not track.
-        extra_dim       = 0,
     ):
         super().__init__()
         self.z_dim = z_dim
@@ -418,7 +417,6 @@ class SynthesisLayer(torch.nn.Module):
                  resample_filter=[1, 3, 3, 1],  # Low-pass filter to apply when resampling activations.
                  conv_clamp=None,  # Clamp the output of convolution layers to +-X, None = disable clamping.
                  channels_last=False,  # Use channels_last format for the weights?
-                 extra_dim=0,
                  ):
         super().__init__()
         self.resolution = resolution
@@ -429,7 +427,6 @@ class SynthesisLayer(torch.nn.Module):
         self.register_buffer('resample_filter', upfirdn2d.setup_filter(resample_filter))
         self.padding = kernel_size // 2
         self.act_gain = bias_act.activation_funcs[activation].def_gain
-        self.extra_dim = extra_dim
 
         self.affine = FullyConnectedLayer(w_dim, in_channels, bias_init=1)
         memory_format = torch.channels_last if channels_last else torch.contiguous_format

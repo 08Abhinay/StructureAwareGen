@@ -15,6 +15,7 @@ import psutil
 import PIL.Image
 import numpy as np
 import torch
+import torch.distributed as dist
 import dnnlib
 from torch_utils import misc
 from torch_utils import training_stats
@@ -23,6 +24,7 @@ from torch_utils.ops import grid_sample_gradfix
 
 import legacy
 from metrics import metric_main
+from training.sam_extractor import SAMExtractor, is_distributed, barrier
 
 #----------------------------------------------------------------------------
 
@@ -47,6 +49,113 @@ def custom_collate_fn(batch):
     else:
         # Tuple format - use default collate
         return torch.utils.data.default_collate(batch)
+
+#----------------------------------------------------------------------------
+
+def pre_extract_sam_embeddings(training_set, loss_kwargs, rank, num_gpus, device):
+    """
+    Pre-extract SAM embeddings for entire dataset in parallel across GPUs.
+    Each GPU processes a subset: images[rank::num_gpus]
+    
+    Args:
+        training_set: Training dataset
+        loss_kwargs: Loss kwargs containing SAM configuration
+        rank: Current process rank
+        num_gpus: Total number of GPUs
+        device: CUDA device
+    """
+    # Check if SAM is enabled
+    if not loss_kwargs.get('sam_enabled', False):
+        return
+    
+    sam_checkpoint = loss_kwargs.get('sam_checkpoint')
+    sam_cache_dir = loss_kwargs.get('sam_cache_dir')
+    
+    if sam_checkpoint is None or sam_cache_dir is None:
+        if rank == 0:
+            print("[Pre-extract] SAM enabled but checkpoint/cache_dir not provided, skipping pre-extraction")
+        return
+    
+    if rank == 0:
+        print()
+        print(f"Pre-extracting SAM embeddings across {num_gpus} GPU(s)...")
+        print(f"Total images: {len(training_set)}")
+        print(f"Cache directory: {sam_cache_dir}")
+    
+    # Create SAM extractor
+    extractor = SAMExtractor(
+        sam_checkpoint=sam_checkpoint,
+        cache_dir=sam_cache_dir,
+        device=device,
+        model_type=loss_kwargs.get('sam_model_type', 'vit_b'),
+        max_masks=loss_kwargs.get('sam_max_masks', 250),
+        rank=rank,
+        world_size=num_gpus
+    )
+    
+    # Collect all image paths
+    all_paths = []
+    for idx in range(len(training_set)):
+        data = training_set[idx]
+        if isinstance(data, dict) and 'paths' in data:
+            all_paths.append(data['paths'])
+        elif hasattr(training_set, 'get_path'):
+            path = training_set.get_path(idx)
+            if path:
+                all_paths.append(path)
+    
+    if len(all_paths) == 0:
+        if rank == 0:
+            print("[Pre-extract] No image paths found in dataset, skipping")
+        return
+    
+    # Get subset for this rank
+    rank_paths = extractor._get_rank_subset(all_paths)
+    
+    if rank == 0:
+        print(f"Each GPU will process ~{len(rank_paths)} images")
+    
+    # Process images for this rank
+    start_time = time.time()
+    processed = 0
+    total_rank = len(rank_paths)
+    
+    # Process in batches to show progress
+    batch_size = 10
+    for batch_start in range(0, total_rank, batch_size):
+        batch_end = min(batch_start + batch_size, total_rank)
+        batch_paths = rank_paths[batch_start:batch_end]
+        
+        # Extract or load from cache
+        _ = extractor.extract_or_load(batch_paths, image_tensors=None)
+        
+        processed += len(batch_paths)
+        
+        # Print progress every 50 images
+        if rank == 0 and processed % 50 == 0:
+            elapsed = time.time() - start_time
+            rate = processed / elapsed if elapsed > 0 else 0
+            print(f"  GPU {rank}: {processed}/{total_rank} images ({rate:.1f} img/sec)")
+    
+    # Wait for async writes to complete
+    extractor.async_writer.queue.join()
+    
+    elapsed = time.time() - start_time
+    if rank == 0:
+        stats = extractor.get_stats()
+        print(f"\nGPU {rank} completed: {processed} images in {elapsed:.1f}s")
+        print(f"  Cache hits: {stats['cache_hits']}, Cache misses: {stats['cache_misses']}")
+        print(f"  Hit rate: {stats['hit_rate']*100:.1f}%")
+    
+    # Synchronize all GPUs before proceeding
+    if num_gpus > 1:
+        if rank == 0:
+            print(f"\nWaiting for all {num_gpus} GPUs to complete...")
+        barrier()
+        
+        if rank == 0:
+            print(f"SAM extraction complete! All {len(all_paths)} images cached.")
+            print()
 
 #----------------------------------------------------------------------------
 
@@ -128,6 +237,8 @@ def training_loop(
     augment_kwargs          = None,     # Options for augmentation pipeline. None = disable.
     loss_kwargs             = {},       # Options for loss function.
     metrics                 = [],       # Metrics to evaluate during training.
+    metrics_seg_mode        = 'none',   # Structure conditioning mode for metrics: 'none', 'real', 'rdm'
+    metrics_rdm_checkpoint  = None,     # RDM checkpoint for metrics (if metrics_seg_mode='rdm')
     random_seed             = 0,        # Global random seed.
     num_gpus                = 1,        # Number of GPUs participating in the training.
     rank                    = 0,        # Rank of the current process in [0, num_gpus[.
@@ -167,14 +278,40 @@ def training_loop(
         print('Loading training set...')
     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs) # subclass of training.dataset.Dataset
     training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
-    training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, collate_fn=custom_collate_fn, **data_loader_kwargs))
+    # training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, collate_fn=custom_collate_fn, **data_loader_kwargs))
+    # Debug-friendly DataLoader: disable workers if debugging or single-GPU
+    debug_mode = os.environ.get('STYLEGAN_DEBUG', '0') == '1'
+    loader_kwargs = dict(data_loader_kwargs)
+    if debug_mode or num_gpus == 1:
+        if rank == 0:
+            print('[DEBUG MODE] Disabling DataLoader workers for debugging compatibility')
+        loader_kwargs['num_workers'] = 0
+        loader_kwargs['pin_memory'] = False
+        loader_kwargs['persistent_workers'] = False
+        loader_kwargs.pop('prefetch_factor', None)  # Only valid with num_workers>0
+
+    if rank == 0:
+        print(f'DataLoader config: {loader_kwargs}')
+
+    # Create DataLoader iterator (split for clearer debugging)
+    data_loader = torch.utils.data.DataLoader(
+        dataset=training_set,
+        sampler=training_set_sampler,
+        batch_size=batch_size//num_gpus,
+        collate_fn=custom_collate_fn,
+        **loader_kwargs
+    )
+    training_set_iterator = iter(data_loader)
+
     if rank == 0:
         print()
         print('Num images: ', len(training_set))
         print('Image shape:', training_set.image_shape)
         print('Label shape:', training_set.label_shape)
         print()
-        
+    
+    # Pre-extract SAM embeddings if enabled (parallel across GPUs)
+    pre_extract_sam_embeddings(training_set, loss_kwargs, rank, num_gpus, device)
     
     # Construct networks.
     if rank == 0:
@@ -226,6 +363,46 @@ def training_loop(
     if rank == 0:
         print('Setting up training phases...')
     loss = dnnlib.util.construct_class_by_name(device=device, **ddp_modules, **loss_kwargs) # subclass of training.loss.Loss
+    
+    # Initialize RDM sampler for mixed training (if enabled)
+    rdm_sampler = None
+    rdm_cache = None
+    rdm_checkpoint = loss_kwargs.get('rdm_checkpoint', None)
+    rdm_mix_prob = loss_kwargs.get('rdm_mix_prob', 0.0)
+    rdm_warmup_kimg = loss_kwargs.get('rdm_warmup_kimg', 10000)
+    
+    if rdm_checkpoint is not None and rdm_mix_prob > 0:
+        if rank == 0:
+            print(f'[RDM] Initializing RDM sampler from: {rdm_checkpoint}')
+            print(f'  Mix probability: {rdm_mix_prob}')
+            print(f'  Warmup kimg: {rdm_warmup_kimg}')
+        
+        try:
+            from training.rdm_sampler import RDMSampler, CachedRDMSampler
+            
+            # Initialize base sampler
+            base_sampler = RDMSampler(
+                rdm_checkpoint_path=rdm_checkpoint,
+                device=device,
+                use_ema=True,
+                ddim_steps=50  # Fast sampling
+            )
+            
+            # Use cached sampler for efficiency (only on rank 0 for now)
+            if rank == 0:
+                rdm_sampler = CachedRDMSampler(
+                    base_sampler,
+                    cache_size=500,  # Pre-generate 500 samples
+                    num_segments=180
+                )
+            
+            if rank == 0:
+                print('[RDM] Sampler initialized successfully')
+        except Exception as e:
+            if rank == 0:
+                print(f'[RDM] Warning: Failed to initialize RDM sampler: {e}')
+                print('[RDM] Continuing without RDM mixed training')
+            rdm_sampler = None
     
     phases = []
     for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
@@ -327,6 +504,39 @@ def training_loop(
             all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
             all_gen_c = torch.from_numpy(np.stack(all_gen_c)).pin_memory().to(device)
             all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
+            
+            # RDM Mixed Training: Replace real embeddings with RDM-sampled ones
+            # with probability rdm_mix_prob (after warmup)
+            if rdm_sampler is not None and has_seg_data and cur_nimg >= rdm_warmup_kimg * 1000:
+                # Compute current mix probability (gradual ramp-up)
+                progress = (cur_nimg - rdm_warmup_kimg * 1000) / (10000 * 1000)  # Ramp over 10M images
+                current_mix_prob = min(rdm_mix_prob, rdm_mix_prob * progress)
+                
+                # Decide whether to use RDM samples this batch
+                if np.random.rand() < current_mix_prob and rank == 0:
+                    try:
+                        # Sample from RDM (only rank 0 for simplicity)
+                        rdm_batch = rdm_sampler.sample(batch_size=batch_size)
+                        
+                        # Replace real embeddings with RDM-sampled ones
+                        # Note: We keep real images but use synthetic embeddings for conditioning
+                        # This teaches the decoder to handle RDM-sampled embeddings
+                        phase_real_seg_tokens = rdm_batch['seg_tokens'].to(device).split(batch_gpu)
+                        
+                        # Create padding masks (RDM generates fixed length, no padding)
+                        num_segments = rdm_batch['seg_tokens'].shape[1]
+                        rdm_pad_mask = torch.zeros(
+                            batch_size, num_segments, 
+                            dtype=torch.bool, device=device
+                        )
+                        phase_real_seg_pad_mask = rdm_pad_mask.split(batch_gpu)
+                        
+                        training_stats.report('Training/rdm_mixed_batch', 1.0)
+                    except Exception as e:
+                        if rank == 0:
+                            print(f'[RDM] Warning: Failed to sample from RDM: {e}')
+                        # Continue with real embeddings on error
+                        pass
 
         # Execute training phases.
         for phase, phase_gen_z, phase_gen_c in zip(phases, all_gen_z, all_gen_c):
@@ -464,7 +674,8 @@ def training_loop(
                 print('Evaluating metrics...')
             for metric in metrics:
                 result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
-                    dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
+                    dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device,
+                    seg_mode=metrics_seg_mode, rdm_checkpoint=metrics_rdm_checkpoint)
                 if rank == 0:
                     metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
                 stats_metrics.update(result_dict.results)

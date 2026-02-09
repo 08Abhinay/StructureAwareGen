@@ -34,7 +34,9 @@ class StyleGAN2Loss(Loss):
                  ijepa_ckpt=None, lambda_ijepa=0.0, ijepa_img=256, ijepa_in_ch=3,
                  ijepa_warmup_kimg=500,
                  sam_enabled=False, sam_prob=0.25, sam_checkpoint=None,
-                 sam_cache_dir=None, sam_model_type='vit_b', sam_max_masks=250):
+                 sam_cache_dir=None, sam_model_type='vit_b', sam_max_masks=250,
+                 lambda_seg_align=0.1, lambda_seg_diversity=0.05,
+                 rank=0, num_gpus=1):
         super().__init__()
         self.device = device
         self.G_mapping = G_mapping
@@ -47,6 +49,10 @@ class StyleGAN2Loss(Loss):
         self.pl_decay = pl_decay
         self.pl_weight = pl_weight
         self.pl_mean = torch.zeros([], device=device)
+        
+        # Alignment and diversity loss weights
+        self.lambda_seg_align = lambda_seg_align
+        self.lambda_seg_diversity = lambda_seg_diversity
         
         # ------------ SAM extractor (optional) -----------------------
         self.sam_enabled = sam_enabled
@@ -62,7 +68,9 @@ class StyleGAN2Loss(Loss):
                 cache_dir=sam_cache_dir,
                 device=device,
                 model_type=sam_model_type,
-                max_masks=sam_max_masks
+                max_masks=sam_max_masks,
+                rank=rank,
+                world_size=num_gpus
             )
             print(f"[Loss] SAM extractor enabled with prob={sam_prob}")
         
@@ -70,11 +78,25 @@ class StyleGAN2Loss(Loss):
         self.sam_rng = random.Random(42)
 
         # ------------ frozen I‑JEPA encoder ---------------------------
-        self.enc, _ = build_ijepa_encoder(
+        # Build encoder FIRST so we know the output dimension for downstream layers
+        self.enc, self.enc_meta = build_ijepa_encoder(
             ijepa_ckpt,
             device=device,
             in_channels_override=ijepa_in_ch)
         self.enc.eval().requires_grad_(False)
+        self.ijepa_out_dim = self.enc_meta['out_dim']  # e.g. 1280 for ViT-H
+        print(f"[Loss] I-JEPA encoder output dim = {self.ijepa_out_dim}")
+
+        # SAM -> I-JEPA projection MLP for alignment loss
+        if sam_enabled and lambda_seg_align > 0:
+            self.sam_proj_mlp = nn.Sequential(
+                nn.Linear(256, 512),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Linear(512, self.ijepa_out_dim)
+            ).to(device)
+            print(f"[Loss] SAM projection MLP created: 256→512→{self.ijepa_out_dim} (weight={lambda_seg_align})")
+        else:
+            self.sam_proj_mlp = None
 
         # self.lambda_ijepa = float(lambda_ijepa)
         # self.expect_c = ijepa_in_ch
@@ -94,6 +116,88 @@ class StyleGAN2Loss(Loss):
         # Verify that mapping is the fusion version.
         if not hasattr(core, "proj_ijepa"):
             raise ValueError("G.mapping must be an IJEPAFusionMapping instance.")
+    
+    # ------------------------------------------------------------------
+    # Diversity & Alignment Loss Methods
+    # ------------------------------------------------------------------
+    def compute_seg_diversity_loss(self, seg_tokens, seg_pad_mask=None, eps=1e-6):
+        """
+        Diversity loss on SAM segment embeddings (monitors real embeddings).
+        Encourages diverse segment representations to prevent collapse.
+        
+        Args:
+            seg_tokens: [B, N, 256] SAM segment embeddings
+            seg_pad_mask: [B, N] boolean mask (True = padded)
+            eps: Regularization constant
+            
+        Returns:
+            Scalar diversity loss (lower = more diverse)
+        """
+        B, N, C = seg_tokens.shape
+        
+        # Remove padding
+        if seg_pad_mask is not None:
+            mask = ~seg_pad_mask  # [B, N]
+        else:
+            mask = torch.ones(B, N, dtype=torch.bool, device=seg_tokens.device)
+        
+        # Compute pairwise cosine similarities within each sample
+        # (O(N^2) but more efficient than determinant for monitoring)
+        seg_norm = F.normalize(seg_tokens, dim=2)  # [B, N, C]
+        
+        losses = []
+        for i in range(B):
+            valid_tokens = seg_norm[i, mask[i]]  # [N_valid, C]
+            if valid_tokens.shape[0] < 2:
+                continue
+            
+            # Pairwise similarity matrix
+            sim_matrix = torch.mm(valid_tokens, valid_tokens.t())  # [N_valid, N_valid]
+            
+            # Average off-diagonal similarities (we want this low for diversity)
+            n_valid = valid_tokens.shape[0]
+            # Exclude diagonal (self-similarity = 1)
+            off_diag = sim_matrix - torch.eye(n_valid, device=sim_matrix.device)
+            avg_sim = off_diag.sum() / (n_valid * (n_valid - 1))
+            
+            # Loss: high similarity = high loss (want diverse = low similarity)
+            losses.append(avg_sim)
+        
+        return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=seg_tokens.device)
+    
+    def compute_seg_alignment_loss(self, ijepa_features, seg_tokens, seg_pad_mask=None):
+        """
+        Alignment loss between I-JEPA global features and SAM segment embeddings.
+        Ensures semantic coherence between global and local representations.
+        
+        Args:
+            ijepa_features: [B, ijepa_out_dim] I-JEPA global features (e.g. 1280 for ViT-H)
+            seg_tokens: [B, N, 256] SAM segment embeddings
+            seg_pad_mask: [B, N] boolean mask (True = padded)
+            
+        Returns:
+            Scalar alignment loss
+        """
+        if self.sam_proj_mlp is None:
+            return torch.tensor(0.0, device=ijepa_features.device)
+        
+        B, N, C = seg_tokens.shape
+        
+        # Pool SAM segments (average over valid tokens)
+        if seg_pad_mask is not None:
+            valid_mask = ~seg_pad_mask  # [B, N]
+            mask_float = valid_mask.float().unsqueeze(2)  # [B, N, 1]
+            seg_pooled = (seg_tokens * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp(min=1)  # [B, 256]
+        else:
+            seg_pooled = seg_tokens.mean(dim=1)  # [B, 256]
+        
+        # Project SAM pooled features to I-JEPA space
+        seg_projected = self.sam_proj_mlp(seg_pooled)  # [B, ijepa_out_dim]
+        
+        # Cosine similarity loss (higher similarity = lower loss)
+        alignment_loss = 1.0 - F.cosine_similarity(ijepa_features, seg_projected, dim=1).mean()
+        
+        return alignment_loss
 
     # ------------------------------------------------------------------
     # helper: global (B, D=384) feature
@@ -196,9 +300,6 @@ class StyleGAN2Loss(Loss):
                 real_seg_tokens = None
                 real_seg_pad_mask = None
 
-
-        zero_embed = torch.zeros(gen_z.size(0), 2048, device=self.device)
-      
         # ───────────────── ramp & weight ─────────────────────────────────────────
         ramp      = ((self.cur_kimg - 2.0) / (self.warmup_kimg - 2.0)).clamp(0.0, 1.0)
         sem_ramp  = float(ramp.item())
@@ -207,7 +308,7 @@ class StyleGAN2Loss(Loss):
         training_stats.report("Loss/IJEPA_weight", lam)
 
         # ───────────────── semantic targets ─────────────────────────────────────
-        target_f        = self._feat(real_img).detach()          # (B, 2048)
+        target_f        = self._feat(real_img).detach()          # (B, ijepa_out_dim)
         batch_size_pl   = gen_z.shape[0] // self.pl_batch_shrink
         target_f_small  = target_f[:batch_size_pl] if do_Gpl else None
         seg_tokens_pl   = real_seg_tokens[:batch_size_pl] if (do_Gpl and real_seg_tokens is not None) else None
@@ -250,6 +351,24 @@ class StyleGAN2Loss(Loss):
                 fake_f = self._feat(gen_img)
                 loss_Gfm = 1.0 - F.cosine_similarity(fake_f, target_f, dim=1)
                 loss_Gmain = loss_Gadv + lam * loss_Gfm
+                
+                # Add alignment and diversity losses (if SAM is enabled)
+                if real_seg_tokens is not None:
+                    # Diversity loss (monitor real embeddings for collapse)
+                    if self.lambda_seg_diversity > 0:
+                        loss_diversity = self.compute_seg_diversity_loss(
+                            real_seg_tokens, real_seg_pad_mask
+                        )
+                        training_stats.report('Loss/G/diversity', loss_diversity)
+                        loss_Gmain = loss_Gmain + self.lambda_seg_diversity * loss_diversity * sem_ramp
+                    
+                    # Alignment loss (semantic coherence between I-JEPA and SAM)
+                    if self.lambda_seg_align > 0:
+                        loss_alignment = self.compute_seg_alignment_loss(
+                            target_f, real_seg_tokens, real_seg_pad_mask
+                        )
+                        training_stats.report('Loss/G/alignment', loss_alignment)
+                        loss_Gmain = loss_Gmain + self.lambda_seg_align * loss_alignment * sem_ramp
 
                 training_stats.report('Loss/G/loss', loss_Gmain)
 
@@ -261,10 +380,6 @@ class StyleGAN2Loss(Loss):
         # Gpl: Apply path length regularization.
         if do_Gpl:
             with torch.autograd.profiler.record_function('Gpl_forward'):
-                # batch_size = gen_z.shape[0] // self.pl_batch_shrink
-                # gen_img, gen_ws = self.run_G(gen_z[:batch_size], gen_c[:batch_size], e_ijepa=zero_embed[:batch_size],
-                #                              sem_ramp=0.0, sync=sync)
-                
                 # Disable segmentation conditioning during Gpl to avoid double-gradient error
                 # with efficient attention kernels (create_graph=True incompatible)
                 gen_img, gen_ws = self.run_G(
@@ -304,8 +419,6 @@ class StyleGAN2Loss(Loss):
         loss_Dgen = 0
         if do_Dmain:
             with torch.autograd.profiler.record_function('Dgen_forward'):
-                # gen_img, _gen_ws = self.run_G(gen_z, gen_c, e_ijepa=zero_embed, sem_ramp=0.0, sync=False)
-                
                 gen_img, _ = self.run_G(
                     gen_z, gen_c,
                     e_ijepa=target_f,
@@ -325,9 +438,7 @@ class StyleGAN2Loss(Loss):
                     seg_ramp=seg_ramp,
                     sync=False,
                 )
-                
 
-                # gen_logits = self.run_D(gen_img, gen_c, e_ijepa=zero_embed, sem_ramp=0.0, sync=False)  # Gets synced by loss_Dreal.
                 training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())
                 loss_Dgen = torch.nn.functional.softplus(gen_logits)  # -log(1 - sigmoid(gen_logits))
@@ -343,7 +454,6 @@ class StyleGAN2Loss(Loss):
             name = 'Dreal_Dr1' if do_Dmain and do_Dr1 else 'Dreal' if do_Dmain else 'Dr1'
             with torch.autograd.profiler.record_function(name + '_forward'):
                 real_img_tmp = real_img.detach().requires_grad_(do_Dr1)
-                # real_logits = self.run_D(real_img_tmp, real_c, e_ijepa=zero_embed, sem_ramp=0.0, sync=sync)
                 real_logits  = self.run_D(
                     real_img_tmp, real_c,
                     e_ijepa=target_f,

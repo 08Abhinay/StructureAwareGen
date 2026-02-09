@@ -34,6 +34,8 @@ def setup_training_loop_kwargs(
     gpus       = None, # Number of GPUs: <int>, default = 1 gpu
     snap       = None, # Snapshot interval: <int>, default = 50 ticks
     metrics    = None, # List of metric names: [], ['fid50k_full'] (default), ...
+    metrics_seg_mode = None, # Structure conditioning mode for metrics: 'none' (default), 'real', 'rdm'
+    metrics_rdm_checkpoint = None, # RDM checkpoint for metrics (required if metrics_seg_mode='rdm'): <path>
     seed       = None, # Random seed: <int>, default = 0
 
     # Dataset.
@@ -70,7 +72,7 @@ def setup_training_loop_kwargs(
     ijepa_lambda = None,
     ijepa_image    = None,
     ijepa_input_channel  = None,
-    extra_dim = None,
+    ijepa_dim = None,
     ijepa_warmup_kimg=100,
     fusion_depth=4,
     sem_mixing_prob=0.9,
@@ -118,6 +120,15 @@ def setup_training_loop_kwargs(
     if not all(metric_main.is_valid_metric(metric) for metric in metrics):
         raise UserError('\n'.join(['--metrics can only contain the following values:'] + metric_main.list_valid_metrics()))
     args.metrics = metrics
+
+    # Metrics structure conditioning mode
+    if metrics_seg_mode is None:
+        metrics_seg_mode = 'none'
+    assert metrics_seg_mode in ['none', 'real', 'rdm']
+    if metrics_seg_mode == 'rdm' and metrics_rdm_checkpoint is None:
+        raise UserError('--metrics-rdm-checkpoint is required when --metrics-seg-mode=rdm')
+    args.metrics_seg_mode = metrics_seg_mode
+    args.metrics_rdm_checkpoint = metrics_rdm_checkpoint
 
     if seed is None:
         seed = 0
@@ -236,7 +247,8 @@ def setup_training_loop_kwargs(
     args.D_kwargs = dnnlib.EasyDict(class_name='training.networks.Discriminator', block_kwargs=dnnlib.EasyDict(), mapping_kwargs=dnnlib.EasyDict(), epilogue_kwargs=dnnlib.EasyDict())
     args.G_kwargs.synthesis_kwargs.channel_base = args.D_kwargs.channel_base = int(spec.fmaps * 32768)
     args.G_kwargs.synthesis_kwargs.channel_max = args.D_kwargs.channel_max = 512
-    args.G_kwargs.mapping_kwargs.extra_dim = extra_dim
+    args.G_kwargs.mapping_kwargs.ijepa_dim = ijepa_dim
+    args.D_kwargs.ijepa_dim = ijepa_dim
     args.G_kwargs.mapping_kwargs.num_layers = spec.map
     args.G_kwargs.mapping_kwargs.fusion_depth = fusion_depth
     args.G_kwargs.mapping_kwargs.sem_mixing_prob = sem_mixing_prob
@@ -459,6 +471,11 @@ def subprocess_fn(rank, args, temp_dir):
     training_stats.init_multiprocessing(rank=rank, sync_device=sync_device)
     if rank != 0:
         custom_ops.verbosity = 'none'
+    
+    # Add rank and num_gpus to loss_kwargs for SAMExtractor
+    if hasattr(args, 'loss_kwargs'):
+        args.loss_kwargs.rank = rank
+        args.loss_kwargs.num_gpus = args.num_gpus
 
     # Execute training loop.
     training_loop.training_loop(rank=rank, **args)
@@ -484,6 +501,8 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--gpus', help='Number of GPUs to use [default: 1]', type=int, metavar='INT')
 @click.option('--snap', help='Snapshot interval [default: 50 ticks]', type=int, metavar='INT')
 @click.option('--metrics', help='Comma-separated list or "none" [default: fid50k_full]', type=CommaSeparatedList())
+@click.option('--metrics-seg-mode', help='Structure conditioning mode for metrics evaluation', type=click.Choice(['none', 'real', 'rdm']), default='none', show_default=True)
+@click.option('--metrics-rdm-checkpoint', help='RDM checkpoint path for metrics (required if metrics-seg-mode=rdm)', metavar='PATH', type=str)
 @click.option('--seed', help='Random seed [default: 0]', type=int, metavar='INT')
 @click.option('-n', '--dry-run', help='Print training options and exit', is_flag=True)
 
@@ -520,12 +539,12 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--ijepa_checkpoint', help='Provide the ijepa checkpoint for guided generation', type=str)
 @click.option('--ijepa_lambda', help='Frequency of ijepa', type=float, default=1.0)
 @click.option('--ijepa_image', help='Resolution of pretrained ijepa', type=int, default=256)
-@click.option('--ijepa_input_channel', help='RGB(3) or Grayscaled(1)?', type=int, default=1)
-@click.option('--extra_dim', help='what is the ijepa embedding dimension? ', type=int, default=384)
+@click.option('--ijepa_input_channel', help='RGB(3) or Grayscaled(1)?', type=int, default=3)
+@click.option('--ijepa_dim', help='I-JEPA embedding dimension (auto-detected: ViT-H=1280, ViT-L=1024, ViT-B=384)', type=int, default=1280)
 @click.option('--ijepa_warmup_kimg', help='How many warm up images? ', type=float, default=100)
-@click.option('--fusion_depth', help='How many layers of ijepa embeddings? ', type=int, default=4)
-@click.option('--sem_mixing_prob', help='Semantic cutoff? ', type=float, default=0.9)
-@click.option('--fusion_alpha', help=' Intesity of Ijepa? ', type=float, default=0.2)
+@click.option('--fusion_depth', help='How many layers of ijepa embeddings? ', type=int, default=6)
+@click.option('--sem_mixing_prob', help='Semantic mixing probability (0=always full fusion)', type=float, default=0.0)
+@click.option('--fusion_alpha', help='Initial fusion strength (bounded by tanh)', type=float, default=0.3)
 
 # Segmentation options
 @click.option('--sam-npz-dir', help='Directory with SAM .npz embeddings', metavar='DIR', type=str)

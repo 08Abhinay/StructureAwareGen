@@ -32,12 +32,52 @@ Usage:
 import os
 import numpy as np
 import torch
+import torch.distributed as dist
 import threading
 import queue
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 import PIL.Image
+try:
+    from filelock import FileLock
+except ImportError:
+    FileLock = None
+    print("[SAMExtractor] Warning: filelock not installed. Install with: pip install filelock")
+    print("[SAMExtractor] Falling back to non-locking mode (may cause issues with multi-GPU)")
+try:
+    from filelock import FileLock
+except ImportError:
+    FileLock = None
+    print("[SAMExtractor] Warning: filelock not installed. Install with: pip install filelock")
+    print("[SAMExtractor] Falling back to non-locking mode (may cause issues with multi-GPU)")
 
+
+#----------------------------------------------------------------------------
+# Distributed training utilities
+#----------------------------------------------------------------------------
+
+def is_distributed() -> bool:
+    """Check if running in distributed mode"""
+    return dist.is_available() and dist.is_initialized()
+
+def get_rank() -> int:
+    """Get current process rank (0 if not distributed)"""
+    if is_distributed():
+        return dist.get_rank()
+    return 0
+
+def get_world_size() -> int:
+    """Get total number of processes (1 if not distributed)"""
+    if is_distributed():
+        return dist.get_world_size()
+    return 1
+
+def barrier():
+    """Synchronize all processes (no-op if not distributed)"""
+    if is_distributed():
+        dist.barrier()
+
+#----------------------------------------------------------------------------
 
 class AsyncWriter:
     """Background thread for non-blocking file writes"""
@@ -57,7 +97,22 @@ class AsyncWriter:
             filepath, data = item
             try:
                 os.makedirs(os.path.dirname(filepath), exist_ok=True)
-                np.savez_compressed(filepath, **data)
+                
+                # Use file locking for multi-GPU safety
+                if FileLock is not None:
+                    lock_path = filepath + '.lock'
+                    with FileLock(lock_path, timeout=300):  # 5 min timeout
+                        # Double-check if another process wrote it while we waited
+                        if not os.path.exists(filepath):
+                            np.savez_compressed(filepath, **data)
+                    # Clean up lock file
+                    try:
+                        os.remove(lock_path)
+                    except:
+                        pass
+                else:
+                    # Fallback without locking (single-GPU or filelock not installed)
+                    np.savez_compressed(filepath, **data)
             except Exception as e:
                 print(f"[AsyncWriter] Failed to save {filepath}: {e}")
             finally:
@@ -90,10 +145,12 @@ class SAMExtractor:
         cache_dir: str,
         device: str = "cuda",
         model_type: str = "vit_b",
-        max_masks: int = 250
+        max_masks: int = 250,
+        rank: Optional[int] = None,
+        world_size: Optional[int] = None
     ):
         """
-        Initialize SAM extractor.
+        Initialize SAM extractor
         
         Args:
             sam_checkpoint: Path to SAM checkpoint file
@@ -101,12 +158,18 @@ class SAMExtractor:
             device: Device to run SAM on ("cuda" or "cpu")
             model_type: SAM model type ("vit_b", "vit_l", "vit_h")
             max_masks: Maximum number of mask embeddings to keep per image
+            rank: Process rank for distributed training (None = auto-detect)
+            world_size: Total number of processes (None = auto-detect)
         """
         self.sam_checkpoint = sam_checkpoint
         self.cache_dir = cache_dir
         self.device = device
         self.model_type = model_type
         self.max_masks = max_masks
+        
+        # Distributed training support
+        self.rank = rank if rank is not None else get_rank()
+        self.world_size = world_size if world_size is not None else get_world_size()
         
         # Lazy initialization - SAM not loaded until needed
         self.sam = None
@@ -145,6 +208,23 @@ class SAMExtractor:
         self.predictor = SamPredictor(self.sam)  # For extracting image embeddings
         
         print(f"[SAMExtractor] SAM model loaded successfully")
+    
+    def _get_rank_subset(self, image_paths: List[str]) -> List[str]:
+        """
+        Get subset of images for this rank to process.
+        Uses strided indexing for load balancing: rank 0 gets [0,4,8,...], rank 1 gets [1,5,9,...]
+        
+        Args:
+            image_paths: Full list of image paths
+            
+        Returns:
+            Subset for this rank
+        """
+        if self.world_size == 1:
+            return image_paths
+        
+        # Strided indexing: [rank::world_size]
+        return image_paths[self.rank::self.world_size]
     
     def _get_cache_path(self, image_path: str) -> str:
         """
@@ -344,13 +424,40 @@ class SAMExtractor:
             if cached is not None:
                 results.append(cached)
             else:
-                # Extract from image
-                img_tensor = image_tensors[i:i+1] if image_tensors is not None else None
-                extracted = self._extract_single(image_path, img_tensor)
-                results.append(extracted)
-                
-                # Save to cache asynchronously
-                self.async_writer.save(cache_path, extracted)
+                # Use file locking to prevent concurrent extraction by multiple GPUs
+                if FileLock is not None:
+                    lock_path = cache_path + '.lock'
+                    try:
+                        with FileLock(lock_path, timeout=300):  # 5 min timeout
+                            # Double-check cache after acquiring lock (another GPU may have written it)
+                            cached = self._load_from_cache(cache_path)
+                            if cached is not None:
+                                results.append(cached)
+                            else:
+                                # Extract from image
+                                img_tensor = image_tensors[i:i+1] if image_tensors is not None else None
+                                extracted = self._extract_single(image_path, img_tensor)
+                                results.append(extracted)
+                                
+                                # Save to cache asynchronously (will use locking internally)
+                                self.async_writer.save(cache_path, extracted)
+                        # Clean up lock file
+                        try:
+                            os.remove(lock_path)
+                        except:
+                            pass
+                    except Exception as e:
+                        print(f"[SAMExtractor] Lock timeout or error for {image_path}: {e}")
+                        # Fallback: extract without saving to cache
+                        img_tensor = image_tensors[i:i+1] if image_tensors is not None else None
+                        extracted = self._extract_single(image_path, img_tensor)
+                        results.append(extracted)
+                else:
+                    # No locking available - extract and save
+                    img_tensor = image_tensors[i:i+1] if image_tensors is not None else None
+                    extracted = self._extract_single(image_path, img_tensor)
+                    results.append(extracted)
+                    self.async_writer.save(cache_path, extracted)
         
         return results
     

@@ -19,7 +19,7 @@ import dnnlib
 #----------------------------------------------------------------------------
 
 class MetricOptions:
-    def __init__(self, G=None, G_kwargs={}, dataset_kwargs={}, num_gpus=1, rank=0, device=None, progress=None, cache=True):
+    def __init__(self, G=None, G_kwargs={}, dataset_kwargs={}, num_gpus=1, rank=0, device=None, progress=None, cache=True, seg_mode='none', rdm_checkpoint=None):
         assert 0 <= rank < num_gpus
         self.G              = G
         self.G_kwargs       = dnnlib.EasyDict(G_kwargs)
@@ -29,6 +29,8 @@ class MetricOptions:
         self.device         = device if device is not None else torch.device('cuda', rank)
         self.progress       = progress.sub() if progress is not None and rank == 0 else ProgressMonitor()
         self.cache          = cache
+        self.seg_mode       = seg_mode  # 'none', 'real', or 'rdm'
+        self.rdm_checkpoint = rdm_checkpoint
 
 #----------------------------------------------------------------------------
 
@@ -331,17 +333,33 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
     G = copy.deepcopy(opts.G).eval().requires_grad_(False).to(opts.device)
     dataset = dnnlib.util.construct_class_by_name(**opts.dataset_kwargs)
 
+    # Initialize RDM sampler if needed
+    rdm_sampler = None
+    if opts.seg_mode == 'rdm':
+        if opts.rdm_checkpoint is None:
+            raise ValueError("seg_mode='rdm' requires rdm_checkpoint path")
+        from training.rdm_sampler import RDMSampler
+        rdm_sampler = RDMSampler(
+            rdm_checkpoint_path=opts.rdm_checkpoint,
+            device=opts.device,
+            use_ema=True,
+            ddim_steps=50
+        )
+        print(f"Loaded RDM sampler from {opts.rdm_checkpoint}")
+
     # Image generation func.
-    def run_generator(z, c):
-        img = G(z=z, c=c, **opts.G_kwargs)
+    def run_generator(z, c, e_ijepa=None, seg_tokens=None, seg_pad_mask=None):
+        img = G(z=z, c=c, e_ijepa=e_ijepa, seg_tokens=seg_tokens, seg_pad_mask=seg_pad_mask, **opts.G_kwargs)
         img = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         return img
 
-    # JIT.
-    if jit:
+    # JIT disabled when using structure conditioning
+    if jit and opts.seg_mode == 'none':
         z = torch.zeros([batch_gen, G.z_dim], device=opts.device)
         c = torch.zeros([batch_gen, G.c_dim], device=opts.device)
         run_generator = torch.jit.trace(run_generator, [z, c], check_trace=False)
+    elif jit and opts.seg_mode != 'none':
+        print("Warning: JIT disabled when using structure conditioning (seg_mode != 'none')")
 
     # Initialize.
     stats = FeatureStats(
@@ -355,6 +373,14 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
     progress = opts.progress.sub(tag='generator features', num_items=stats.max_items, rel_lo=rel_lo, rel_hi=rel_hi)
     detector = get_feature_detector(url=detector_url, device=opts.device, num_gpus=opts.num_gpus, rank=opts.rank, verbose=progress.verbose)
 
+    # Setup iterator for 'real' mode
+    dataset_iterator = None
+    if opts.seg_mode == 'real':
+        dataset_sampler = torch.utils.data.RandomSampler(dataset)
+        dataset_iterator = iter(torch.utils.data.DataLoader(
+            dataset=dataset, sampler=dataset_sampler, batch_size=batch_gen
+        ))
+
     # Main loop.
     while not stats.is_full():
         images = []
@@ -362,17 +388,66 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
 
         # build one big batch of images *and* record the discrete class IDs
         for _ in range(batch_size // batch_gen):
-            # 1) sample integer class indices
-            idxs = np.random.randint(len(dataset), size=batch_gen)
-            batch_ids.append(idxs)
-
-            # 2) fetch the corresponding conditioning vectors
-            c_list = [dataset.get_label(i) for i in idxs]
-            c_tensor = torch.from_numpy(np.stack(c_list)).pin_memory().to(opts.device)
-
-            # 3) generate images
             z = torch.randn([batch_gen, G.z_dim], device=opts.device)
-            images.append(run_generator(z, c_tensor))
+            
+            if opts.seg_mode == 'none':
+                # Unconditional mode: random z and c, no structure
+                idxs = np.random.randint(len(dataset), size=batch_gen)
+                batch_ids.append(idxs)
+                c_list = [dataset.get_label(i) for i in idxs]
+                c_tensor = torch.from_numpy(np.stack(c_list)).pin_memory().to(opts.device)
+                images.append(run_generator(z, c_tensor))
+                
+            elif opts.seg_mode == 'real':
+                # Real mode: get embeddings from dataset
+                try:
+                    batch_data = next(dataset_iterator)
+                except StopIteration:
+                    dataset_sampler = torch.utils.data.RandomSampler(dataset)
+                    dataset_iterator = iter(torch.utils.data.DataLoader(
+                        dataset=dataset, sampler=dataset_sampler, batch_size=batch_gen
+                    ))
+                    batch_data = next(dataset_iterator)
+                
+                if isinstance(batch_data, dict):
+                    c_tensor = batch_data['label'].to(opts.device)
+                    e_ijepa = batch_data.get('global_vec', None)
+                    seg_tokens = batch_data.get('seg_tokens', None)
+                    seg_pad_mask = batch_data.get('seg_pad_mask', None)
+                    
+                    if e_ijepa is not None:
+                        e_ijepa = e_ijepa.to(opts.device)
+                    if seg_tokens is not None:
+                        seg_tokens = seg_tokens.to(opts.device)
+                    if seg_pad_mask is not None:
+                        seg_pad_mask = seg_pad_mask.to(opts.device)
+                    
+                    # Extract class indices for PR metrics
+                    idxs = c_tensor.argmax(dim=1).cpu().numpy()
+                    batch_ids.append(idxs)
+                else:
+                    # Legacy tuple format
+                    c_tensor = batch_data[1].to(opts.device)
+                    e_ijepa, seg_tokens, seg_pad_mask = None, None, None
+                    idxs = c_tensor.argmax(dim=1).cpu().numpy()
+                    batch_ids.append(idxs)
+                    
+                images.append(run_generator(z, c_tensor, e_ijepa, seg_tokens, seg_pad_mask))
+                
+            elif opts.seg_mode == 'rdm':
+                # RDM mode: sample synthetic embeddings
+                idxs = np.random.randint(len(dataset), size=batch_gen)
+                batch_ids.append(idxs)
+                c_list = [dataset.get_label(i) for i in idxs]
+                c_tensor = torch.from_numpy(np.stack(c_list)).pin_memory().to(opts.device)
+                
+                # Sample from RDM
+                rdm_batch = rdm_sampler.sample(batch_size=batch_gen, num_segments=250)
+                e_ijepa = rdm_batch['global_vectors'].to(opts.device)
+                seg_tokens = rdm_batch['seg_tokens'].to(opts.device)
+                seg_pad_mask = torch.zeros(batch_gen, 250, dtype=torch.bool, device=opts.device)
+                
+                images.append(run_generator(z, c_tensor, e_ijepa, seg_tokens, seg_pad_mask))
 
         # concatenate everything
         images = torch.cat(images, dim=0)
