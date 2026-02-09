@@ -109,8 +109,8 @@ def pre_extract_sam_embeddings(training_set, loss_kwargs, rank, num_gpus, device
             print("[Pre-extract] No image paths found in dataset, skipping")
         return
     
-    # Get subset for this rank
-    rank_paths = extractor._get_rank_subset(all_paths)
+    # Split images across GPUs: rank gets every num_gpus-th image
+    rank_paths = all_paths[rank::num_gpus]
     
     if rank == 0:
         print(f"Each GPU will process ~{len(rank_paths)} images")
@@ -360,15 +360,18 @@ def training_loop(
             ddp_modules[name] = module
 
     # Setup training phases.
+    # Extract RDM keys from loss_kwargs BEFORE passing to Loss constructor
+    # (StyleGAN2Loss.__init__ doesn't accept these; they're only used by training_loop)
+    rdm_checkpoint = loss_kwargs.pop('rdm_checkpoint', None)
+    rdm_mix_prob = loss_kwargs.pop('rdm_mix_prob', 0.0)
+    rdm_warmup_kimg = loss_kwargs.pop('rdm_warmup_kimg', 10000)
+
     if rank == 0:
         print('Setting up training phases...')
     loss = dnnlib.util.construct_class_by_name(device=device, **ddp_modules, **loss_kwargs) # subclass of training.loss.Loss
     
     # Initialize RDM sampler for mixed training (if enabled)
     rdm_sampler = None
-    rdm_checkpoint = loss_kwargs.get('rdm_checkpoint', None)
-    rdm_mix_prob = loss_kwargs.get('rdm_mix_prob', 0.0)
-    rdm_warmup_kimg = loss_kwargs.get('rdm_warmup_kimg', 10000)
     
     if rdm_checkpoint is not None and rdm_mix_prob > 0:
         if rank == 0:
