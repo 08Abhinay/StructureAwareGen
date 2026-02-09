@@ -1,0 +1,1003 @@
+\documentclass[12pt]{article}
+\usepackage{graphicx}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\title{Structure-Aware Generation via Representation Diffusion:\\
+Theoretical Foundations}
+\author{Abhinay Belde}
+\date{February 2026}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{assumption}[theorem]{Assumption}
+
+\DeclareMathOperator{\Tr}{Tr}
+\DeclareMathOperator{\diag}{diag}
+\DeclareMathOperator{\softmax}{softmax}
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+
+%% ====================================================================
+\section{Problem Setup and Notation}
+\label{sec:setup}
+%% ====================================================================
+
+Let $\mathcal{X} \subseteq \mathbb{R}^{3 \times H \times W}$ denote the
+space of RGB images of resolution $H \times W$, and let
+$X \sim p_{\mathrm{data}}$ be a random image drawn from the data distribution.
+We employ two frozen, pretrained encoders:
+\begin{enumerate}
+    \item \textbf{I-JEPA encoder}
+    (Image-based Joint-Embedding Predictive Architecture~\cite{assran2023ijepa}):
+    a ViT-H/14 context encoder
+    $\phi_{\mathrm{jepa}} : \mathcal{X} \to \mathbb{R}^{d_g}$
+    that maps an image to a global semantic representation $g = \phi_{\mathrm{jepa}}(x)$
+    with $d_g = 1280$.
+    In practice, the raw ViT output is projected to $\mathbb{R}^{256}$ via
+    a learned linear projection $W_{\mathrm{proj}} \in \mathbb{R}^{256 \times 1280}$.
+    We write $g \in \mathbb{R}^{256}$ for the projected embedding.
+    \item \textbf{SAM encoder}
+    (Segment Anything Model~\cite{kirillov2023sam}):
+    an image encoder followed by per-mask average pooling,
+    $\phi_{\mathrm{sam}} : \mathcal{X} \to \mathbb{R}^{N \times d_s}$,
+    that yields $N$ segment-level embeddings
+    $s_1, \ldots, s_N \in \mathbb{R}^{d_s}$
+    with $d_s = 256$.
+    Each $s_i$ is the spatially pooled SAM feature map restricted to
+    the $i$-th mask region $M_i \subset \Omega$,
+    where $\{M_i\}_{i=1}^{N}$ is a partition of the image grid
+    $\Omega = \{1,\ldots,H\}\times\{1,\ldots,W\}$.
+\end{enumerate}
+
+For a given image $x$, we define the \emph{unified token sequence}
+\begin{equation}\label{eq:token-sequence}
+    z = \bigl[\, g,\; s_1,\; s_2,\; \ldots,\; s_N \,\bigr]
+    \;\in\; \mathbb{R}^{(1+N) \times 256},
+\end{equation}
+where the first token is the I-JEPA global vector and the remaining
+$N$ tokens are SAM segment embeddings.
+In practice, sequences are padded to a fixed length $L = 251$ with
+zero vectors and a boolean padding mask $m \in \{0,1\}^L$ is maintained.
+
+%% ====================================================================
+\section{Two-Stage Generative Model}
+\label{sec:two-stage}
+%% ====================================================================
+
+Our generative framework factorises image synthesis into two stages.
+
+\begin{definition}[Two-stage factorisation]
+\label{def:two-stage}
+Define the latent variable $z = (g, S)$ with $g \in \mathbb{R}^{256}$ and
+$S = (s_1, \ldots, s_N) \in \mathbb{R}^{N \times 256}$.
+The data distribution is decomposed as
+\begin{equation}\label{eq:marginalisation}
+    p_{\mathrm{data}}(x)
+    = \int p(x \mid g, S)\, p(g, S)\, dg\, dS,
+\end{equation}
+and our model approximates each factor:
+\begin{itemize}
+    \item \textbf{Stage~1} (Representation Diffusion Model):
+    a denoising diffusion probabilistic model (DDPM)~\cite{ho2020ddpm}
+    that learns $p_\theta(g, S) \approx p(g, S)$
+    in the joint representation space.
+    \item \textbf{Stage~2} (Structure-Aware Generator):
+    a conditional StyleGAN2-based generator~\cite{karras2020stylegan2}
+    that learns $p_\psi(x \mid g, S) \approx p(x \mid g, S)$
+    via adversarial training with structural conditioning.
+\end{itemize}
+\end{definition}
+
+At inference, we sample
+$\hat{z} = (\hat{g}, \hat{S}) \sim p_\theta$
+and decode
+$\hat{x} = G_\psi(\hat{g}, \hat{S})$,
+yielding an overall generative model
+\begin{equation}\label{eq:generative-model}
+    \hat{p}(x) = \int p_\psi(x \mid g, S)\, p_\theta(g, S)\, dg\, dS.
+\end{equation}
+
+%% ====================================================================
+\section{Stage~1: Denoising Diffusion in Representation Space}
+\label{sec:stage1}
+%% ====================================================================
+
+\subsection{Forward Diffusion Process}
+
+We adopt the standard DDPM framework~\cite{ho2020ddpm,sohl2015deep}
+operating in the 256-dimensional representation space
+rather than pixel space.
+Let $z_0 \in \mathbb{R}^{L \times 256}$ denote the clean unified
+token sequence for a training example.
+The forward (noising) process is a fixed Markov chain
+$q(z_t \mid z_{t-1}) = \mathcal{N}(z_t; \sqrt{1-\beta_t}\, z_{t-1},\, \beta_t I)$
+for $t = 1, \ldots, T$ with $T = 1000$.
+
+Defining $\alpha_t = 1 - \beta_t$ and $\bar{\alpha}_t = \prod_{k=1}^{t} \alpha_k$,
+the marginal at arbitrary timestep $t$ admits the closed form
+\begin{equation}\label{eq:forward-marginal}
+    q(z_t \mid z_0)
+    = \mathcal{N}\!\bigl(z_t;\; \sqrt{\bar{\alpha}_t}\, z_0,\;
+    (1 - \bar{\alpha}_t)\, I\bigr),
+\end{equation}
+equivalently
+$z_t = \sqrt{\bar{\alpha}_t}\, z_0 + \sqrt{1-\bar{\alpha}_t}\, \epsilon$
+with $\epsilon \sim \mathcal{N}(0, I)$.
+
+\paragraph{Noise schedule.}
+We use a \emph{linear} schedule~\cite{ho2020ddpm}:
+$\beta_t = \bigl(\sqrt{\beta_1} + \frac{t-1}{T-1}\bigl(\sqrt{\beta_T} - \sqrt{\beta_1}\bigr)\bigr)^{\!2}$
+with $\beta_1 = 10^{-4}$ and $\beta_T = 0.02$.
+
+\subsection{Denoising Objective ($x_0$-Prediction)}
+\label{sec:x0-pred}
+
+The reverse process
+$p_\theta(z_{t-1} \mid z_t) = \mathcal{N}(z_{t-1}; \mu_\theta(z_t, t), \sigma_t^2 I)$
+is parameterised via \emph{$x_0$-prediction}~\cite{ramesh2022hierarchical}:
+the denoising network $f_\theta(z_t, t)$ directly predicts $\hat{z}_0$,
+and the posterior mean is obtained from the DDPM posterior
+\begin{equation}\label{eq:posterior-mean}
+    \mu_\theta(z_t, t)
+    = \frac{\sqrt{\bar{\alpha}_{t-1}}\,\beta_t}{1 - \bar{\alpha}_t}\,
+    f_\theta(z_t, t)
+    \;+\;
+    \frac{\sqrt{\alpha_t}\,(1 - \bar{\alpha}_{t-1})}{1 - \bar{\alpha}_t}\,
+    z_t.
+\end{equation}
+
+The training objective is the \emph{simple loss}~\cite{ho2020ddpm}:
+\begin{equation}\label{eq:ddpm-loss}
+    \mathcal{L}_{\mathrm{simple}}(\theta)
+    = \mathbb{E}_{z_0,\, t,\, \epsilon}\!
+    \bigl[\,\lVert f_\theta(z_t, t) - z_0 \rVert_2^2 \,\bigr],
+    \quad t \sim \mathrm{Uniform}\{1, \ldots, T\}.
+\end{equation}
+
+When the token sequence contains padded positions (indicated by the mask $m$),
+the loss is computed only over valid (non-padded) tokens:
+\begin{equation}\label{eq:masked-loss}
+    \mathcal{L}_{\mathrm{simple}}(\theta)
+    = \mathbb{E}_{z_0,\, t,\, \epsilon}\!\biggl[\,
+    \frac{1}{\sum_{\ell} m_\ell}\,
+    \sum_{\ell=1}^{L} m_\ell\,
+    \lVert f_\theta(z_t, t)_\ell - (z_0)_\ell \rVert_2^2
+    \,\biggr].
+\end{equation}
+
+\begin{remark}[$x_0$-prediction vs.\ $\epsilon$-prediction]
+\label{rem:x0-vs-eps}
+Standard DDPM~\cite{ho2020ddpm} trains the network to predict the added noise
+$\epsilon$.  In the $x_0$-prediction parameterisation
+(also used in DALL$\cdot$E~2~\cite{ramesh2022hierarchical} and
+RDM~\cite{bordes2022rdm}),
+the network instead predicts the clean data $z_0$ directly.
+The two are related by the identity
+$\hat{\epsilon} = (z_t - \sqrt{\bar{\alpha}_t}\,\hat{z}_0) / \sqrt{1 - \bar{\alpha}_t}$.
+The $x_0$ parameterisation is particularly natural for representation
+diffusion since the target representations are bounded and low-dimensional.
+\end{remark}
+
+\subsection{Denoising Network Architecture}
+\label{sec:denoising-arch}
+
+We employ two backbone architectures depending on the operating regime.
+
+\paragraph{SimpleMLP (single-vector RDM).}
+For diffusing only the global I-JEPA vector $g \in \mathbb{R}^{256}$,
+we use a residual MLP with $K = 12$ blocks,
+hidden dimension $d_h = 1536$,
+and sinusoidal timestep embeddings~\cite{vaswani2017attention}:
+\begin{equation}\label{eq:mlp-block}
+    h^{(k+1)} = h^{(k)} + \mathrm{MLP}\!\bigl(\mathrm{LN}(h^{(k)}) + e_t\bigr),
+    \quad k = 0, \ldots, K-1,
+\end{equation}
+where $h^{(0)} = W_{\mathrm{in}}\, z_t$, $e_t = \mathrm{MLP}_t(\mathrm{SinEmb}(t))$,
+and the final output is $\hat{z}_0 = W_{\mathrm{out}}\, \mathrm{LN}(h^{(K)})$
+with $W_{\mathrm{out}}$ zero-initialised~\cite{goyal2017accurate}.
+
+\paragraph{UnifiedSegTransformer (joint token diffusion).}
+For diffusing the full token sequence $z = [g, s_1, \ldots, s_N] \in \mathbb{R}^{L \times 256}$,
+we use a Transformer~\cite{vaswani2017attention} with
+Adaptive Layer Normalization (AdaLN)~\cite{peebles2023dit}:
+
+\begin{enumerate}
+    \item \textbf{Input embedding.}
+    Each token is projected from 256 to $d_{\mathrm{model}} = 768$
+    and augmented with a learned positional embedding
+    $p_\ell \in \mathbb{R}^{768}$ and a token-type embedding
+    $\tau_k \in \mathbb{R}^{768}$ ($k = 0$ for the global token,
+    $k = 1$ for segment tokens):
+    \begin{equation}\label{eq:token-embed}
+        h_\ell^{(0)} = W_{\mathrm{in}}\, (z_t)_\ell + p_\ell + \tau_{k(\ell)}.
+    \end{equation}
+
+    \item \textbf{Adaptive Layer Normalisation.}
+    The timestep $t$ is encoded via sinusoidal embedding and
+    projected to scale--shift parameters $(\gamma_t, \beta_t)$:
+    \begin{equation}\label{eq:adaln}
+        \mathrm{AdaLN}(h, t) = (1 + \gamma_t) \odot \mathrm{LN}(h) + \beta_t.
+    \end{equation}
+    This replaces standard LayerNorm in each Transformer block and
+    provides the denoising network with its timestep conditioning,
+    following DiT~\cite{peebles2023dit}.
+
+    \item \textbf{Transformer blocks.}
+    The backbone consists of $N_{\mathrm{layers}} = 8$ blocks,
+    each comprising AdaLN, multi-head self-attention
+    ($n_{\mathrm{heads}} = 12$, $d_k = 64$) with a causal-free
+    attention mask (only padding positions are masked),
+    and a position-wise feed-forward network with GELU
+    activation~\cite{hendrycks2016gelu} and $d_{\mathrm{ff}} = 3072$.
+
+    \item \textbf{Output projection.}
+    The final hidden states are projected back to 256 dimensions
+    via a zero-initialised linear layer~\cite{goyal2017accurate},
+    so that $\hat{z}_0 = W_{\mathrm{out}}\, \mathrm{LN}(h^{(N_{\mathrm{layers}})})$
+    with $W_{\mathrm{out}}$ and its bias initialised to zero.
+\end{enumerate}
+
+\subsection{Auxiliary Losses for Representation Quality}
+\label{sec:aux-losses}
+
+We augment the simple denoising loss~\eqref{eq:ddpm-loss} with two
+auxiliary terms that operate on the \emph{predicted clean tokens}
+$\hat{z}_0 = f_\theta(z_t, t)$.
+Let $\hat{g} = (\hat{z}_0)_0 \in \mathbb{R}^{256}$ denote the predicted
+global vector and $\hat{S} = (\hat{s}_1, \ldots, \hat{s}_N)$ the predicted
+segment tokens.
+
+\paragraph{Diversity loss (log-determinant regulariser).}
+Define the empirical covariance of the predicted segment tokens:
+\begin{equation}\label{eq:seg-cov}
+    \bar{s} = \frac{1}{N}\sum_{i=1}^{N} \hat{s}_i,
+    \qquad
+    C = \frac{1}{N}\sum_{i=1}^{N}
+    (\hat{s}_i - \bar{s})(\hat{s}_i - \bar{s})^\top
+    \in \mathbb{R}^{256 \times 256}.
+\end{equation}
+The diversity loss is
+\begin{equation}\label{eq:div-loss}
+    \mathcal{L}_{\mathrm{div}} = -\log\det(C + \epsilon\, I),
+    \quad \epsilon = 10^{-4},
+\end{equation}
+which penalises low-rank covariance (i.e., collapsed or redundant
+segment embeddings).
+This is equivalent to the negative log-volume of the parallelepiped
+spanned by the centred embeddings, and is related to Determinantal
+Point Process (DPP) kernels~\cite{kulesza2012dpp} and the VICReg
+variance term~\cite{bardes2022vicreg}.
+
+\paragraph{Alignment loss (InfoNCE).}
+We use an InfoNCE contrastive loss~\cite{oord2018infonce} between
+the predicted global vector and segment tokens within each mini-batch
+of size $B$:
+\begin{equation}\label{eq:align-loss}
+    \mathcal{L}_{\mathrm{align}}
+    = -\frac{1}{B}\sum_{i=1}^{B}
+    \log \frac{
+    \exp\!\bigl(\mathrm{sim}(\hat{g}_i,\, \bar{s}_i)\,/\,\tau\bigr)
+    }{
+    \sum_{j=1}^{B}
+    \exp\!\bigl(\mathrm{sim}(\hat{g}_i,\, \bar{s}_j)\,/\,\tau\bigr)
+    },
+\end{equation}
+where $\mathrm{sim}(a, b) = a^\top b / (\lVert a \rVert \lVert b \rVert)$
+is cosine similarity and $\tau = 0.07$ is the temperature.
+This encourages the global and segment representations to remain
+mutually informative and image-specific.
+
+\paragraph{Total Stage-1 loss.}
+\begin{equation}\label{eq:total-stage1-loss}
+    \mathcal{L}_{\mathrm{Stage1}}
+    = \mathcal{L}_{\mathrm{simple}}
+    + \lambda_{\mathrm{div}}\, \mathcal{L}_{\mathrm{div}}
+    + \lambda_{\mathrm{align}}\, \mathcal{L}_{\mathrm{align}},
+\end{equation}
+with $\lambda_{\mathrm{div}} = 0.1$ and $\lambda_{\mathrm{align}} = 0.05$.
+
+\subsection{Sampling via DDIM}
+\label{sec:ddim}
+
+At inference, we use the DDIM sampler~\cite{song2021ddim}
+for accelerated, optionally deterministic generation.
+Given a subsequence of timesteps
+$\{t_1 > t_2 > \cdots > t_S\} \subset \{1, \ldots, T\}$
+with $S \ll T$ (typically $S = 50$), the DDIM update is:
+\begin{equation}\label{eq:ddim-update}
+    z_{t_{i+1}} = \sqrt{\bar{\alpha}_{t_{i+1}}}\,\hat{z}_0
+    + \sqrt{1 - \bar{\alpha}_{t_{i+1}} - \sigma_{t_i}^2}\;\hat{\epsilon}
+    + \sigma_{t_i}\, \xi,
+    \quad \xi \sim \mathcal{N}(0, I),
+\end{equation}
+where $\hat{z}_0 = f_\theta(z_{t_i}, t_i)$ (the $x_0$-prediction),
+$\hat{\epsilon} = (z_{t_i} - \sqrt{\bar{\alpha}_{t_i}}\,\hat{z}_0) / \sqrt{1 - \bar{\alpha}_{t_i}}$
+(the implied noise prediction), and
+\begin{equation}\label{eq:ddim-sigma}
+    \sigma_{t_i} = \eta\,\sqrt{\frac{1 - \bar{\alpha}_{t_{i+1}}}{1 - \bar{\alpha}_{t_i}}
+    \cdot \frac{1 - \bar{\alpha}_{t_i}/\bar{\alpha}_{t_{i+1}}}{1}}.
+\end{equation}
+Setting $\eta = 0$ yields deterministic sampling; $\eta = 1$ recovers
+DDPM ancestral sampling.
+
+%% ====================================================================
+\section{Stage~2: Structure-Aware Adversarial Decoder}
+\label{sec:stage2}
+%% ====================================================================
+
+Stage~2 is a conditional GAN that decodes sampled representations
+$(g, S)$ into images.
+The generator and discriminator are built upon
+StyleGAN2-ADA~\cite{karras2020stylegan2,karras2020training}.
+
+\subsection{Generator Architecture}
+
+\subsubsection{I-JEPA Conditioning via $\mathcal{W}$-Space Fusion}
+
+The I-JEPA global vector $g \in \mathbb{R}^{256}$ is injected into the
+StyleGAN2 generator through the $\mathcal{W}$ latent space.
+A learnable projection network
+$\pi : \mathbb{R}^{256} \to \mathbb{R}^{w}$
+(two fully-connected layers with Leaky ReLU, where $w = 512$ is the
+$\mathcal{W}$-space dimension) maps $g$ to a style modifier.
+Given the standard StyleGAN2 mapping network output
+$\mathbf{w} = (\mathbf{w}_1, \ldots, \mathbf{w}_{L_w}) \in \mathbb{R}^{L_w \times w}$,
+we apply an \emph{additive semantic shift} to the first $K$ layers
+($K = 6$ by default):
+\begin{equation}\label{eq:w-fusion}
+    \tilde{\mathbf{w}}_k =
+    \begin{cases}
+    \mathbf{w}_k + \alpha_{\mathrm{sem}} \cdot r_{\mathrm{sem}}
+    \cdot \mathrm{norm}(\pi(g)),
+    & k \leq K, \\
+    \mathbf{w}_k, & k > K,
+    \end{cases}
+\end{equation}
+where $\alpha_{\mathrm{sem}} = \tanh(\alpha_{\mathrm{raw}})$ is a learnable
+gating scalar (initialised at $\alpha_{\mathrm{raw}} = 0.3$),
+$r_{\mathrm{sem}} \in [0,1]$ is a linear warmup ramp, and
+$\mathrm{norm}(\cdot)$ denotes second-moment normalisation
+as in~\cite{karras2020stylegan2}.
+
+During training, a \emph{stochastic mixing depth} is sampled per
+example: $K_i \sim \mathrm{Uniform}\{1,\ldots,K\}$, so that
+layers beyond $K_i$ receive no semantic shift.
+This acts as a regulariser analogous to style mixing~\cite{karras2019style}.
+
+\subsubsection{SAM Conditioning via Cross-Attention}
+\label{sec:cross-attn}
+
+Structural information from SAM segment tokens is injected into the
+synthesis network via \emph{cross-attention layers} inserted at
+intermediate resolutions ($16 \times 16$ and $32 \times 32$).
+
+\begin{definition}[Segment cross-attention]
+\label{def:seg-cross-attn}
+Let $x \in \mathbb{R}^{C \times H' \times W'}$ be a feature map at some
+resolution $H' \times W'$ inside the synthesis network,
+and let $S = (s_1, \ldots, s_N) \in \mathbb{R}^{N \times 256}$
+be the SAM segment tokens.
+\begin{enumerate}
+    \item Flatten and project the feature map to queries:
+    $Q = \mathrm{LN}(W_Q\, x_{\mathrm{flat}}) \in \mathbb{R}^{(H'W') \times d}$,
+    where $x_{\mathrm{flat}} \in \mathbb{R}^{(H'W') \times C}$ and $d = 256$.
+    \item Project segment tokens to keys and values:
+    $K = V = \mathrm{LN}(W_S\, S) \in \mathbb{R}^{N \times d}$.
+    \item Compute multi-head attention with $n_h = 8$ heads:
+    $\mathrm{Attn}(Q, K, V) = \softmax\!\bigl(QK^\top / \sqrt{d/n_h}\bigr)\, V$,
+    using the padding mask to exclude invalid tokens.
+    \item Project back to the original channel dimension and apply a
+    \emph{gated residual connection}:
+    \begin{equation}\label{eq:gated-residual}
+        x \leftarrow x + \alpha_{\mathrm{seg}} \cdot r_{\mathrm{seg}}
+        \cdot W_O\, \mathrm{Attn}(Q, K, V),
+    \end{equation}
+    where $\alpha_{\mathrm{seg}}$ is a \emph{learnable scalar gate}
+    initialised to zero, and $r_{\mathrm{seg}} \in [0,1]$ is a
+    linear warmup ramp.
+\end{enumerate}
+\end{definition}
+
+\begin{remark}[Zero-initialised gating]
+\label{rem:zero-gate}
+Initialising $\alpha_{\mathrm{seg}} = 0$ ensures that the generator
+begins training as an \emph{unconditional} StyleGAN2 and
+gradually incorporates structural conditioning as the gate opens.
+This stabilises early training when the SAM embeddings from Stage~1
+may not yet be reliable
+(cf.\ zero-init residuals in~\cite{bachlechner2021rezero,goyal2017accurate}).
+\end{remark}
+
+\subsubsection{Stochastic SAM Dropout}
+
+During training, segment conditioning is dropped with probability
+$p_{\mathrm{seg}} = 0.15$ per batch element (setting $S = \mathbf{0}$
+and disabling cross-attention).
+This serves two purposes:
+(i)~it regularises the generator to not rely exclusively on segment
+tokens, and
+(ii)~at inference it enables a form of classifier-free guidance
+(CFG)~\cite{ho2022cfg} by interpolating between the conditioned and
+unconditioned outputs.
+
+\subsection{Discriminator Architecture}
+
+The discriminator follows the standard StyleGAN2 residual architecture
+and is augmented with \emph{projection-based conditioning}~\cite{miyato2018projection}
+from both I-JEPA and SAM representations.
+
+\paragraph{I-JEPA projection.}
+The global vector $g$ is projected to a conditioning map
+$c_g = W_g\, g \in \mathbb{R}^{d_{\mathrm{cmap}}}$ via a
+two-layer MLP.
+
+\paragraph{SAM segment pooling.}
+A learnable query token $q_{\mathrm{pool}} \in \mathbb{R}^{256}$
+attends to all SAM segment tokens via multi-head attention
+(8~heads), producing a single pooled vector
+$\bar{s}_{\mathrm{pool}} \in \mathbb{R}^{256}$, which is then projected
+to $c_s = W_s\, \bar{s}_{\mathrm{pool}} \in \mathbb{R}^{d_{\mathrm{cmap}}}$.
+
+\paragraph{Blended conditioning.}
+The final conditioning vector is a normalised weighted sum:
+\begin{equation}\label{eq:d-cmap}
+    c = \mathrm{norm}\!\bigl(w_1\, c_{\mathrm{class}} + w_2\, c_g + w_3\, c_s\bigr),
+\end{equation}
+where $c_{\mathrm{class}}$ is the optional class embedding,
+$(w_1, w_2, w_3)$ are ramp-dependent weights,
+and $\mathrm{norm}(\cdot)$ denotes second-moment normalisation.
+The discriminator output is
+$D(x, g, S) = \langle \psi(x),\, c \rangle$,
+where $\psi(x) \in \mathbb{R}^{d_{\mathrm{cmap}}}$ is the
+discriminator's feature representation of the image.
+
+\subsection{Training Objectives}
+\label{sec:stage2-losses}
+
+\paragraph{Adversarial loss.}
+We use the non-saturating logistic GAN objective~\cite{goodfellow2014gan}:
+\begin{align}
+    \mathcal{L}_D &= \mathbb{E}_{x \sim p_{\mathrm{data}}}\!
+    \bigl[\softplus\!\bigl(-D(x, g, S)\bigr)\bigr]
+    + \mathbb{E}_{z \sim p_z}\!
+    \bigl[\softplus\!\bigl(D(G_\psi(z, g, S), g, S)\bigr)\bigr],
+    \label{eq:d-loss} \\
+    \mathcal{L}_G^{\mathrm{adv}} &= \mathbb{E}_{z \sim p_z}\!
+    \bigl[\softplus\!\bigl(-D(G_\psi(z, g, S), g, S)\bigr)\bigr],
+    \label{eq:g-adv-loss}
+\end{align}
+where $\softplus(u) = \log(1 + e^u)$.
+
+\paragraph{I-JEPA feature matching.}
+To encourage semantic consistency, the generated image's I-JEPA
+embedding is matched to the conditioning vector via cosine similarity:
+\begin{equation}\label{eq:fm-loss}
+    \mathcal{L}_G^{\mathrm{fm}}
+    = 1 - \mathrm{sim}\!\bigl(
+    \phi_{\mathrm{jepa}}(G_\psi(z, g, S)),\; g
+    \bigr),
+\end{equation}
+with a warmup weight $\lambda_{\mathrm{fm}} \cdot r(t)$ that linearly
+increases from $0$ to $\lambda_{\mathrm{fm}}$.
+
+\paragraph{R1 gradient penalty.}
+Following~\cite{mescheder2018training}, we apply
+\begin{equation}\label{eq:r1}
+    \mathcal{L}_D^{\mathrm{R1}}
+    = \frac{\gamma}{2}\,
+    \mathbb{E}_{x \sim p_{\mathrm{data}}}\!\bigl[
+    \lVert \nabla_x D(x, g, S) \rVert^2 \bigr],
+\end{equation}
+with $\gamma = 10$.
+
+\paragraph{Path length regularisation.}
+The standard StyleGAN2 path length penalty~\cite{karras2020stylegan2}
+is applied to the generator to encourage smooth latent space geometry.
+
+\paragraph{Total Stage-2 losses.}
+\begin{align}
+    \mathcal{L}_G &= \mathcal{L}_G^{\mathrm{adv}}
+    + \lambda_{\mathrm{fm}}\, r(t)\, \mathcal{L}_G^{\mathrm{fm}}
+    + \lambda_{\mathrm{pl}}\, \mathcal{L}_G^{\mathrm{pl}},
+    \label{eq:total-g-loss} \\
+    \mathcal{L}_D &= \mathcal{L}_D^{\mathrm{adv}}
+    + \mathcal{L}_D^{\mathrm{R1}}.
+    \label{eq:total-d-loss}
+\end{align}
+
+\subsection{RDM-Mixed Training}
+\label{sec:rdm-mixed}
+
+After a warmup period, Stage~2 training begins mixing in
+\emph{synthetically sampled} representations from the Stage~1 diffusion
+model.
+With probability $p_{\mathrm{rdm}}$, the real embeddings $(g, S)$
+for a training image are replaced with samples
+$(\hat{g}, \hat{S}) \sim p_\theta$ drawn from the pretrained
+Stage~1 model via DDIM ($S = 50$ steps, $\eta = 0$).
+This exposes the generator and discriminator to the same distribution
+they will encounter at inference, reducing the train--test mismatch
+between real and generated representations.
+
+%% ====================================================================
+\section{Theoretical Analysis}
+\label{sec:theory}
+%% ====================================================================
+
+\subsection{Diversity Loss Prevents Embedding Collapse}
+
+\begin{lemma}[Diversity loss penalises collapsed embeddings]
+\label{lem:div-collapse}
+Let $S = (s_1, \ldots, s_N) \in \mathbb{R}^{N \times d}$ be a set of
+segment embeddings with empirical covariance
+$C = \frac{1}{N}\sum_{i=1}^{N}(s_i - \bar{s})(s_i - \bar{s})^\top$,
+and let $\mathcal{L}_{\mathrm{div}} = -\log\det(C + \epsilon I)$
+for $\epsilon > 0$.
+Denote the eigenvalues of $C$ by $\lambda_1, \ldots, \lambda_d \geq 0$.
+Then:
+\begin{enumerate}
+    \item[(a)] $\mathcal{L}_{\mathrm{div}} = -\sum_{k=1}^{d} \log(\lambda_k + \epsilon)$.
+    \item[(b)] If all embeddings collapse to a single point
+    ($s_i = c$ for all $i$), then $C = 0$ and
+    $\mathcal{L}_{\mathrm{div}} = -d\log\epsilon$.
+    \item[(c)] $\frac{\partial \mathcal{L}_{\mathrm{div}}}{\partial \lambda_k}
+    = -(\lambda_k + \epsilon)^{-1} < 0$ for all $k$,
+    so the loss strictly decreases as any eigenvalue increases from zero.
+\end{enumerate}
+\end{lemma}
+
+\begin{proof}
+Part (a) follows from the spectral decomposition
+$C + \epsilon I = U \diag(\lambda_1 + \epsilon, \ldots, \lambda_d + \epsilon) U^\top$,
+so $\det(C + \epsilon I) = \prod_{k}(\lambda_k + \epsilon)$ and
+$\mathcal{L}_{\mathrm{div}} = -\sum_{k}\log(\lambda_k + \epsilon)$.
+
+Part (b):\ if $s_i = c$ for all $i$, then $\bar{s} = c$ and $C = 0$,
+giving $\det(\epsilon I) = \epsilon^d$ and
+$\mathcal{L}_{\mathrm{div}} = -d\log\epsilon$.
+Since $\epsilon \ll 1$, this is a large positive value.
+
+Part (c):\ $-\log(\lambda_k + \epsilon)$ is strictly decreasing in
+$\lambda_k$ for $\lambda_k \geq 0$.
+\end{proof}
+
+\subsection{InfoNCE Alignment Prevents Trivial Collapse}
+
+\begin{lemma}[InfoNCE is maximised by trivial representations]
+\label{lem:align-collapse}
+Consider the alignment loss~\eqref{eq:align-loss} with
+a batch $\{(\hat{g}_i, \hat{S}_i)\}_{i=1}^{B}$.
+If all segment embeddings collapse to a constant
+$\bar{s}_i = c$ for all $i$, then
+$\mathrm{sim}(\hat{g}_i, \bar{s}_j) = \mathrm{sim}(\hat{g}_i, c)$
+is independent of $j$, and
+\begin{equation}
+    \mathcal{L}_{\mathrm{align}} = \log B,
+\end{equation}
+which is the maximum of the InfoNCE loss.
+Thus, minimising $\mathcal{L}_{\mathrm{align}}$ requires the
+segment embeddings to carry image-specific information that
+distinguishes positive from negative pairs.
+\end{lemma}
+
+\begin{proof}
+Under collapse $\bar{s}_j = c$, the similarity
+$\mathrm{sim}(\hat{g}_i, c)$ is the same for all $j$.
+Hence the softmax in~\eqref{eq:align-loss} becomes uniform:
+$\exp(\mathrm{sim}(\hat{g}_i, c)/\tau) / \sum_{j=1}^{B}\exp(\mathrm{sim}(\hat{g}_i, c)/\tau) = 1/B$
+and $\mathcal{L}_{\mathrm{align}} = -\frac{1}{B}\sum_i \log(1/B) = \log B$.
+\end{proof}
+
+\subsection{Joint Loss Excludes Collapsed Minimisers}
+
+\begin{proposition}[No collapsed global minimiser]
+\label{prop:no-collapse}
+Let $S^\star(x) = (s_1^\star(x), \ldots, s_N^\star(x))$ denote
+the teacher SAM embeddings for image $x$.
+Assume:
+\begin{enumerate}
+    \item[\textup{(A1)}] There exists at least one image $x$ for which the
+    teacher covariance $C^\star(x) \neq 0$
+    (i.e., the SAM embeddings are not degenerate).
+    \item[\textup{(A2)}] The denoising loss $\mathcal{L}_{\mathrm{simple}}$
+    is minimised only when the predicted tokens match the teacher tokens
+    for every training example.
+    \item[\textup{(A3)}] The alignment loss $\mathcal{L}_{\mathrm{align}}$
+    is minimised only when $\{(\hat{g}_i, \hat{S}_i)\}_{i=1}^{B}$
+    are discriminative across images.
+\end{enumerate}
+Then any parameter configuration in which the predicted segment
+embeddings collapse to a single constant vector for some image $x$
+(i.e., $\hat{s}_i(x) = c$ for all $i$) cannot be a global minimiser of
+\begin{equation}
+    \mathcal{L}_{\mathrm{Stage1}}
+    = \mathcal{L}_{\mathrm{simple}}
+    + \lambda_{\mathrm{div}}\, \mathcal{L}_{\mathrm{div}}
+    + \lambda_{\mathrm{align}}\, \mathcal{L}_{\mathrm{align}},
+    \quad \lambda_{\mathrm{div}}, \lambda_{\mathrm{align}} > 0.
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Suppose for contradiction that some global minimiser has
+$\hat{s}_i(x_0) = c$ for all $i$ and some image $x_0$.
+
+\textbf{Step 1 (Diversity).}
+By Lemma~\ref{lem:div-collapse}(b), the collapsed configuration has
+$\mathcal{L}_{\mathrm{div}}(x_0) = -d\log\epsilon$.
+By assumption (A1), the teacher covariance $C^\star(x_0)$ has at least one
+positive eigenvalue.
+Setting $\hat{S}(x_0) = S^\star(x_0)$ yields
+$C(x_0) = C^\star(x_0)$, which strictly decreases
+$\mathcal{L}_{\mathrm{div}}(x_0)$ by Lemma~\ref{lem:div-collapse}(c).
+
+\textbf{Step 2 (Reconstruction).}
+Since $C^\star(x_0) \neq 0$, the teacher embeddings are not all equal,
+so $\hat{S}(x_0) = (c, \ldots, c) \neq S^\star(x_0)$.
+By (A2), this means $\mathcal{L}_{\mathrm{simple}}$ is not at its minimum,
+and replacing $\hat{S}(x_0)$ by $S^\star(x_0)$ strictly reduces it.
+
+\textbf{Step 3 (Alignment).}
+By (A3) and Lemma~\ref{lem:align-collapse},
+the collapsed configuration yields the maximal InfoNCE loss $\log B$,
+which is strictly suboptimal.
+
+\textbf{Step 4 (Contradiction).}
+Since all three terms can be strictly decreased simultaneously
+(by setting $\hat{S}(x_0) = S^\star(x_0)$), and $\lambda_{\mathrm{div}}, \lambda_{\mathrm{align}} > 0$,
+the total loss $\mathcal{L}_{\mathrm{Stage1}}$ decreases,
+contradicting the assumption of global optimality.
+\end{proof}
+
+\subsection{Partition-Based Spatial Modulation via SAM Masks}
+\label{sec:partition}
+
+We now formalise how the SAM partition induces spatially adaptive
+conditioning, and show that cross-attention generalises this mechanism.
+
+\begin{lemma}[Piecewise-constant modulation from a partition]
+\label{lem:partition}
+Let $\{M_i\}_{i=1}^{N}$ be a partition of the image grid $\Omega$
+(i.e., $M_i \cap M_j = \emptyset$ for $i \neq j$ and
+$\bigcup_i M_i = \Omega$), and let $s_i \in \mathbb{R}^{d}$ be
+the region code for $M_i$.
+Let $W_\gamma, W_\beta \in \mathbb{R}^{C \times d}$ be linear maps,
+and define
+$\gamma_i = W_\gamma s_i$, $\beta_i = W_\beta s_i \in \mathbb{R}^C$.
+Set
+\begin{equation}\label{eq:pw-modulation}
+    \gamma_c(u,v) = \gamma_{i(u,v),c}, \quad
+    \beta_c(u,v) = \beta_{i(u,v),c},
+    \quad (u,v) \in \Omega,\; c = 1,\ldots,C,
+\end{equation}
+where $i(u,v)$ is the unique index with $(u,v) \in M_{i(u,v)}$.
+Then:
+\begin{enumerate}
+    \item[\textup{(a)}] $\gamma$ and $\beta$ are piecewise constant on
+    $\{M_i\}$; and
+    \item[\textup{(b)}] conversely, any piecewise-constant spatial modulation
+    field on $\{M_i\}$ that depends linearly on the region codes
+    $\{s_i\}$ can be written in this form.
+\end{enumerate}
+\end{lemma}
+
+\begin{proof}
+(a) follows directly from the construction: for $(u,v), (u',v') \in M_i$,
+we have $i(u,v) = i(u',v') = i$, so $\gamma_c(u,v) = \gamma_{i,c} = \gamma_c(u',v')$.
+
+(b) Any piecewise-constant field assigns a vector $\tilde{\gamma}_i \in \mathbb{R}^C$
+to each region $M_i$.
+If this depends linearly on $s_i$, then
+$\tilde{\gamma}_i = F(s_i) = W_\gamma s_i$ for some $W_\gamma \in \mathbb{R}^{C \times d}$.
+\end{proof}
+
+\begin{proposition}[Cross-attention generalises partition modulation]
+\label{prop:cross-attn-generalises}
+The cross-attention mechanism in Definition~\ref{def:seg-cross-attn}
+is strictly more expressive than the piecewise-constant modulation
+of Lemma~\ref{lem:partition}.
+Specifically, by concentrating attention weights on a single token per
+spatial location, cross-attention can recover the hard partition assignment
+$(u,v) \mapsto i(u,v)$ as a special case, while also permitting
+smooth blending across region boundaries.
+\end{proposition}
+
+\begin{proof}
+In cross-attention, the output at spatial position $(u,v)$ is
+\begin{equation}\label{eq:xattn-output}
+    o_{(u,v)} = \sum_{i=1}^{N} a_{(u,v),i}\, V_i,
+    \quad
+    a_{(u,v),i} = \frac{\exp(Q_{(u,v)}^\top K_i / \sqrt{d/n_h})}
+    {\sum_{j=1}^{N} \exp(Q_{(u,v)}^\top K_j / \sqrt{d/n_h})},
+\end{equation}
+where $Q_{(u,v)} = W_Q\, x_{(u,v)}$ and $K_i = V_i = W_S\, s_i$.
+
+In the limit where attention weights concentrate on a single token
+(i.e., $a_{(u,v),i} \to \mathbf{1}[i = i(u,v)]$), the output becomes
+$o_{(u,v)} = W_S\, s_{i(u,v)}$, which is exactly the piecewise-constant
+modulation with $W_\gamma = W_O W_S$.
+Since the attention weights can also take intermediate values,
+cross-attention is strictly more expressive.
+\end{proof}
+
+\begin{remark}[Connection to SPADE and spatially adaptive normalisation]
+\label{rem:spade}
+The partition-based modulation of Lemma~\ref{lem:partition} is
+closely related to SPADE (Spatially-Adaptive Denormalisation)~\cite{park2019spade},
+which applies spatially varying affine transforms conditioned on a
+semantic layout.
+Our cross-attention mechanism can be seen as a \emph{learned, soft}
+variant of SPADE where the spatial layout emerges from attention
+patterns rather than being provided as a hard label map.
+\end{remark}
+
+\subsection{Representation Sufficiency}
+\label{sec:sufficiency}
+
+We justify using $z = (g, S)$ as the latent variable in our
+factorisation~\eqref{eq:marginalisation}.
+
+\begin{definition}[Sufficiency for region prediction]
+\label{def:sufficiency}
+Let $\mathcal{R}$ denote the space of region descriptors (e.g., indices
+or positional encodings of masked patch subsets in the I-JEPA framework).
+For each image $x$ and region descriptor $R \in \mathcal{R}$,
+let $y_R(x)$ denote the \emph{target encoder} output
+(the EMA teacher ViT representation of the patch subset specified by $R$,
+as in~\cite{assran2023ijepa}).
+We say that a representation $z$ is \emph{sufficient for the region
+prediction family} $\{y_R\}_{R \in \mathcal{R}}$ if, for all $R$,
+$\mathbb{E}[y_R(X) \mid X, R] = \mathbb{E}[y_R(X) \mid z, R]$
+almost surely.
+\end{definition}
+
+\begin{proposition}[Sufficiency of $(g, S)$]
+\label{prop:sufficiency}
+Assume:
+\begin{enumerate}
+    \item[\textup{(A1)}] The I-JEPA context encoder $\phi_{\mathrm{jepa}}$
+    and predictor $P$ are jointly trained to minimise
+    $\mathbb{E}_{X, R}[\lVert P(g, R) - y_R(X) \rVert^2]$
+    with fixed target encoder outputs $y_R(X)$.
+    \item[\textup{(A2)}] The predictor class is rich enough to attain the
+    Bayes-optimal regression for a.e.\ $(g, R)$.
+\end{enumerate}
+Then: (i) the optimal predictor satisfies
+$P^\star(g, R) = \mathbb{E}[y_R(X) \mid g, R]$; and
+(ii) $\mathbb{E}[y_R(X) \mid g, R] = \mathbb{E}[y_R(X) \mid z, R]$,
+so $z = (g, S)$ is sufficient in the sense of
+Definition~\ref{def:sufficiency}.
+\end{proposition}
+
+\begin{proof}
+(i) Under squared-error loss, the Bayes-optimal predictor is the
+conditional expectation~\cite{lehmann2006theory}:
+$P^\star(g, R) = \arg\min_{f} \mathbb{E}[\lVert f(g, R) - y_R(X) \rVert^2 \mid g, R]
+= \mathbb{E}[y_R(X) \mid g, R]$.
+
+(ii) Since $g = \phi_{\mathrm{jepa}}(X)$ and $S = \phi_{\mathrm{sam}}(X)$
+are deterministic functions of $X$, the $\sigma$-algebra satisfies
+$\sigma(g, R) \subseteq \sigma(z, R)$.
+By the tower property,
+$\mathbb{E}[y_R(X) \mid z, R]
+= \mathbb{E}[\mathbb{E}[y_R(X) \mid g, R] \mid z, R]
+= \mathbb{E}[y_R(X) \mid g, R]$,
+since $\mathbb{E}[y_R(X) \mid g, R]$ is $\sigma(g, R)$-measurable
+and hence $\sigma(z, R)$-measurable.
+\end{proof}
+
+\begin{remark}[Interpretation]
+Proposition~\ref{prop:sufficiency} shows that $g$ alone carries
+sufficient information for predicting I-JEPA's target encoder outputs.
+The SAM component $S$ is therefore \emph{complementary}: it encodes
+spatial-structural information (object boundaries, part decomposition)
+that is useful for pixel-level generation but not strictly needed for
+the I-JEPA prediction task.
+Together, $(g, S)$ captures both global semantics and local structure.
+\end{remark}
+
+%% ====================================================================
+\section{Inference Algorithm}
+\label{sec:inference}
+%% ====================================================================
+
+\begin{algorithm}[t]
+\caption{Two-stage sampling procedure}
+\label{alg:sampling}
+\begin{algorithmic}[1]
+\REQUIRE Trained Stage-1 diffusion model $f_\theta$, trained Stage-2
+generator $G_\psi$, DDIM steps $S$, stochasticity $\eta$
+\STATE $z_T \sim \mathcal{N}(0, I)$ \hfill\COMMENT{Sample noise in representation space}
+\FOR{$i = S, S-1, \ldots, 1$}
+    \STATE $\hat{z}_0 \leftarrow f_\theta(z_{t_i}, t_i)$ \hfill\COMMENT{$x_0$-prediction}
+    \STATE $\hat{\epsilon} \leftarrow (z_{t_i} - \sqrt{\bar{\alpha}_{t_i}}\hat{z}_0) / \sqrt{1 - \bar{\alpha}_{t_i}}$ \hfill\COMMENT{Implied noise}
+    \STATE $z_{t_{i-1}} \leftarrow \text{DDIM-update}(z_{t_i}, \hat{z}_0, \hat{\epsilon}, \eta)$ \hfill\COMMENT{Eq.~\eqref{eq:ddim-update}}
+\ENDFOR
+\STATE $\hat{g} \leftarrow (z_0)_0$, \quad $\hat{S} \leftarrow (z_0)_{1:N}$ \hfill\COMMENT{Split global and segment tokens}
+\STATE $\hat{x} \leftarrow G_\psi(\hat{g}, \hat{S})$ \hfill\COMMENT{Decode image via StyleGAN2}
+\RETURN $\hat{x}$
+\end{algorithmic}
+\end{algorithm}
+
+%% ====================================================================
+\section{Summary of Architectural Choices}
+\label{sec:summary}
+%% ====================================================================
+
+\begin{table}[t]
+\centering
+\caption{Summary of key design choices.}
+\label{tab:summary}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Component} & \textbf{Choice} & \textbf{Details} \\
+\midrule
+\multicolumn{3}{@{}l}{\textit{Stage~1: Representation Diffusion}} \\
+Diffusion framework & DDPM~\cite{ho2020ddpm} & Discrete-time, Gaussian \\
+Parameterisation & $x_0$-prediction & Predicts clean tokens directly \\
+Noise schedule & Linear & $\beta \in [10^{-4}, 0.02]$, $T = 1000$ \\
+Backbone & UnifiedSegTransformer & 8 layers, $d = 768$, 12 heads \\
+Timestep conditioning & AdaLN~\cite{peebles2023dit} & Scale--shift from sinusoidal embedding \\
+Sampler & DDIM~\cite{song2021ddim} & 50 steps, $\eta = 0$ \\
+\midrule
+\multicolumn{3}{@{}l}{\textit{Stage~2: Conditional Generator}} \\
+Base architecture & StyleGAN2-ADA~\cite{karras2020training} & Residual synthesis \\
+I-JEPA injection & $\mathcal{W}$-space additive shift & Gated, first 6 layers \\
+SAM injection & Cross-attention & Res.\ $16\times16$, $32\times32$ \\
+Gate initialisation & Zero & Starts unconditional \\
+Adversarial loss & Non-saturating logistic & With R1 penalty \\
+Feature matching & Cosine (I-JEPA) & With linear warmup \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{assran2023ijepa}
+M.~Assran, Q.~Duval, I.~Misra, P.~Bojanowski, P.~Vincent, M.~Rabbat,
+Y.~LeCun, and N.~Ballas.
+\newblock Self-supervised learning from images with a joint-embedding
+predictive architecture.
+\newblock In \emph{CVPR}, 2023.
+
+\bibitem{bachlechner2021rezero}
+T.~Bachlechner, B.~P.~Majumder, H.~H.~Mao, G.~W.~Cottrell, and J.~McAuley.
+\newblock {ReZero} is all you need: Fast convergence at large depth.
+\newblock In \emph{UAI}, 2021.
+
+\bibitem{bardes2022vicreg}
+A.~Bardes, J.~Ponce, and Y.~LeCun.
+\newblock {VICReg}: Variance-invariance-covariance regularization for
+self-supervised learning.
+\newblock In \emph{ICLR}, 2022.
+
+\bibitem{bordes2022rdm}
+F.~Bordes, E.~Pimentel, K.~Srinivasan, and A.~Romero-Soriano.
+\newblock High fidelity visualization of what your self-supervised
+representation knows.
+\newblock \emph{arXiv:2112.09164}, 2022.
+
+\bibitem{goodfellow2014gan}
+I.~Goodfellow, J.~Pouget-Abadie, M.~Mirza, B.~Xu, D.~Warde-Farley,
+S.~Ozair, A.~Courville, and Y.~Bengio.
+\newblock Generative adversarial nets.
+\newblock In \emph{NeurIPS}, 2014.
+
+\bibitem{goyal2017accurate}
+P.~Goyal, P.~Doll{\'a}r, R.~Girshick, P.~Noordhuis, L.~Wesolowski,
+A.~Kyrola, A.~Tulloch, Y.~Jia, and K.~He.
+\newblock Accurate, large minibatch {SGD}: Training {ImageNet} in 1~hour.
+\newblock \emph{arXiv:1706.02677}, 2017.
+
+\bibitem{hendrycks2016gelu}
+D.~Hendrycks and K.~Gimpel.
+\newblock {Gaussian} error linear units ({GELUs}).
+\newblock \emph{arXiv:1606.08415}, 2016.
+
+\bibitem{ho2020ddpm}
+J.~Ho, A.~Jain, and P.~Abbeel.
+\newblock Denoising diffusion probabilistic models.
+\newblock In \emph{NeurIPS}, 2020.
+
+\bibitem{ho2022cfg}
+J.~Ho and T.~Salimans.
+\newblock Classifier-free diffusion guidance.
+\newblock In \emph{NeurIPS Workshop}, 2022.
+
+\bibitem{karras2019style}
+T.~Karras, S.~Laine, and T.~Aila.
+\newblock A style-based generator architecture for generative adversarial
+networks.
+\newblock In \emph{CVPR}, 2019.
+
+\bibitem{karras2020stylegan2}
+T.~Karras, S.~Laine, M.~Aittala, J.~Hellsten, J.~Lehtinen, and T.~Aila.
+\newblock Analyzing and improving the image quality of {StyleGAN}.
+\newblock In \emph{CVPR}, 2020.
+
+\bibitem{karras2020training}
+T.~Karras, M.~Aittala, J.~Hellsten, S.~Laine, J.~Lehtinen, and T.~Aila.
+\newblock Training generative adversarial networks with limited data.
+\newblock In \emph{NeurIPS}, 2020.
+
+\bibitem{kirillov2023sam}
+A.~Kirillov, E.~Mintun, N.~Ravi, H.~Mao, C.~Rolland, L.~Gustafson,
+T.~Xiao, S.~Whitehead, A.~C.~Berg, W.-Y.~Lo, P.~Doll{\'a}r, and
+R.~Girshick.
+\newblock Segment anything.
+\newblock In \emph{ICCV}, 2023.
+
+\bibitem{kulesza2012dpp}
+A.~Kulesza and B.~Taskar.
+\newblock Determinantal point processes for machine learning.
+\newblock \emph{Foundations and Trends in Machine Learning}, 5(2--3):123--286,
+2012.
+
+\bibitem{lehmann2006theory}
+E.~L.~Lehmann and G.~Casella.
+\newblock \emph{Theory of Point Estimation}.
+\newblock Springer, 2nd edition, 2006.
+
+\bibitem{mescheder2018training}
+L.~Mescheder, A.~Geiger, and S.~Nowozin.
+\newblock Which training methods for {GANs} do actually converge?
+\newblock In \emph{ICML}, 2018.
+
+\bibitem{miyato2018projection}
+T.~Miyato and M.~Koyama.
+\newblock c{GAN}s with projection discriminator.
+\newblock In \emph{ICLR}, 2018.
+
+\bibitem{oord2018infonce}
+A.~van~den~Oord, Y.~Li, and O.~Vinyals.
+\newblock Representation learning with contrastive predictive coding.
+\newblock \emph{arXiv:1807.03748}, 2018.
+
+\bibitem{park2019spade}
+T.~Park, M.-Y.~Liu, T.-C.~Wang, and J.-Y.~Zhu.
+\newblock Semantic image synthesis with spatially-adaptive normalization.
+\newblock In \emph{CVPR}, 2019.
+
+\bibitem{peebles2023dit}
+W.~Peebles and S.~Xie.
+\newblock Scalable diffusion models with transformers.
+\newblock In \emph{ICCV}, 2023.
+
+\bibitem{ramesh2022hierarchical}
+A.~Ramesh, P.~Dhariwal, A.~Nichol, C.~Chu, and M.~Chen.
+\newblock Hierarchical text-conditional image generation with {CLIP} latents.
+\newblock \emph{arXiv:2204.06125}, 2022.
+
+\bibitem{sohl2015deep}
+J.~Sohl-Dickstein, E.~A.~Weiss, N.~Maheswaranathan, and S.~Ganguli.
+\newblock Deep unsupervised learning using nonequilibrium thermodynamics.
+\newblock In \emph{ICML}, 2015.
+
+\bibitem{song2021ddim}
+J.~Song, C.~Meng, and S.~Ermon.
+\newblock Denoising diffusion implicit models.
+\newblock In \emph{ICLR}, 2021.
+
+\bibitem{vaswani2017attention}
+A.~Vaswani, N.~Shazeer, N.~Parmar, J.~Uszkoreit, L.~Jones, A.~N.~Gomez,
+\L.~Kaiser, and I.~Polosukhin.
+\newblock Attention is all you need.
+\newblock In \emph{NeurIPS}, 2017.
+
+\end{thebibliography}
+
+\end{document}

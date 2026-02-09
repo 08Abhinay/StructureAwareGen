@@ -1,0 +1,858 @@
+\documentclass[12pt]{article}
+\usepackage{graphicx} 
+\usepackage{amsmath, amssymb,amsthm}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+
+\title{ECCV 2026}
+\author{Notes for Abhinay}
+\date{February 2026}
+
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+
+\section{Theoretical Viewpoint}
+
+\subsection{Two-Stage Modeling in Representation Space}
+
+Let \(X\) be a random variable of natural images with distribution \(p_X\).
+Let \(E_{\mathrm{g}} : \mathcal{X} \to \mathbb{R}^{d_g}\) be the I-JEPA encoder and
+\(E_{\mathrm{s}} : \mathcal{X} \to \mathbb{R}^{N \times d_s}\) be the SAM-based encoder
+that outputs per-mask embeddings. For each image \(x\), we define
+\[
+G = E_{\mathrm{g}}(X) \in \mathbb{R}^{d_g}, \qquad
+S = E_{\mathrm{s}}(X) \in \mathbb{R}^{N \times d_s}.
+\]
+This induces a joint representation distribution
+\[
+p_{G,S}(g,s)
+= \int p_X(x)\,\delta\big(g - E_{\mathrm{g}}(x)\big)\,\delta\big(s - E_{\mathrm{s}}(x)\big)\,dx,
+\]
+where \(\delta\) is the Dirac delta.
+
+Our generative goal can be written as
+\[
+p_X(x)
+= \int p_{X \mid G,S}(x \mid g,s)\,p_{G,S}(g,s)\,dg\,ds,
+\]
+where \(p_{G,S}\) is the distribution of self-supervised representations and
+\(p_{X \mid G,S}\) is a decoder from representation space back to pixels.
+Our two-stage model approximates these components as
+\(\hat{p}_{G,S}\) (Stage~1) and \(\hat{p}_{X \mid G,S}\) (Stage~2),
+yielding the overall generative model
+\[
+\hat{p}_X(x)
+= \int \hat{p}_{X \mid G,S}(x \mid g,s)\,\hat{p}_{G,S}(g,s)\,dg\,ds.
+\]
+
+\subsection{Stage 1 as Rectified Flow / Diffusion}
+
+Let \(Z = (G,S)\) be the concatenated representation, taking values in
+\(\mathbb{R}^d\) with \(d = d_g + N d_s\).
+We choose a simple base distribution \(p_0 = \mathcal{N}(0, I_d)\)
+and denote the data distribution in representation space by
+\(p_1 = p_Z = p_{G,S}\).
+In the rectified-flow viewpoint, we consider a family of intermediate
+distributions \(\{p_t\}_{t \in [0,1]}\) and a time-dependent
+velocity field \(v_\theta : \mathbb{R}^d \times [0,1] \to \mathbb{R}^d\)
+such that the flow \(\phi_t\) satisfies
+\[
+\frac{d}{dt}\phi_t(z_0) = v_\theta\big(\phi_t(z_0), t\big), \qquad
+\phi_0(z_0) = z_0, \quad z_0 \sim p_0,
+\]
+and \(\phi_{1\sharp} p_0 \approx p_1\), where \(\phi_{1\sharp}\) denotes the
+pushforward of measures.
+
+In practice, we parameterize this flow via a diffusion-style noise-adding
+process and a denoising network.
+Let \(Z \sim p_1\) and \(\varepsilon \sim \mathcal{N}(0, I_d)\).
+For a noise schedule \(\{\alpha_t\}_{t \in [0,1]}\), we define
+\[
+Z_t = \sqrt{\alpha_t}\, Z + \sqrt{1 - \alpha_t}\,\varepsilon.
+\]
+We train a network \(f_\theta(Z_t, t)\) to predict the clean
+representations \(Z\) from \(Z_t\) via the objective
+\[
+\mathcal{L}_{\mathrm{denoise}}(\theta)
+= \mathbb{E}_{Z, t, \varepsilon}
+\big[\|f_\theta(Z_t, t) - Z\|_2^2\big].
+\]
+Under standard assumptions on the noise schedule,
+this denoising objective corresponds to learning the score or velocity
+field associated with a flow that transports \(p_0\) to \(p_1\).
+
+In our setting, the network has structured outputs
+\[
+f_\theta(Z_t, t)
+= \big(f_\theta^{\mathrm{g}}(Z_t, t), f_\theta^{\mathrm{s}}(Z_t, t)\big),
+\]
+corresponding to predictions of the global embedding \(G\) and the
+segmentation embeddings \(S\).
+The loss decomposes as
+\[
+\mathcal{L}_{\mathrm{global}}
+= \mathbb{E}\big[\|f_\theta^{\mathrm{g}}(Z_t, t) - G\|_2^2\big], \qquad
+\mathcal{L}_{\mathrm{seg}}
+= \mathbb{E}\big[\|f_\theta^{\mathrm{s}}(Z_t, t) - S\|_2^2\big],
+\]
+so that the learned flow respects the joint structure of
+\((G,S)\) in representation space.
+
+\subsection{Stage 2 as Conditional Decoder}
+
+Stage~2 is a conditional decoder from representation space to pixels.
+We define a generator
+\[
+D_\psi : \mathbb{R}^{d_g} \times \mathbb{R}^{N \times d_s} \to \mathcal{X}
+\]
+that induces a conditional distribution
+\[
+\hat{p}_{X \mid G,S}(x \mid g,s) = p_\psi(x \mid g,s).
+\]
+We train this decoder with a conditional GAN objective and auxiliary
+reconstruction losses.
+Let \(D_\phi\) be a discriminator.
+We optimize
+\begin{align*}
+\min_\psi \max_\phi \quad
+&\mathbb{E}_{(x,g,s) \sim (X,G,S)}
+\big[\log D_\phi(x,g,s)\big] \\
+&+ \mathbb{E}_{(g,s) \sim p_{G,S},
+\ \tilde{x} \sim p_\psi(\cdot \mid g,s)}
+\big[\log(1 - D_\phi(\tilde{x}, g,s))\big]
++ \lambda_{\mathrm{rec}}\,\mathcal{L}_{\mathrm{rec}}(\psi),
+\end{align*}
+where \(\mathcal{L}_{\mathrm{rec}}\) combines perceptual and pixel-level losses
+between \(\tilde{x} = D_\psi(g,s)\) and the observed image \(x\).
+
+At inference, the overall sampling procedure is:
+\begin{enumerate}
+    \item Sample \(z_0 \sim \mathcal{N}(0, I_d)\).
+    \item Evolve \(z_0\) through the learned flow (or reverse diffusion)
+          to obtain \(\hat{Z}_1 = (\hat{G}, \hat{S})\).
+    \item Decode an image \(\hat{X} = D_\psi(\hat{G}, \hat{S})\).
+\end{enumerate}
+This realizes sampling from
+\[
+\hat{X} \sim \int \hat{p}_{X \mid G,S}(x \mid g,s)\,
+\hat{p}_{G,S}(g,s)\,dg\,ds.
+\]
+
+\subsection{Alignment and Diversity Losses Prevent Representation Collapse}
+
+For a fixed image \(x\), let its per-mask embeddings be
+\[
+S(x) = \big(s_1(x), \dots, s_N(x)\big), \qquad
+s_i(x) \in \mathbb{R}^{d_s}.
+\]
+Define the sample mean
+\[
+\bar{s}(x) = \frac{1}{N} \sum_{i=1}^N s_i(x),
+\]
+and the sample covariance
+\[
+C(x) = \frac{1}{N} \sum_{i=1}^N
+\big(s_i(x) - \bar{s}(x)\big)\big(s_i(x) - \bar{s}(x)\big)^\top
+\in \mathbb{R}^{d_s \times d_s}.
+\]
+
+\paragraph{Diversity loss.}
+We introduce a diversity-promoting term
+\[
+\mathcal{L}_{\mathrm{div}}(x)
+= - \log \det \big(C(x) + \epsilon I\big),
+\]
+with a small \(\epsilon > 0\) for numerical stability.
+If all mask embeddings collapse to a single vector, i.e.,
+\(s_i(x) = s_j(x)\) for all \(i,j\), then \(C(x) = 0\) and
+\(\det\big(C(x) + \epsilon I\big) = \epsilon^{d_s}\).
+In the limit \(\epsilon \to 0\),
+the determinant is zero and \(\mathcal{L}_{\mathrm{div}}(x) \to +\infty\).
+
+More generally, let \(\lambda_1, \dots, \lambda_{d_s}\) be the eigenvalues
+of \(C(x)\).
+Then
+\[
+\det\big(C(x) + \epsilon I\big)
+= \prod_{k=1}^{d_s} (\lambda_k + \epsilon),
+\qquad
+\mathcal{L}_{\mathrm{div}}(x)
+= - \sum_{k=1}^{d_s} \log (\lambda_k + \epsilon).
+\]
+Any eigenvalue \(\lambda_k \to 0\) causes the corresponding term
+to blow up.
+Minimizing \(\mathcal{L}_{\mathrm{div}}\) therefore encourages the
+covariance \(C(x)\) to be full-rank and well-conditioned, i.e.,
+it discourages low-dimensional collapse of mask embeddings.
+
+\paragraph{Alignment loss.}
+Let \(g(x)\) denote the global embedding of image \(x\).
+For a batch \(\{x^{(b)}\}_{b=1}^B\), a contrastive alignment loss can be
+written as
+\[
+\mathcal{L}_{\mathrm{align}} =
+\mathbb{E}\bigg[
+- \log
+\frac{\exp\big(\mathrm{sim}(g(x), s_i(x)) / \tau\big)}
+{\sum_{b',j} \exp\big(\mathrm{sim}(g(x), s_j(x^{(b')})) / \tau\big)}
+\bigg],
+\]
+where \(\mathrm{sim}(\cdot,\cdot)\) is a similarity function
+(e.g., dot product or cosine) and \(\tau > 0\) is a temperature.
+
+If all mask embeddings collapse to a constant vector \(c\) across images
+and masks, i.e., \(s_i(x) = c\) for all \(i,x\), and the global embeddings
+also collapse or trivially align with \(c\), then
+\(\mathrm{sim}(g(x), s_i(x))\) becomes nearly independent of
+\((x,i)\).
+In this regime, the numerator and denominator of the contrastive ratio
+are similar across all pairs, so the loss cannot effectively
+distinguish positive from negative pairs and remains high.
+Minimizing \(\mathcal{L}_{\mathrm{align}}\) thus encourages
+\((g(x), s_i(x))\) to retain image-specific information and to be
+mutually informative, preventing trivial collapse.
+
+\paragraph{Joint effect.}
+The total embedding-related loss combines reconstruction, alignment,
+and diversity terms, e.g.,
+\[
+\mathcal{L}_{\mathrm{emb}}
+= \lambda_2 \mathcal{L}_{\mathrm{seg}}
++ \lambda_3 \mathcal{L}_{\mathrm{align}}
++ \lambda_4 \mathcal{L}_{\mathrm{div}}.
+\]
+Any configuration where the mask embeddings collapse to a single
+structural code leads to:
+(i) a large diversity loss due to nearly singular covariance,
+(ii) a large alignment loss due to poor discrimination between positive
+and negative pairs, and
+(iii) increased reconstruction error relative to the teacher-forced SAM
+embeddings.
+Therefore, minimizing \(\mathcal{L}_{\mathrm{emb}}\) drives the model
+towards non-degenerate, diverse mask embeddings that remain coherent
+with global representations while avoiding trivial collapse.
+%\subsection{Alignment and Diversity Losses Prevent Representation Collapse}
+
+\begin{lemma}[Diversity loss penalizes collapsed embeddings]
+Let \(S(x) = (s_1(x),\dots,s_N(x))\) with \(s_i(x) \in \mathbb{R}^{d_s}\), and let
+\[
+\bar{s}(x) = \frac{1}{N} \sum_{i=1}^N s_i(x), \qquad
+C(x) = \frac{1}{N} \sum_{i=1}^N (s_i(x) - \bar{s}(x))(s_i(x) - \bar{s}(x))^\top.
+\]
+Assume the diversity loss
+\[
+\mathcal{L}_{\mathrm{div}}(x)
+= - \log \det \big(C(x) + \epsilon I\big), \quad \epsilon > 0.
+\]
+If all mask embeddings collapse to a single vector, i.e.\ \(s_i(x) = c\) for all \(i\),
+then \(C(x) = 0\) and therefore
+\[
+\mathcal{L}_{\mathrm{div}}(x) = - d_s \log \epsilon.
+\]
+Moreover, for any non-collapsed configuration with eigenvalues
+\(\lambda_1,\dots,\lambda_{d_s}\) of \(C(x)\),
+\[
+\mathcal{L}_{\mathrm{div}}(x)
+= - \sum_{k=1}^{d_s} \log (\lambda_k + \epsilon)
+\]
+strictly decreases as any \(\lambda_k\) increases from \(0\).
+In particular, any configuration in which one or more eigenvalues
+\(\lambda_k\) are close to zero yields a large value of
+\(\mathcal{L}_{\mathrm{div}}(x)\), so the loss strongly penalizes
+collapsed or nearly collapsed spectra.
+\end{lemma}
+
+\begin{proof}
+If \(s_i(x) = c\) for all \(i\), then \(\bar{s}(x) = c\) and
+\(s_i(x) - \bar{s}(x) = 0\) for all \(i\), so \(C(x) = 0\).
+Thus
+\[
+\det(C(x) + \epsilon I) = \det(\epsilon I) = \epsilon^{d_s},
+\]
+and therefore \(\mathcal{L}_{\mathrm{div}}(x) = - d_s \log \epsilon\).
+
+In the general case, let \(\lambda_1,\dots,\lambda_{d_s}\) be the eigenvalues of
+\(C(x)\), so
+\[
+\det(C(x) + \epsilon I) = \prod_{k=1}^{d_s} (\lambda_k + \epsilon),
+\quad
+\mathcal{L}_{\mathrm{div}}(x)
+= - \sum_{k=1}^{d_s} \log (\lambda_k + \epsilon).
+\]
+For each \(k\),
+\[
+\frac{\partial \mathcal{L}_{\mathrm{div}}}{\partial \lambda_k}
+= - \frac{1}{\lambda_k + \epsilon} < 0,
+\]
+so increasing any \(\lambda_k\) strictly decreases
+\(\mathcal{L}_{\mathrm{div}}(x)\).
+In particular, when some \(\lambda_k\) are close to zero, the terms
+\(-\log(\lambda_k + \epsilon)\) are large, making
+\(\mathcal{L}_{\mathrm{div}}(x)\) large.
+Hence the diversity loss penalizes collapsed or nearly collapsed spectra.
+\end{proof}
+
+
+\begin{lemma}[No trivial joint minimizer under collapse]
+Fix an image $x$ and let $S^\star(x) = (s^\star_1(x),\dots,s^\star_N(x))$
+denote the corresponding teacher per-mask embeddings (e.g., from a
+segmentation encoder such as SAM), with sample covariance
+$C^\star(x)$ defined by
+\[
+\bar{s}^\star(x) = \frac{1}{N} \sum_{i=1}^N s^\star_i(x), \qquad
+C^\star(x) = \frac{1}{N} \sum_{i=1}^N
+\big(s^\star_i(x) - \bar{s}^\star(x)\big)\big(s^\star_i(x) - \bar{s}^\star(x)\big)^\top.
+\]
+
+
+Assume:
+\begin{enumerate}
+    \item[(i)] $C^\star(x)$ is non-zero for some $x$, i.e.\ the teacher SAM
+    embeddings are not collapsed for at least one image;
+    \item[(ii)] the segmentation reconstruction loss $\mathcal{L}_{\mathrm{seg}}$
+    is minimized (over the model parameters) only when, for every image $x$,
+    the predicted mask embeddings $S(x)$ equal the teacher embeddings
+    $S^\star(x)$;
+    \item[(iii)] the alignment loss $\mathcal{L}_{\mathrm{align}}$ is minimized
+    only when the joint configuration of global and mask embeddings
+    $\{(G(x), S(x))\}_x$ is discriminative across images (in particular,
+    assigning the same constant mask embedding to all images does not minimize
+    $\mathcal{L}_{\mathrm{align}}$);
+    \item[(iv)] the diversity loss for an image $x$ is
+    \[
+    \mathcal{L}_{\mathrm{div}}(x)
+    = - \log \det\big(C(x) + \epsilon I\big), \quad \epsilon > 0,
+    \]
+    where $C(x)$ is the empirical covariance of the predicted mask embeddings
+    $S(x)$ defined analogously to $C^\star(x)$.
+\end{enumerate}
+
+Let
+\[
+\mathcal{L}_{\mathrm{emb}}
+= \mathcal{L}_{\mathrm{seg}}
++ \lambda_3 \mathcal{L}_{\mathrm{align}}
++ \lambda_4 \mathcal{L}_{\mathrm{div}},
+\qquad \lambda_3,\lambda_4 > 0.
+\]
+Then any configuration in which, for some image $x$, all predicted mask
+embeddings collapse to a single constant vector, i.e.\ $s_i(x) = c$ for all $i$,
+cannot be a global minimizer of $\mathcal{L}_{\mathrm{emb}}$.
+\end{lemma}
+
+\begin{proof}
+Consider any configuration of model parameters for which there exists at least
+one image $x_0$ such that all predicted mask embeddings collapse, i.e.\
+\[
+s_i(x_0) = c \quad \text{for all } i = 1,\dots,N
+\]
+for some $c \in \mathbb{R}^{d_s}$.
+
+\medskip
+\noindent\textbf{Step 1: Diversity loss is suboptimal under collapse.}
+For this image $x_0$, the predicted embeddings satisfy
+\[
+\bar{s}(x_0) = \frac{1}{N} \sum_{i=1}^N s_i(x_0) = c,
+\]
+and hence $s_i(x_0) - \bar{s}(x_0) = 0$ for all $i$.
+Thus the predicted covariance is
+\[
+C(x_0)
+= \frac{1}{N} \sum_{i=1}^N
+\big(s_i(x_0) - \bar{s}(x_0)\big)\big(s_i(x_0) - \bar{s}(x_0)\big)^\top
+= 0.
+\]
+Therefore
+\[
+\mathcal{L}_{\mathrm{div}}(x_0)
+= - \log \det\big(C(x_0) + \epsilon I\big)
+= - \log \det(\epsilon I)
+= - d_s \log \epsilon.
+\]
+
+Now, by assumption (i), for the teacher embeddings $S^\star(x_0)$ we have
+$C^\star(x_0) \neq 0$, so at least one eigenvalue of $C^\star(x_0)$ is
+strictly positive.
+By the lemma on the diversity loss (proved previously), any configuration
+with $C(x_0)$ closer to $C^\star(x_0)$ has strictly larger eigenvalues than
+the collapsed case and thus a strictly smaller value of
+$\mathcal{L}_{\mathrm{div}}(x_0)$.
+In particular, setting $S(x_0) = S^\star(x_0)$ yields $C(x_0) = C^\star(x_0)$
+and strictly decreases $\mathcal{L}_{\mathrm{div}}(x_0)$ compared to the
+collapsed configuration.
+
+\medskip
+\noindent\textbf{Step 2: Segmentation reconstruction is suboptimal under collapse.}
+By assumption (ii), the segmentation loss $\mathcal{L}_{\mathrm{seg}}$ is
+minimized only when $S(x) = S^\star(x)$ for every image $x$.
+For the image $x_0$ under the collapsed configuration $S(x_0) \equiv c$,
+we have $S(x_0) \neq S^\star(x_0)$ (since $C^\star(x_0) \neq 0$ and hence
+the teacher embeddings cannot all be equal).
+Therefore, replacing $S(x_0)$ by $S^\star(x_0)$ (and keeping all other
+parameters fixed) strictly reduces $\mathcal{L}_{\mathrm{seg}}$.
+
+\medskip
+\noindent\textbf{Step 3: Alignment loss is suboptimal under collapse.}
+By assumption (iii), the alignment loss $\mathcal{L}_{\mathrm{align}}$ is
+minimized only when the collection $\{(G(x), S(x))\}_x$ is discriminative
+across images, and in particular a configuration where mask embeddings are
+constant (or nearly constant) across images does not minimize
+$\mathcal{L}_{\mathrm{align}}$.
+Thus there exists at least one perturbation of the collapsed configuration
+that decreases $\mathcal{L}_{\mathrm{align}}$.
+
+\medskip
+\noindent\textbf{Step 4: Strict improvement of the joint objective.}
+Consider now moving from the collapsed configuration to a configuration where,
+for the image $x_0$, we set $S(x_0) = S^\star(x_0)$ and adjust the model
+parameters (if necessary) to reduce $\mathcal{L}_{\mathrm{align}}$ (as allowed
+by (iii)), while leaving other images unchanged.
+From Steps 1–3, this move strictly decreases at least one of
+$\mathcal{L}_{\mathrm{seg}}$, $\mathcal{L}_{\mathrm{align}}$, or
+$\mathcal{L}_{\mathrm{div}}$, and cannot increase the others arbitrarily
+without undoing the improvements.
+Since $\lambda_3,\lambda_4 > 0$, any strict decrease in one of these terms
+(with the others not decreased negatively enough to compensate) produces a
+strict decrease in
+\[
+\mathcal{L}_{\mathrm{emb}}
+= \mathcal{L}_{\mathrm{seg}}
++ \lambda_3 \mathcal{L}_{\mathrm{align}}
++ \lambda_4 \mathcal{L}_{\mathrm{div}}.
+\]
+
+Hence the collapsed configuration cannot be a global minimizer of
+$\mathcal{L}_{\mathrm{emb}}$.
+\end{proof}
+
+\begin{lemma}[SEG-RDM avoids collapsed mask embeddings]
+Fix an image $x$ and let $S^\star(x) = (s^\star_1(x),\dots,s^\star_N(x))$
+denote the corresponding teacher per-mask embeddings (e.g., from a
+segmentation encoder such as SAM), with sample covariance
+\[
+\bar{s}^\star(x) = \frac{1}{N} \sum_{i=1}^N s^\star_i(x), \qquad
+C^\star(x) = \frac{1}{N} \sum_{i=1}^N
+\big(s^\star_i(x) - \bar{s}^\star(x)\big)\big(s^\star_i(x) - \bar{s}^\star(x)\big)^\top.
+\]
+
+Assume:
+\begin{enumerate}
+    \item[(i)] $C^\star(x)$ is non-zero for at least one image $x$, i.e.,
+    the teacher embeddings are not collapsed for that image;
+    \item[(ii)] the segmentation reconstruction loss $\mathcal{L}_{\mathrm{seg}}$
+    is minimized (over model parameters) only when, for every image $x$,
+    the predicted mask embeddings $S(x)$ equal the teacher embeddings
+    $S^\star(x)$;
+    \item[(iii)] the alignment loss $\mathcal{L}_{\mathrm{align}}$ is minimized
+    only when the joint configuration $\{(G(x), S(x))\}_x$ is discriminative
+    across images (in particular, assigning the same constant mask embedding
+    to all images does not minimize $\mathcal{L}_{\mathrm{align}}$);
+    \item[(iv)] for each image $x$, the diversity loss is
+    \[
+    \mathcal{L}_{\mathrm{div}}(x)
+    = - \log \det\big(C(x) + \epsilon I\big), \quad \epsilon > 0,
+    \]
+    where $C(x)$ is the empirical covariance of the predicted mask embeddings
+    $S(x)$ defined analogously to $C^\star(x)$.
+\end{enumerate}
+
+Let
+\[
+\mathcal{L}_{\mathrm{emb}}
+= \mathcal{L}_{\mathrm{seg}}
++ \lambda_3 \mathcal{L}_{\mathrm{align}}
++ \lambda_4 \mathcal{L}_{\mathrm{div}},
+\qquad \lambda_3,\lambda_4 > 0.
+\]
+Then any configuration in which, for some image $x$, all predicted mask
+embeddings collapse to a single constant vector, i.e.\ $s_i(x) = c$ for all $i$,
+cannot be a global minimizer of $\mathcal{L}_{\mathrm{emb}}$.
+\end{lemma}
+
+\begin{proof}
+Suppose, for the sake of contradiction, that there exists a global minimizer
+of $\mathcal{L}_{\mathrm{emb}}$ in which the predicted mask embeddings
+collapse for at least one image $x_0$, i.e.\ there exists $c \in \mathbb{R}^{d_s}$
+such that
+\[
+s_i(x_0) = c \quad \text{for all } i=1,\dots,N.
+\]
+
+\medskip
+\noindent\textbf{Step 1: Diversity loss under collapse.}
+For this image $x_0$, the predicted mean and covariance are
+\[
+\bar{s}(x_0) = \frac{1}{N} \sum_{i=1}^N s_i(x_0) = c,
+\]
+and therefore $s_i(x_0) - \bar{s}(x_0) = 0$ for all $i$, so
+\[
+C(x_0)
+= \frac{1}{N} \sum_{i=1}^N
+\big(s_i(x_0) - \bar{s}(x_0)\big)\big(s_i(x_0) - \bar{s}(x_0)\big)^\top
+= 0.
+\]
+Hence
+\[
+\mathcal{L}_{\mathrm{div}}(x_0)
+= - \log \det\big(C(x_0) + \epsilon I\big)
+= - \log \det(\epsilon I)
+= - d_s \log \epsilon.
+\]
+
+By assumption (i), for the teacher embeddings $S^\star(x_0)$ we have
+$C^\star(x_0) \neq 0$, so at least one eigenvalue of $C^\star(x_0)$
+is strictly positive.
+As shown in the diversity lemma, any configuration with covariance
+eigenvalues strictly larger than those of the collapsed case (which has
+all eigenvalues equal to $0$) yields a strictly smaller value of
+$\mathcal{L}_{\mathrm{div}}(x_0)$.
+In particular, setting $S(x_0) = S^\star(x_0)$ gives $C(x_0)=C^\star(x_0)$
+and strictly decreases $\mathcal{L}_{\mathrm{div}}(x_0)$ compared to the
+collapsed configuration.
+
+\medskip
+\noindent\textbf{Step 2: Segmentation reconstruction under collapse.}
+By assumption (ii), the segmentation loss $\mathcal{L}_{\mathrm{seg}}$
+is minimized only when $S(x) = S^\star(x)$ for every image $x$.
+Under the collapsed configuration for $x_0$, we have $S(x_0)\equiv c$.
+Since $C^\star(x_0) \neq 0$, the teacher embeddings $S^\star(x_0)$
+cannot all be equal to the same constant vector, so $S(x_0) \neq S^\star(x_0)$.
+Thus replacing $S(x_0)$ by $S^\star(x_0)$ strictly decreases
+$\mathcal{L}_{\mathrm{seg}}$.
+
+\medskip
+\noindent\textbf{Step 3: Alignment under collapse.}
+By assumption (iii), $\mathcal{L}_{\mathrm{align}}$ is minimized only when
+the collection $\{(G(x), S(x))\}_x$ is discriminative across images.
+In particular, a configuration in which mask embeddings are constant
+or nearly constant across images does not minimize $\mathcal{L}_{\mathrm{align}}$.
+Therefore, there exists a perturbation of the collapsed configuration
+that strictly decreases $\mathcal{L}_{\mathrm{align}}$.
+
+\medskip
+\noindent\textbf{Step 4: Contradiction.}
+Starting from the collapsed configuration for $x_0$, consider a modified
+configuration in which we set $S(x_0) = S^\star(x_0)$ and (if necessary)
+adjust parameters to reduce $\mathcal{L}_{\mathrm{align}}$, while keeping
+all other images fixed.
+From Steps 1 and 2, this modification strictly decreases
+$\mathcal{L}_{\mathrm{div}}(x_0)$ and $\mathcal{L}_{\mathrm{seg}}$.
+From Step 3, we can also strictly decrease $\mathcal{L}_{\mathrm{align}}$.
+Since $\lambda_3,\lambda_4>0$, any strict decrease in one of
+$\mathcal{L}_{\mathrm{seg}}, \mathcal{L}_{\mathrm{align}},
+\mathcal{L}_{\mathrm{div}}$ leads to a strict decrease in
+\[
+\mathcal{L}_{\mathrm{emb}}
+= \mathcal{L}_{\mathrm{seg}}
++ \lambda_3 \mathcal{L}_{\mathrm{align}}
++ \lambda_4 \mathcal{L}_{\mathrm{div}}.
+\]
+Thus the collapsed configuration cannot be a global minimizer of
+$\mathcal{L}_{\mathrm{emb}}$, contradicting our assumption.
+
+Therefore, no global minimizer of $\mathcal{L}_{\mathrm{emb}}$ can have
+all predicted mask embeddings collapse to a single constant vector
+for any image $x$.
+\end{proof}
+
+\subsection{Structural Sufficiency of I-JEPA + SAM Representations}
+
+In this section we formalize a restricted sufficiency property of the
+joint representation \(Z = (G,S)\), where \(G\) is the global I-JEPA
+embedding and \(S\) is the SAM-based per-mask embedding. This property
+justifies using \(Z\) as the latent variable in our generative
+factorization.
+
+\subsubsection{Setup}
+
+Let \(X\) be a random variable of images with distribution \(p_X\).
+Let \(E_{\mathrm{g}} : \mathcal{X} \to \mathbb{R}^{d_g}\) denote the
+I-JEPA encoder, and \(E_{\mathrm{s}} : \mathcal{X} \to \mathbb{R}^{N \times d_s}\)
+denote the SAM-based encoder that outputs per-mask embeddings. We define
+\[
+G = E_{\mathrm{g}}(X) \in \mathbb{R}^{d_g}, \qquad
+S = E_{\mathrm{s}}(X) \in \mathbb{R}^{N \times d_s}, \qquad
+Z = (G,S).
+\]
+
+Let \(\mathcal{R}\) be the space of region descriptors (e.g., indices or
+positional encodings of masked regions). For each image \(x \in \mathcal{X}\)
+and region descriptor \(R \in \mathcal{R}\), let
+\[
+Y_R(x) \in \mathbb{R}^{d_y}
+\]
+denote the corresponding teacher region embedding, as defined by the
+I-JEPA teacher network.\footnote{For example, \(Y_R(x)\) may be the
+teacher ViT embedding associated with the patch subset specified by \(R\)
+in the formulation of Assran et al.~\cite{assran2023ijepa}.}
+
+The I-JEPA training objective for the image-level encoder \(E_{\mathrm{g}}\)
+and predictor \(P\) can be written (in squared-error form) as
+\begin{equation}
+\label{eq:ijepa-objective}
+\min_{\theta,\psi} \;
+\mathbb{E}_{X \sim p_X}\,\mathbb{E}_{R \sim \mathcal{R}}
+\big[
+\|P_\psi(E_{\mathrm{g},\theta}(X), R) - Y_R(X)\|_2^2
+\big],
+\end{equation}
+where \(\theta,\psi\) are the parameters of \(E_{\mathrm{g}}\) and \(P\),
+respectively.
+
+\subsubsection{Structural Sufficiency of \texorpdfstring{$(G,S)$}{(G,S)}}
+
+We now show that, under standard regression assumptions, the global
+I-JEPA embedding \(G\) is a sufficient statistic (for this family of
+region-level prediction tasks), and hence the joint representation
+\(Z = (G,S)\) is also sufficient.
+
+\begin{proposition}[Structural sufficiency of I-JEPA + SAM representation]
+\label{prop:structural-sufficiency}
+Assume that:
+\begin{enumerate}
+    \item[(i)] \(E_{\mathrm{g}}\) and \(P\) are trained by minimizing
+    the objective \eqref{eq:ijepa-objective} with squared error,
+    and that the teacher region embeddings \(Y_R(X)\) are fixed
+    (non-trainable) random variables;
+    \item[(ii)] the predictor class is rich enough that the empirical
+    minimizer \(P^\star\) of \eqref{eq:ijepa-objective} attains the
+    regression optimum for almost all \((G,R)\).
+\end{enumerate}
+Then for almost all \((g,R)\), the optimal predictor satisfies
+\begin{equation}
+\label{eq:cond-mean-g}
+P^\star(g,R)
+= \mathbb{E}\big[\,Y_R(X) \mid G = g, R\,\big].
+\end{equation}
+Moreover, since \(G = E_{\mathrm{g}}(X)\) and
+\(Z = (G,S) = (E_{\mathrm{g}}(X), E_{\mathrm{s}}(X))\) are deterministic
+functions of \(X\), we also have
+\begin{equation}
+\label{eq:cond-mean-z}
+\mathbb{E}\big[\,Y_R(X) \mid G, R\,\big]
+= \mathbb{E}\big[\,Y_R(X) \mid Z, R\,\big],
+\end{equation}
+so the joint representation \(Z = (G,S)\) is a sufficient statistic for
+predicting the family of targets \(\{Y_R(X)\}_{R \in \mathcal{R}}\) in the
+sense that all optimal predictors of \(Y_R(X)\) given \(X\) and \(R\) can
+be expressed as functions of \((Z,R)\).
+\end{proposition}
+
+\begin{proof}
+We first prove \eqref{eq:cond-mean-g}. For any fixed encoder
+\(E_{\mathrm{g}}\), the optimization problem \eqref{eq:ijepa-objective}
+over predictors \(P\) is, for each region descriptor \(R\), a standard
+least-squares regression of \(Y_R(X)\) on \(G = E_{\mathrm{g}}(X)\) and
+\(R\). Under assumptions (i)–(ii), the minimizer \(P^\star\) of the
+expected squared loss satisfies the well-known characterization of
+conditional expectation in \(L^2\):
+\[
+P^\star(G,R)
+= \mathbb{E}\big[\,Y_R(X) \mid G, R\,\big]
+\quad\text{almost surely},
+\]
+which yields \eqref{eq:cond-mean-g}.
+
+Next, we establish \eqref{eq:cond-mean-z}. Recall that both \(G\) and
+\(Z = (G,S)\) are deterministic functions of the underlying image \(X\):
+\[
+G = E_{\mathrm{g}}(X), \qquad
+Z = (E_{\mathrm{g}}(X), E_{\mathrm{s}}(X)).
+\]
+Therefore, for any measurable function \(h\),
+\[
+h(X) = h(X, G, Z)
+\]
+can be viewed as a function of \(X\) alone or as a function of
+\((X,G,Z)\), and conditioning on \((G,R)\) or on \((Z,R)\) induces
+the same \(\sigma\)-algebra generated by \(G\) together with \(R\), up to
+augmentation by the additional information in \(S\) that is itself a
+measurable function of \(X\).
+
+Formally, because \(G = E_{\mathrm{g}}(X)\) and \(Z = (G,S)\) with
+\(S = E_{\mathrm{s}}(X)\), we have the inclusion of \(\sigma\)-algebras
+\[
+\sigma(G,R) \subseteq \sigma(Z,R).
+\]
+Thus
+\[
+\mathbb{E}\big[\,Y_R(X) \mid Z, R\,\big]
+= \mathbb{E}\big[
+\mathbb{E}\big[\,Y_R(X) \mid G, R\,\big] \,\big|\, Z, R
+\big]
+= \mathbb{E}\big[\,Y_R(X) \mid G, R\,\big],
+\]
+where the first equality uses the tower property of conditional
+expectation and the fact that \(\mathbb{E}[Y_R(X)\mid G,R]\) is already
+\(\sigma(G,R)\)-measurable and hence also \(\sigma(Z,R)\)-measurable.
+This proves \eqref{eq:cond-mean-z}.
+
+Combining \eqref{eq:cond-mean-g} and \eqref{eq:cond-mean-z}, we conclude
+that the optimal predictor of \(Y_R(X)\) can be written as a function of
+\((G,R)\), and equivalently as a function of \((Z,R)\).
+In particular, any optimal predictor of the teacher’s region embeddings
+can be implemented using only the joint representation \(Z = (G,S)\) and
+the region descriptor \(R\).
+This establishes the claimed sufficiency of \(Z\) for the family of
+prediction tasks \(\{Y_R(X)\}_{R \in \mathcal{R}}\).
+\end{proof}
+
+\subsection{Partition-Based Spatial Modulation with SAM}
+
+In this section we formalize how SAM's instance masks and per-mask
+embeddings induce a natural, minimal spatially adaptive conditioning
+field for our segmentation-aware generator.
+
+\subsubsection{Setup}
+
+Let the image domain be a discrete grid
+\(\Omega = \{1,\dots,H\} \times \{1,\dots,W\}\).
+For a fixed image \(x\), SAM produces a set of non-overlapping
+instance masks
+\[
+\{M_i(x)\}_{i=1}^N, \quad M_i(x) \subset \Omega,
+\]
+such that
+\[
+M_i(x) \cap M_j(x) = \emptyset \ \text{for } i \neq j,
+\qquad
+\bigcup_{i=1}^N M_i(x) = \Omega.
+\]
+Thus \(\{M_i(x)\}_{i=1}^N\) forms a partition of the image grid.
+For each region \(M_i(x)\) we have a per-mask embedding
+\(s_i(x) \in \mathbb{R}^{d_s}\) provided by the SAM encoder.
+
+Let \(C\) be the channel dimension of a feature map
+\(x^{\mathrm{feat}} \in \mathbb{R}^{C \times H \times W}\) inside the
+generator.
+We consider spatially adaptive modulation parameters
+\(\gamma(x),\beta(x) \in \mathbb{R}^{C \times H \times W}\) that are
+piecewise constant on the SAM partition and are functions only of the
+per-mask embeddings \(\{s_i(x)\}\).
+
+\subsubsection{Minimal Partition-Based Conditioner}
+
+We now show that, given the SAM partition and per-mask embeddings, our
+construction of \((\gamma(x),\beta(x))\) is the unique piecewise-constant
+field adapted to the partition that depends only on region-level codes.
+
+\begin{lemma}[Partition-based spatial modulation]
+\label{lem:partition-modulation}
+Fix an image \(x\) and its SAM partition
+\(\{M_i(x)\}_{i=1}^N\) of \(\Omega\).
+Let \(s_i(x) \in \mathbb{R}^{d_s}\) be the per-region codes and let
+\(W_\gamma, W_\beta : \mathbb{R}^{d_s} \to \mathbb{R}^C\) be linear maps.
+Define region-level modulation parameters
+\[
+\gamma_i(x) = W_\gamma s_i(x) \in \mathbb{R}^C, \qquad
+\beta_i(x) = W_\beta s_i(x) \in \mathbb{R}^C.
+\]
+For each spatial location \((u,v) \in \Omega\), let \(i(u,v)\) be the
+unique index such that \((u,v) \in M_{i(u,v)}(x)\).
+Define the spatial fields \(\gamma(x),\beta(x) \in \mathbb{R}^{C \times H \times W}\) by
+\[
+\gamma_c(u,v) = \gamma_{i(u,v),c}(x), \qquad
+\beta_c(u,v) = \beta_{i(u,v),c}(x),
+\quad c = 1,\dots,C.
+\]
+
+Then:
+\begin{enumerate}
+    \item[(a)] \(\gamma(x)\) and \(\beta(x)\) are piecewise constant on
+    the partition \(\{M_i(x)\}\), i.e., for each \(i\), the restrictions
+    of \(\gamma(x)\) and \(\beta(x)\) to \(M_i(x)\) are constant;
+    \item[(b)] conversely, any spatial fields
+    \(\tilde{\gamma}(x),\tilde{\beta}(x) \in \mathbb{R}^{C \times H \times W}\)
+    that are piecewise constant on \(\{M_i(x)\}\) and depend only on the
+    region-level codes \(\{s_i(x)\}_{i=1}^N\) can be written in the form
+    above for some (possibly different) linear maps
+    \(W_\gamma, W_\beta : \mathbb{R}^{d_s} \to \mathbb{R}^C\).
+\end{enumerate}
+In particular, SAM's partition and per-mask embeddings determine a
+minimal spatially adaptive conditioning mechanism in which each region
+\(M_i(x)\) is assigned a constant modulation vector that depends only on
+its code \(s_i(x)\).
+\end{lemma}
+
+\begin{proof}
+(a) By construction, for any fixed region index \(i\) and any two
+locations \((u,v), (u',v') \in M_i(x)\), we have
+\(i(u,v) = i(u',v') = i\).
+Thus
+\[
+\gamma_c(u,v) = \gamma_{i,c}(x), \quad
+\gamma_c(u',v') = \gamma_{i,c}(x),
+\]
+and similarly for \(\beta\).
+Hence \(\gamma(x)\) and \(\beta(x)\) are constant on each region
+\(M_i(x)\), and therefore piecewise constant on the partition
+\(\{M_i(x)\}\).
+
+(b) Suppose \(\tilde{\gamma}(x),\tilde{\beta}(x)\) are spatial fields that
+are piecewise constant on \(\{M_i(x)\}\) and depend only on
+\(\{s_i(x)\}_{i=1}^N\).
+Being piecewise constant means that for each \(i\) there exist vectors
+\(\tilde{\gamma}_i(x), \tilde{\beta}_i(x) \in \mathbb{R}^C\) such that
+\[
+\tilde{\gamma}_c(u,v) = \tilde{\gamma}_{i,c}(x), \qquad
+\tilde{\beta}_c(u,v) = \tilde{\beta}_{i,c}(x),
+\quad \text{for all } (u,v) \in M_i(x), \ c=1,\dots,C.
+\]
+Dependence only on the region codes \(\{s_i(x)\}\) means that
+\(\tilde{\gamma}_i(x)\) and \(\tilde{\beta}_i(x)\) can be written as
+functions of \(s_i(x)\) alone:
+\[
+\tilde{\gamma}_i(x) = F_\gamma(s_i(x)), \qquad
+\tilde{\beta}_i(x) = F_\beta(s_i(x)),
+\]
+for some functions \(F_\gamma, F_\beta : \mathbb{R}^{d_s} \to \mathbb{R}^C\).
+
+If we restrict to linear dependence on \(s_i(x)\), then
+\(F_\gamma, F_\beta\) are linear maps and can be represented as
+\(W_\gamma, W_\beta \in \mathbb{R}^{C \times d_s}\).
+In that case, \(\tilde{\gamma}(x),\tilde{\beta}(x)\) coincide with the
+fields defined in the statement of the lemma:
+\[
+\tilde{\gamma}_i(x) = W_\gamma s_i(x), \qquad
+\tilde{\beta}_i(x) = W_\beta s_i(x),
+\]
+and
+\[
+\tilde{\gamma}_c(u,v) = \tilde{\gamma}_{i(u,v),c}(x), \quad
+\tilde{\beta}_c(u,v) = \tilde{\beta}_{i(u,v),c}(x).
+\]
+
+Therefore, within the class of linear region-level conditioners, any
+piecewise-constant spatial modulation field adapted to the SAM partition
+and depending only on \(\{s_i(x)\}\) necessarily has the form described
+in the lemma.
+\end{proof}
+
+\begin{remark}[Cross-attention as a soft partition conditioner]
+In our implementation, we replace the hard partition-based assignment
+\((u,v) \mapsto i(u,v)\) with a learned cross-attention mechanism:
+at each spatial location the feature map queries all segment tokens
+\(\{s_i(x)\}\) via multi-head attention, yielding a soft, data-dependent
+weighting.  This is strictly more expressive than the piecewise-constant
+field described in Lemma~\ref{lem:partition-modulation}: by concentrating
+attention weights on a single token per location, the cross-attention layer
+can recover the partition-based modulation as a special case, while also
+allowing smooth blending across region boundaries.
+A gated residual connection
+\[
+x \leftarrow x + \alpha \cdot \mathrm{CrossAttn}(x,\, S),
+\]
+with \(\alpha\) initialised at zero, ensures that training begins from
+the unconditional baseline and gradually incorporates structural
+conditioning as the gate opens.
+\end{remark}
+
+
+\end{document}
