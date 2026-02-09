@@ -35,7 +35,14 @@ class StyleGAN2Loss(Loss):
                  ijepa_warmup_kimg=500,
                  sam_enabled=False, sam_prob=0.25, sam_checkpoint=None,
                  sam_cache_dir=None, sam_model_type='vit_b', sam_max_masks=250,
+                 sam_emb_logging=False,
+                 # AMG parameters (matching precompute_sam_embeddings.py)
+                 sam_points_per_side=32, sam_pred_iou_thresh=0.82,
+                 sam_stability_score_thresh=0.85, sam_box_nms_thresh=0.70,
+                 sam_crop_n_layers=0, sam_dedup_iou_thresh=0.95,
+                 sam_min_mask_region_area=100,
                  lambda_seg_align=0.1, lambda_seg_diversity=0.05,
+                 seg_align_tau=0.07,
                  rank=0, num_gpus=1):
         super().__init__()
         self.device = device
@@ -53,11 +60,20 @@ class StyleGAN2Loss(Loss):
         # Alignment and diversity loss weights
         self.lambda_seg_align = lambda_seg_align
         self.lambda_seg_diversity = lambda_seg_diversity
+        self.seg_align_tau = seg_align_tau
         
         # ------------ SAM extractor (optional) -----------------------
         self.sam_enabled = sam_enabled
         self.sam_prob = sam_prob
+        self.sam_emb_logging = sam_emb_logging
         self.sam_extractor = None
+        
+        # SAM embedding logging counters
+        self._sam_log_pre_extracted = 0   # pre-computed from AlignedSegDataset reused
+        self._sam_log_cache_hits = 0      # loaded by SAMExtractor from unified cache
+        self._sam_log_on_the_fly = 0      # just extracted on-the-fly
+        self._sam_log_dropout = 0         # dropped (stochastic conditioning)
+        self._sam_log_total = 0           # total batches with SAM decision
         
         if sam_enabled:
             if sam_checkpoint is None or sam_cache_dir is None:
@@ -70,9 +86,17 @@ class StyleGAN2Loss(Loss):
                 model_type=sam_model_type,
                 max_masks=sam_max_masks,
                 rank=rank,
-                world_size=num_gpus
+                world_size=num_gpus,
+                # AMG parameters
+                points_per_side=sam_points_per_side,
+                pred_iou_thresh=sam_pred_iou_thresh,
+                stability_score_thresh=sam_stability_score_thresh,
+                box_nms_thresh=sam_box_nms_thresh,
+                crop_n_layers=sam_crop_n_layers,
+                dedup_iou_thresh=sam_dedup_iou_thresh,
+                min_mask_region_area=sam_min_mask_region_area,
             )
-            print(f"[Loss] SAM extractor enabled with prob={sam_prob}")
+            print(f"[Loss] SAM extractor enabled with prob={sam_prob}, logging={sam_emb_logging}")
         
         # Separate RNG for SAM decisions (independent of training seed)
         self.sam_rng = random.Random(42)
@@ -122,16 +146,17 @@ class StyleGAN2Loss(Loss):
     # ------------------------------------------------------------------
     def compute_seg_diversity_loss(self, seg_tokens, seg_pad_mask=None, eps=1e-6):
         """
-        Diversity loss on SAM segment embeddings (monitors real embeddings).
-        Encourages diverse segment representations to prevent collapse.
+        Diversity loss: -log det(C + εI) on SAM segment embeddings.
+        Matches the log-determinant form in theory.tex (Lemma 1).
+        Penalises collapsed / low-rank covariance spectra.
         
         Args:
             seg_tokens: [B, N, 256] SAM segment embeddings
             seg_pad_mask: [B, N] boolean mask (True = padded)
-            eps: Regularization constant
+            eps: Regularization constant for numerical stability
             
         Returns:
-            Scalar diversity loss (lower = more diverse)
+            Scalar diversity loss (higher = more collapsed)
         """
         B, N, C = seg_tokens.shape
         
@@ -141,37 +166,39 @@ class StyleGAN2Loss(Loss):
         else:
             mask = torch.ones(B, N, dtype=torch.bool, device=seg_tokens.device)
         
-        # Compute pairwise cosine similarities within each sample
-        # (O(N^2) but more efficient than determinant for monitoring)
-        seg_norm = F.normalize(seg_tokens, dim=2)  # [B, N, C]
-        
         losses = []
         for i in range(B):
-            valid_tokens = seg_norm[i, mask[i]]  # [N_valid, C]
+            valid_tokens = seg_tokens[i, mask[i]]  # [N_valid, C]
             if valid_tokens.shape[0] < 2:
                 continue
             
-            # Pairwise similarity matrix
-            sim_matrix = torch.mm(valid_tokens, valid_tokens.t())  # [N_valid, N_valid]
+            # Compute sample covariance matrix
+            mean = valid_tokens.mean(dim=0, keepdim=True)  # [1, C]
+            centered = valid_tokens - mean  # [N_valid, C]
+            cov = (centered.T @ centered) / valid_tokens.shape[0]  # [C, C]
             
-            # Average off-diagonal similarities (we want this low for diversity)
-            n_valid = valid_tokens.shape[0]
-            # Exclude diagonal (self-similarity = 1)
-            off_diag = sim_matrix - torch.eye(n_valid, device=sim_matrix.device)
-            avg_sim = off_diag.sum() / (n_valid * (n_valid - 1))
+            # Regularise and compute log determinant
+            cov_reg = cov + eps * torch.eye(C, device=cov.device)
             
-            # Loss: high similarity = high loss (want diverse = low similarity)
-            losses.append(avg_sim)
+            # slogdet for numerical stability
+            sign, logdet = torch.slogdet(cov_reg)
+            if sign > 0:  # Only use if positive definite
+                losses.append(-logdet)
         
         return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=seg_tokens.device)
     
     def compute_seg_alignment_loss(self, ijepa_features, seg_tokens, seg_pad_mask=None):
         """
-        Alignment loss between I-JEPA global features and SAM segment embeddings.
-        Ensures semantic coherence between global and local representations.
+        Contrastive alignment loss (InfoNCE) between I-JEPA global features
+        and SAM segment embeddings.  Uses in-batch negatives with temperature
+        self.seg_align_tau, matching theory.tex §1.4.
+        
+        Satisfies assumption (iii) of Lemmas 2–3: constant embeddings across
+        all images cannot minimise this loss because the cross-image negatives
+        make the softmax uniform.
         
         Args:
-            ijepa_features: [B, ijepa_out_dim] I-JEPA global features (e.g. 1280 for ViT-H)
+            ijepa_features: [B, ijepa_out_dim] I-JEPA global features
             seg_tokens: [B, N, 256] SAM segment embeddings
             seg_pad_mask: [B, N] boolean mask (True = padded)
             
@@ -183,7 +210,7 @@ class StyleGAN2Loss(Loss):
         
         B, N, C = seg_tokens.shape
         
-        # Pool SAM segments (average over valid tokens)
+        # Pool SAM segments (masked average over valid tokens)
         if seg_pad_mask is not None:
             valid_mask = ~seg_pad_mask  # [B, N]
             mask_float = valid_mask.float().unsqueeze(2)  # [B, N, 1]
@@ -194,8 +221,20 @@ class StyleGAN2Loss(Loss):
         # Project SAM pooled features to I-JEPA space
         seg_projected = self.sam_proj_mlp(seg_pooled)  # [B, ijepa_out_dim]
         
-        # Cosine similarity loss (higher similarity = lower loss)
-        alignment_loss = 1.0 - F.cosine_similarity(ijepa_features, seg_projected, dim=1).mean()
+        # Fallback for B=1 (e.g. final partial batch): simple cosine
+        if B < 2:
+            return 1.0 - F.cosine_similarity(ijepa_features, seg_projected, dim=1).mean()
+        
+        # L2 normalise both sides
+        g_norm = F.normalize(ijepa_features, dim=1)   # [B, D]
+        s_norm = F.normalize(seg_projected, dim=1)     # [B, D]
+        
+        # Similarity matrix: sim[i,j] = cos(g_i, s_j) / tau
+        sim_matrix = torch.mm(g_norm, s_norm.t()) / self.seg_align_tau  # [B, B]
+        
+        # InfoNCE: positive pairs are on the diagonal
+        labels = torch.arange(B, device=sim_matrix.device)
+        alignment_loss = F.cross_entropy(sim_matrix, labels)
         
         return alignment_loss
 
@@ -272,7 +311,8 @@ class StyleGAN2Loss(Loss):
         return logits
     
     def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, sync, gain,
-                             real_seg_tokens=None, real_seg_pad_mask=None, image_paths=None):
+                             real_seg_tokens=None, real_seg_pad_mask=None, image_paths=None,
+                             real_global_vec=None):
 
         assert phase in ['Gmain', 'Greg', 'Gboth', 'Dmain', 'Dreg', 'Dboth']
         do_Gmain = (phase in ['Gmain', 'Gboth'])
@@ -281,24 +321,50 @@ class StyleGAN2Loss(Loss):
         do_Dr1 = (phase in ['Dreg', 'Dboth']) and (self.r1_gamma != 0)
         
         # ───────────────── Stochastic SAM Conditioning ─────────────────────────
-        # Mode 2: sam_prob controls both extraction and usage (extract and use together)
-        # This is like dropout for conditioning - regularization and robustness
+        # sam_prob controls whether SAM tokens are USED this batch (dropout-like).
+        # If use_sam=True  → use tokens (pre-computed if available, else extract)
+        # If use_sam=False → dropout: set tokens to None (unconditional generation)
+        # I-JEPA global guidance is ALWAYS active regardless of this decision.
         use_sam = False
         if self.sam_enabled and image_paths is not None:
             use_sam = self.sam_rng.random() < self.sam_prob
-            
+            self._sam_log_total += 1
+
             if use_sam:
-                # Extract or load SAM embeddings from cache
-                sam_seg_tokens, sam_seg_pad_mask = self._get_sam_embeddings(real_img, image_paths)
-                
-                # Override pre-computed segmentation with SAM (if available)
-                if sam_seg_tokens is not None:
-                    real_seg_tokens = sam_seg_tokens
-                    real_seg_pad_mask = sam_seg_pad_mask
+                # Only extract if pre-computed tokens are NOT already available
+                if real_seg_tokens is None:
+                    sam_seg_tokens, sam_seg_pad_mask = self._get_sam_embeddings(real_img, image_paths)
+                    if sam_seg_tokens is not None:
+                        real_seg_tokens = sam_seg_tokens
+                        real_seg_pad_mask = sam_seg_pad_mask
+                        # Determine source: cache hit vs on-the-fly
+                        if self.sam_extractor is not None:
+                            stats = self.sam_extractor.get_stats()
+                            # If extractions increased, this was on-the-fly
+                            if stats['extractions'] > self._sam_log_on_the_fly:
+                                self._sam_log_on_the_fly = stats['extractions']
+                            else:
+                                self._sam_log_cache_hits += 1
+                else:
+                    # Pre-computed tokens exist (from AlignedSegDataset) — reuse them
+                    self._sam_log_pre_extracted += 1
             else:
-                # Don't use SAM this batch (stochastic conditioning)
+                # Stochastic dropout: don't use SAM this batch
                 real_seg_tokens = None
                 real_seg_pad_mask = None
+                self._sam_log_dropout += 1
+
+            # Report logging stats (when enabled)
+            if self.sam_emb_logging and self._sam_log_total > 0:
+                training_stats.report('SAM/pre_extracted_reused', self._sam_log_pre_extracted)
+                training_stats.report('SAM/cache_hits', self._sam_log_cache_hits)
+                training_stats.report('SAM/on_the_fly_extractions', self._sam_log_on_the_fly)
+                training_stats.report('SAM/dropout_batches', self._sam_log_dropout)
+                total_used = self._sam_log_pre_extracted + self._sam_log_cache_hits + self._sam_log_on_the_fly
+                hit_pct = (self._sam_log_pre_extracted + self._sam_log_cache_hits) / max(1, total_used) * 100
+                training_stats.report('SAM/cache_hit_rate_pct', hit_pct)
+                if self.sam_extractor is not None:
+                    training_stats.report('SAM/lock_wait_time_s', self.sam_extractor.lock_wait_time)
 
         # ───────────────── ramp & weight ─────────────────────────────────────────
         ramp      = ((self.cur_kimg - 2.0) / (self.warmup_kimg - 2.0)).clamp(0.0, 1.0)
@@ -308,7 +374,11 @@ class StyleGAN2Loss(Loss):
         training_stats.report("Loss/IJEPA_weight", lam)
 
         # ───────────────── semantic targets ─────────────────────────────────────
-        target_f        = self._feat(real_img).detach()          # (B, ijepa_out_dim)
+        # Use pre-computed I-JEPA embedding if available, else run live encoder
+        if real_global_vec is not None:
+            target_f = real_global_vec.detach()                   # (B, ijepa_out_dim)
+        else:
+            target_f = self._feat(real_img).detach()              # (B, ijepa_out_dim)
         batch_size_pl   = gen_z.shape[0] // self.pl_batch_shrink
         target_f_small  = target_f[:batch_size_pl] if do_Gpl else None
         seg_tokens_pl   = real_seg_tokens[:batch_size_pl] if (do_Gpl and real_seg_tokens is not None) else None
@@ -320,8 +390,7 @@ class StyleGAN2Loss(Loss):
         # Gmain: Maximize logits for generated images.
         if do_Gmain:
             with torch.autograd.profiler.record_function('Gmain_forward'):
-                target_f = self._feat(real_img).detach()
-                # scaled_target_f = target_f * sem_ramp
+                # target_f already computed above (pre-computed or live encoder)
 
                 # Generate a fake image conditioned on that embedding:
                 gen_img, _gen_ws = self.run_G(

@@ -366,7 +366,6 @@ def training_loop(
     
     # Initialize RDM sampler for mixed training (if enabled)
     rdm_sampler = None
-    rdm_cache = None
     rdm_checkpoint = loss_kwargs.get('rdm_checkpoint', None)
     rdm_mix_prob = loss_kwargs.get('rdm_mix_prob', 0.0)
     rdm_warmup_kimg = loss_kwargs.get('rdm_warmup_kimg', 10000)
@@ -388,13 +387,13 @@ def training_loop(
                 ddim_steps=50  # Fast sampling
             )
             
-            # Use cached sampler for efficiency (only on rank 0 for now)
-            if rank == 0:
-                rdm_sampler = CachedRDMSampler(
-                    base_sampler,
-                    cache_size=500,  # Pre-generate 500 samples
-                    num_segments=180
-                )
+            # Initialize cached sampler on ALL ranks so every GPU gets RDM
+            # samples during mixed training (avoids gradient inconsistency)
+            rdm_sampler = CachedRDMSampler(
+                base_sampler,
+                cache_size=500,  # Pre-generate 500 samples
+                num_segments=180
+            )
             
             if rank == 0:
                 print('[RDM] Sampler initialized successfully')
@@ -512,15 +511,15 @@ def training_loop(
                 progress = (cur_nimg - rdm_warmup_kimg * 1000) / (10000 * 1000)  # Ramp over 10M images
                 current_mix_prob = min(rdm_mix_prob, rdm_mix_prob * progress)
                 
-                # Decide whether to use RDM samples this batch
-                if np.random.rand() < current_mix_prob and rank == 0:
+                # Decide whether to use RDM samples this batch (all ranks)
+                if np.random.rand() < current_mix_prob:
                     try:
-                        # Sample from RDM (only rank 0 for simplicity)
                         rdm_batch = rdm_sampler.sample(batch_size=batch_size)
                         
-                        # Replace real embeddings with RDM-sampled ones
+                        # Replace BOTH global_vec and seg_tokens with RDM samples
                         # Note: We keep real images but use synthetic embeddings for conditioning
                         # This teaches the decoder to handle RDM-sampled embeddings
+                        phase_real_global_vec = rdm_batch['global_vec'].to(device).split(batch_gpu)
                         phase_real_seg_tokens = rdm_batch['seg_tokens'].to(device).split(batch_gpu)
                         
                         # Create padding masks (RDM generates fixed length, no padding)
@@ -582,7 +581,8 @@ def training_loop(
                     gain=gain,
                     real_seg_tokens=real_seg_tokens,
                     real_seg_pad_mask=real_seg_pad_mask,
-                    image_paths=round_image_paths
+                    image_paths=round_image_paths,
+                    real_global_vec=real_global_vec,
                 )
 
             # Update weights.

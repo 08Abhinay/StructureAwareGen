@@ -129,7 +129,7 @@ class RDMSampler:
             
         Returns:
             dict with keys:
-                'global_vectors': [batch_size, 256] global I-JEPA embeddings
+                'global_vec': [batch_size, 256] global I-JEPA embeddings
                 'seg_tokens': [batch_size, num_segments, 256] SAM segment embeddings
                 'num_segments': [batch_size] actual segment counts (all = num_segments)
         """
@@ -166,7 +166,7 @@ class RDMSampler:
         num_segments_arr = torch.full((batch_size,), num_segments, dtype=torch.long)
         
         return {
-            'global_vectors': global_vectors,
+            'global_vec': global_vectors,
             'seg_tokens': seg_tokens,
             'num_segments': num_segments_arr,
         }
@@ -197,12 +197,12 @@ class RDMSampler:
                 num_segments=num_segments,
                 use_ddim=True
             )
-            all_global.append(samples['global_vectors'])
+            all_global.append(samples['global_vec'])
             all_seg.append(samples['seg_tokens'])
         
         # Concatenate
         cache = {
-            'global_vectors': torch.cat(all_global, dim=0),  # [cache_size, 256]
+            'global_vec': torch.cat(all_global, dim=0),  # [cache_size, 256]
             'seg_tokens': torch.cat(all_seg, dim=0),  # [cache_size, num_segments, 256]
         }
         
@@ -252,7 +252,7 @@ class CachedRDMSampler:
             self._refresh_cache()
         
         # Get batch from cache
-        global_batch = self.cache['global_vectors'][
+        global_batch = self.cache['global_vec'][
             self.current_idx:self.current_idx + batch_size
         ]
         seg_batch = self.cache['seg_tokens'][
@@ -262,7 +262,7 @@ class CachedRDMSampler:
         self.current_idx += batch_size
         
         return {
-            'global_vectors': global_batch,
+            'global_vec': global_batch,
             'seg_tokens': seg_batch,
             'num_segments': torch.full((batch_size,), self.num_segments, dtype=torch.long),
         }
@@ -281,10 +281,10 @@ if __name__ == '__main__':
     # Sample embeddings
     samples = sampler.sample(batch_size=4, num_segments=180)
     
-    print("Global vectors:", samples['global_vectors'].shape)  # [4, 256]
+    print("Global vectors:", samples['global_vec'].shape)  # [4, 256]
     print("Segment tokens:", samples['seg_tokens'].shape)  # [4, 180, 256]
     
     # Use cached sampler for efficient training
     cached_sampler = CachedRDMSampler(sampler, cache_size=500)
     batch = cached_sampler.sample(batch_size=8)
-    print("Cached batch:", batch['global_vectors'].shape)
+    print("Cached batch:", batch['global_vec'].shape)
