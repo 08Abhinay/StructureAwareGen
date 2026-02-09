@@ -1,16 +1,16 @@
 #!/bin/bash
 #SBATCH -A pfw-cs
-#SBATCH -p a100-40gb
+#SBATCH -p a30
 #SBATCH -q standby
 #SBATCH --job-name=ijepa_and_seg_aware
-#SBATCH --nodes=4
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=2
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=10
 #SBATCH --mem-per-gpu=80G
 #SBATCH --time=04:00:00
-#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/ijepa_and_seg_aware-batch_32/.out
-#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/ijepa_and_seg_aware-batch_32/.err
+#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/ijepa_and_seg_aware-batch_16/.out
+#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/ijepa_and_seg_aware-batch_16/.err
 
 module load anaconda
 conda activate /scratch/gilbreth/abelde/Thesis/StructureAwareGen/SegmentationAwareGen
@@ -21,14 +21,14 @@ cd /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM
 export PYTHONPATH="$PWD:$PYTHONPATH"
 
 mkdir -p /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES
-mkdir -p /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_128/ijepa_h14
+mkdir -p /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_16/ijepa_and_seg_aware
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
 MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
 
 RESUME_ARG=""
-if ls /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_128/ijepa_h14/checkpoint-*.pth 1> /dev/null 2>&1; then
-  LAST_CKPT=$(ls -t /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_128/ijepa_h14/checkpoint-*.pth | head -n 1)
+if ls /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_16/ijepa_and_seg_aware/checkpoint-*.pth 1> /dev/null 2>&1; then
+  LAST_CKPT=$(ls -t /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_16/ijepa_and_seg_aware/checkpoint-*.pth | head -n 1)
   RESUME_ARG="--resume $LAST_CKPT"
 fi
 
@@ -42,14 +42,17 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
     --rdzv_id=$SLURM_JOB_ID \
     -m rdm.main_rdm \
-      --config /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/configs/rdm_default.yaml \
+      --config /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/configs/unified_seg_rdm.yaml \
       --input_size 256 \
       --blr 1e-6 \
       --weight_decay 0.01 \
       --epochs 200 \
-      --batch_size 32 \
+      --batch_size 16 \
       --accum_iter 1 \
-      --output_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_32/ijepa_and_seg_aware \
+      --output_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_16/ijepa_and_seg_aware \
       --log_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm \
       --data_path /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf \
-      --resume /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_128/ijepa_h14/checkpoint-last.pth
+      --use_seg_dataset \
+      --mask_npz_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/sam_cache_unified/ \
+      --ijepa_cache_dir rdm/output_dir/ijepa_embeddings \
+      --max_segments 250 \
