@@ -84,12 +84,14 @@ class AlignedSegDataset(ImageFolderDataset):
         print(f"  Max segments: {max_segments}")
         print(f"  Use labels (conditional): {use_labels}")
     
-    def _get_corresponding_npz(self, image_fname, npz_dir):
+    def _get_corresponding_npz(self, image_fname, npz_dir, subdir=None):
         """
         Get corresponding .npz path for an image filename.
         
         If origin_map is loaded, translates zip names like
-          "00000/img00000005.png" -> original "0/980" -> npz_dir/0/980.npz
+          "00000/img00000005.png" -> original "0/980"
+          -> npz_dir/0/{subdir}/980.npz  (if subdir given, e.g. "masks_npz" for SAM)
+          -> npz_dir/0/980.npz           (if subdir is None, e.g. for I-JEPA)
         
         Falls back to using the zip filename directly if no mapping exists.
         """
@@ -97,11 +99,15 @@ class AlignedSegDataset(ImageFolderDataset):
             orig_key = self._origin_map[image_fname]   # e.g. "0/980"
             parts = orig_key.split("/")
             if len(parts) == 2:
-                return npz_dir / parts[0] / "masks_npz" / f"{parts[1]}.npz"
+                if subdir:
+                    return npz_dir / parts[0] / subdir / f"{parts[1]}.npz"
+                return npz_dir / parts[0] / f"{parts[1]}.npz"
             return npz_dir / f"{orig_key}.npz"
         
         # Fallback: use zip filename directly (works for non-zip or unmapped datasets)
         rel_path = Path(image_fname)
+        if subdir:
+            return npz_dir / rel_path.parent / subdir / f"{rel_path.stem}.npz"
         return npz_dir / rel_path.parent / f"{rel_path.stem}.npz"
     
     def __getitem__(self, idx):
@@ -141,12 +147,7 @@ class AlignedSegDataset(ImageFolderDataset):
             global_vec = np.zeros(1280, dtype=np.float32)
         
         try:
-            sam_path = self._get_corresponding_npz(fname, self.sam_npz_dir)
-            # SAM precompute may store under {class}/masks_npz/{stem}.npz
-            if not sam_path.exists():
-                alt_path = sam_path.parent / "masks_npz" / sam_path.name
-                if alt_path.exists():
-                    sam_path = alt_path
+            sam_path = self._get_corresponding_npz(fname, self.sam_npz_dir, subdir="masks_npz")
             sam_data = np.load(sam_path)
             seg_tokens = sam_data['emb'].astype(np.float32)
             
