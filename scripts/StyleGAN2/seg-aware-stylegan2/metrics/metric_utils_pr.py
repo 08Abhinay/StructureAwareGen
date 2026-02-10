@@ -294,8 +294,16 @@ def compute_feature_stats_for_dataset(
         **data_loader_kwargs
     )
     item_subset = [(i * opts.num_gpus + opts.rank) % num_items for i in range((num_items - 1) // opts.num_gpus + 1)]
-    for images, _labels in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset, batch_size=batch_size, **data_loader_kwargs):
-        
+    for batch in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset, batch_size=batch_size, **data_loader_kwargs):
+        if isinstance(batch, dict):
+            images = batch['image']
+            _labels = batch.get('label', None)
+        elif isinstance(batch, (list, tuple)):
+            images = batch[0]
+            _labels = batch[1] if len(batch) > 1 else None
+        else:
+            images = batch
+            _labels = None
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])
         feats = detector(images.to(opts.device), **detector_kwargs)
