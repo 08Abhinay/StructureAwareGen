@@ -55,34 +55,37 @@ class AlignedSegDataset(ImageFolderDataset):
             if om_path.exists():
                 with open(om_path, 'r') as f:
                     self._origin_map = json.load(f)
-                print(f"  Loaded origin_map with {len(self._origin_map)} entries from {om_path}")
             else:
                 print(f"  WARNING: origin_map_json not found at {om_path}")
                 print(f"           NPZ lookup will use zip filenames directly (likely won't find files)")
-        else:
-            print(f"  INFO: No origin_map_json provided — assuming image filenames match NPZ filenames")
         
         if not self.sam_npz_dir.exists():
             raise ValueError(f"SAM directory not found: {sam_npz_dir}")
         if not self.ijepa_npz_dir.exists():
             raise ValueError(f"I-JEPA directory not found: {ijepa_npz_dir}")
         
-        # Sanity check: verify first filename maps correctly
-        if self._origin_map and len(self._image_fnames) > 0:
-            test_fname = self._image_fnames[0]
-            if test_fname in self._origin_map:
-                orig = self._origin_map[test_fname]
-                print(f"  origin_map sanity check: '{test_fname}' -> '{orig}' OK")
-            else:
-                print(f"  WARNING: first image '{test_fname}' NOT in origin_map — check mapping!")
-        
-        print(f"AlignedSegDataset initialized:")
-        print(f"  Images: {path}")
-        print(f"  SAM embeddings: {sam_npz_dir}")
-        print(f"  I-JEPA embeddings: {ijepa_npz_dir}")
-        print(f"  Origin map entries: {len(self._origin_map)}")
-        print(f"  Max segments: {max_segments}")
-        print(f"  Use labels (conditional): {use_labels}")
+        # Only print verbose init info once (first construction, typically rank 0)
+        if not hasattr(AlignedSegDataset, '_init_logged'):
+            AlignedSegDataset._init_logged = True
+            if self._origin_map:
+                print(f"  Loaded origin_map with {len(self._origin_map)} entries from {origin_map_json}")
+                # Sanity check: verify first filename maps correctly
+                if len(self._image_fnames) > 0:
+                    test_fname = self._image_fnames[0]
+                    if test_fname in self._origin_map:
+                        orig = self._origin_map[test_fname]
+                        print(f"  origin_map sanity check: '{test_fname}' -> '{orig}' OK")
+                    else:
+                        print(f"  WARNING: first image '{test_fname}' NOT in origin_map — check mapping!")
+            elif origin_map_json is None:
+                print(f"  INFO: No origin_map_json provided — assuming image filenames match NPZ filenames")
+            print(f"AlignedSegDataset initialized:")
+            print(f"  Images: {path}")
+            print(f"  SAM embeddings: {sam_npz_dir}")
+            print(f"  I-JEPA embeddings: {ijepa_npz_dir}")
+            print(f"  Origin map entries: {len(self._origin_map)}")
+            print(f"  Max segments: {max_segments}")
+            print(f"  Use labels (conditional): {use_labels}")
     
     def _get_corresponding_npz(self, image_fname, npz_dir, subdir=None):
         """
