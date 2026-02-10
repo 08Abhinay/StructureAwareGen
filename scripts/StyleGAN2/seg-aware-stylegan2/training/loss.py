@@ -72,6 +72,7 @@ class StyleGAN2Loss(Loss):
         self._sam_log_pre_extracted = 0   # pre-computed from AlignedSegDataset reused
         self._sam_log_cache_hits = 0      # loaded by SAMExtractor from unified cache
         self._sam_log_on_the_fly = 0      # just extracted on-the-fly
+        self._sam_log_fallback = 0        # missing pre-computed → extracted on-the-fly per-sample
         self._sam_log_dropout = 0         # dropped (stochastic conditioning)
         self._sam_log_total = 0           # total batches with SAM decision
         
@@ -331,23 +332,40 @@ class StyleGAN2Loss(Loss):
             self._sam_log_total += 1
 
             if use_sam:
-                # Only extract if pre-computed tokens are NOT already available
-                if real_seg_tokens is None:
+                has_precomputed = (real_seg_tokens is not None and real_seg_pad_mask is not None)
+
+                if has_precomputed:
+                    # ── Per-sample hybrid: reuse valid pre-computed, extract missing ──
+                    B = real_seg_pad_mask.shape[0]
+                    missing_idx = [i for i in range(B) if real_seg_pad_mask[i].all()]
+                    valid_count = B - len(missing_idx)
+
+                    if valid_count > 0:
+                        self._sam_log_pre_extracted += valid_count
+
+                    # On-the-fly extraction ONLY for samples without pre-computed SAM
+                    if missing_idx and self.sam_extractor is not None and image_paths is not None:
+                        missing_paths = [image_paths[i] for i in missing_idx]
+                        missing_imgs  = real_img[missing_idx] if real_img is not None else None
+                        embeddings_list = self.sam_extractor.extract_or_load(missing_paths, missing_imgs)
+
+                        max_seg = real_seg_tokens.shape[1]  # AlignedSegDataset pad dim (e.g. 250)
+                        for j, bi in enumerate(missing_idx):
+                            emb = embeddings_list[j]['emb']  # (N, 256) numpy
+                            n = min(emb.shape[0], max_seg)
+                            if n > 0:
+                                real_seg_tokens[bi, :n] = torch.from_numpy(
+                                    emb[:n].astype(np.float32)).to(real_seg_tokens.device)
+                                real_seg_pad_mask[bi, :n] = False  # mark as valid
+                        self._sam_log_fallback += len(missing_idx)
+
+                else:
+                    # No pre-computed tokens at all → full batch extraction
                     sam_seg_tokens, sam_seg_pad_mask = self._get_sam_embeddings(real_img, image_paths)
                     if sam_seg_tokens is not None:
-                        real_seg_tokens = sam_seg_tokens
+                        real_seg_tokens  = sam_seg_tokens
                         real_seg_pad_mask = sam_seg_pad_mask
-                        # Determine source: cache hit vs on-the-fly
-                        if self.sam_extractor is not None:
-                            stats = self.sam_extractor.get_stats()
-                            # If extractions increased, this was on-the-fly
-                            if stats['extractions'] > self._sam_log_on_the_fly:
-                                self._sam_log_on_the_fly = stats['extractions']
-                            else:
-                                self._sam_log_cache_hits += 1
-                else:
-                    # Pre-computed tokens exist (from AlignedSegDataset) — reuse them
-                    self._sam_log_pre_extracted += 1
+                        self._sam_log_fallback += real_seg_tokens.shape[0]
             else:
                 # Stochastic dropout: don't use SAM this batch
                 real_seg_tokens = None
@@ -359,8 +377,9 @@ class StyleGAN2Loss(Loss):
                 training_stats.report('SAM/pre_extracted_reused', self._sam_log_pre_extracted)
                 training_stats.report('SAM/cache_hits', self._sam_log_cache_hits)
                 training_stats.report('SAM/on_the_fly_extractions', self._sam_log_on_the_fly)
+                training_stats.report('SAM/fallback_extractions', self._sam_log_fallback)
                 training_stats.report('SAM/dropout_batches', self._sam_log_dropout)
-                total_used = self._sam_log_pre_extracted + self._sam_log_cache_hits + self._sam_log_on_the_fly
+                total_used = self._sam_log_pre_extracted + self._sam_log_cache_hits + self._sam_log_on_the_fly + self._sam_log_fallback
                 hit_pct = (self._sam_log_pre_extracted + self._sam_log_cache_hits) / max(1, total_used) * 100
                 training_stats.report('SAM/cache_hit_rate_pct', hit_pct)
                 if self.sam_extractor is not None:
