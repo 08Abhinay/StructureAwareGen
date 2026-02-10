@@ -32,89 +32,66 @@ class RDMSampler:
         self._load_checkpoint(rdm_checkpoint_path)
         
     def _load_checkpoint(self, checkpoint_path):
-        """Load RDM model from checkpoint."""
+        """Load RDM model from checkpoint.
+
+        Expected checkpoint keys (produced by SEG-RDM main_rdm.py):
+            config   – full OmegaConf dict with model.target / model.params
+            model    – raw model state_dict
+            model_ema – EMA state_dict (or None)
+            args, optimizer, epoch, scaler – training metadata
+        """
         # Add SEG-RDM to path
         seg_rdm_path = Path(__file__).parent.parent.parent.parent / 'SEG-RDM'
         if str(seg_rdm_path) not in sys.path:
             sys.path.insert(0, str(seg_rdm_path))
-        
+
         try:
-            from rdm.models.diffusion.ddpm import UnifiedSegRDM
             from rdm.models.diffusion.ddim import DDIMSampler
+            from rdm.util import instantiate_from_config
         except ImportError as e:
             raise ImportError(
                 f"Failed to import SEG-RDM modules. Make sure {seg_rdm_path} exists. Error: {e}"
             )
-        
+
         # Load checkpoint
         ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-        
-        # Handle different checkpoint formats
-        if 'model' in ckpt:
-            state_dict = ckpt['model']
-        elif 'model_state_dict' in ckpt:
-            state_dict = ckpt['model_state_dict']
-        elif 'state_dict' in ckpt:
-            state_dict = ckpt['state_dict']
-        else:
-            state_dict = ckpt
-        
-        # Extract model config (if available)
-        if 'config' in ckpt:
-            config = ckpt['config']
-        elif 'args' in ckpt and hasattr(ckpt['args'], 'max_segments'):
-            # Extract from args (SEG-RDM checkpoint format)
-            max_segments = ckpt['args'].max_segments
-            print(f"Extracted max_segments={max_segments} from checkpoint args")
-            config = {
-                'model': {
-                    'params': {
-                        'channels': 256,
-                        'max_segments': max_segments,
-                    }
-                }
-            }
-        else:
-            # Use default config
-            print("Warning: No config found in checkpoint, using defaults")
-            config = {
-                'model': {
-                    'params': {
-                        'channels': 256,
-                        'max_segments': 250,
-                    }
-                }
-            }
-        
-        # Instantiate model
-        # Note: You may need to adjust this based on your checkpoint structure
-        from rdm.util import instantiate_from_config
-        
-        if 'model' in config:
-            self.model = instantiate_from_config(config['model'])
-        else:
-            # Fallback: create model with default params
-            self.model = UnifiedSegRDM(
-                timesteps=1000,
-                channels=256,
-                max_segments=250,
-                # Add other required params
+
+        # --- Retrieve config ------------------------------------------------
+        config = ckpt.get('config')
+        if config is None or 'model' not in config:
+            raise RuntimeError(
+                "Checkpoint is missing the 'config' key (or config has no 'model' entry). "
+                "Re-train the RDM with the updated save_model() that embeds the YAML config."
             )
-        
-        # Load state dict
-        if self.use_ema and 'model_ema' in ckpt:
-            print("Using EMA weights")
+
+        # --- Instantiate model from config -----------------------------------
+        # Remove pretrained_enc_config so the 630M I-JEPA encoder is NOT
+        # loaded at inference time (we only need the diffusion backbone).
+        model_cfg = config['model']
+        if 'params' in model_cfg and 'pretrained_enc_config' in model_cfg['params']:
+            model_cfg['params']['pretrained_enc_config'] = {'params': {}}
+            print("[RDM] Skipping pretrained encoder init (not needed for sampling)")
+
+        self.model = instantiate_from_config(model_cfg)
+
+        # --- Load weights ----------------------------------------------------
+        if self.use_ema and ckpt.get('model_ema') is not None:
+            print("[RDM] Loading EMA weights")
             self.model.load_state_dict(ckpt['model_ema'], strict=False)
+        elif 'model' in ckpt:
+            print("[RDM] Loading raw model weights")
+            self.model.load_state_dict(ckpt['model'], strict=False)
         else:
-            self.model.load_state_dict(state_dict, strict=False)
-        
+            raise RuntimeError("Checkpoint contains neither 'model' nor 'model_ema' state_dict.")
+
         self.model = self.model.to(self.device)
         self.model.eval()
-        
+
         # Create DDIM sampler for fast sampling
         self.ddim_sampler = DDIMSampler(self.model)
-        
-        print(f"RDM model loaded successfully (EMA: {self.use_ema})")
+
+        epoch = ckpt.get('epoch', '?')
+        print(f"[RDM] Model loaded successfully (epoch={epoch}, EMA={self.use_ema})")
     
     @torch.no_grad()
     def sample(self, batch_size=1, num_segments=180, cond=None, use_ddim=True):

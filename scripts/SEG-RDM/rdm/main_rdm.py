@@ -331,14 +331,30 @@ def main(args):
                 log_writer=log_writer,
                 args=args
             )
+        # ---- Extract EMA parameters (if model uses LitEma) ---- #
+        ema_params = None
+        if hasattr(model_without_ddp, 'model_ema') and model_without_ddp.model_ema is not None:
+            ema_module = model_without_ddp.model_ema
+            # LitEma stores buffers with dots stripped from param names.
+            # Reverse-map: s_name (dot-free) -> original dotted name
+            s2m = {v: k for k, v in ema_module.m_name2s_name.items()}
+            buffers = dict(ema_module.named_buffers())
+            ema_params = []
+            for name, _p in model_without_ddp.named_parameters():
+                s_name = ema_module.m_name2s_name.get(name)
+                if s_name is not None and s_name in buffers:
+                    ema_params.append(buffers[s_name])
+                else:
+                    ema_params.append(_p.data)  # fallback: use raw weight
+
         if args.output_dir and (epoch % 25 == 0 or epoch + 1 == args.epochs):
             util.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch)
+                loss_scaler=loss_scaler, epoch=epoch, ema_params=ema_params, config=config)
 
         util.save_model_last(
             args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-            loss_scaler=loss_scaler, epoch=epoch)
+            loss_scaler=loss_scaler, epoch=epoch, ema_params=ema_params, config=config)
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      'epoch': epoch, }
 
