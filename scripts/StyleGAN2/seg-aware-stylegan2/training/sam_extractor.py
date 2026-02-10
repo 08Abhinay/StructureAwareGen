@@ -357,19 +357,22 @@ class SAMExtractor:
         Get NPZ cache file path for an image. O(1) path computation.
 
         If origin_map is available, translates zip names to original names
-        so the cache path matches AlignedSegDataset._get_corresponding_npz():
+        so the cache path matches precompute_sam_embeddings.py output:
           "00004/img00004572.png" -> origin_map -> "921/499656"
-          -> {cache_dir}/921/499656.npz
+          -> {cache_dir}/921/masks_npz/499656.npz
 
         Without origin_map, falls back to:
           {cache_dir}/{class_folder}/masks_npz/{image_stem}.npz
         """
         image_path = self._resolve_image_key(image_path)
 
-        # Use origin_map if available (matches AlignedSegDataset._get_corresponding_npz)
+        # Use origin_map if available (matches precompute_sam_embeddings.py layout)
         if self.origin_map and image_path in self.origin_map:
             orig_key = self.origin_map[image_path]  # e.g. "921/499656"
-            return os.path.join(self.cache_dir, f"{orig_key}.npz")
+            parts = orig_key.split("/")
+            if len(parts) == 2:
+                return os.path.join(self.cache_dir, parts[0], "masks_npz", f"{parts[1]}.npz")
+            return os.path.join(self.cache_dir, "masks_npz", f"{orig_key}.npz")
 
         # Fallback: use zip filename structure
         path_obj = Path(image_path)

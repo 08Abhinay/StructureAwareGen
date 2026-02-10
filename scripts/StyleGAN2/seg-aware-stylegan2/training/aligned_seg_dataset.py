@@ -95,6 +95,9 @@ class AlignedSegDataset(ImageFolderDataset):
         """
         if self._origin_map and image_fname in self._origin_map:
             orig_key = self._origin_map[image_fname]   # e.g. "0/980"
+            parts = orig_key.split("/")
+            if len(parts) == 2:
+                return npz_dir / parts[0] / "masks_npz" / f"{parts[1]}.npz"
             return npz_dir / f"{orig_key}.npz"
         
         # Fallback: use zip filename directly (works for non-zip or unmapped datasets)
