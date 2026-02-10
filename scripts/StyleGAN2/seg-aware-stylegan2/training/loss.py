@@ -152,6 +152,10 @@ class StyleGAN2Loss(Loss):
         Diversity loss: -log det(C + εI) on SAM segment embeddings.
         Matches the log-determinant form in theory.tex (Lemma 1).
         Penalises collapsed / low-rank covariance spectra.
+
+        Tokens are L2-normalised first so eigenvalues live in [0, 1] and
+        the log-determinant is divided by the embedding dimension C to make
+        the loss scale-invariant (otherwise it grows ∝ C ≈ 256).
         
         Args:
             seg_tokens: [B, N, 256] SAM segment embeddings
@@ -175,6 +179,9 @@ class StyleGAN2Loss(Loss):
             if valid_tokens.shape[0] < 2:
                 continue
             
+            # L2-normalise so covariance eigenvalues are bounded in [0, 1]
+            valid_tokens = F.normalize(valid_tokens, dim=1)
+            
             # Compute sample covariance matrix
             mean = valid_tokens.mean(dim=0, keepdim=True)  # [1, C]
             centered = valid_tokens - mean  # [N_valid, C]
@@ -186,7 +193,8 @@ class StyleGAN2Loss(Loss):
             # slogdet for numerical stability
             sign, logdet = torch.slogdet(cov_reg)
             if sign > 0:  # Only use if positive definite
-                losses.append(-logdet)
+                # Normalise by dimension so loss doesn't scale with C
+                losses.append(-logdet / C)
         
         return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=seg_tokens.device)
     
