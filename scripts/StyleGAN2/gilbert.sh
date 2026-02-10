@@ -44,6 +44,6 @@ cd /scratch/gilbreth/abelde/Thesis/scripts/StyleGAN2/stylegan2-ada-pytorch
 #                         --dest=/scratch/gilbreth/abelde/Thesis/scripts/StyleGAN2/stylegan2-ada-pytorch/datasets/256/lsun_unlabelled.zip \
 #                         --width=256 --height=256 --resize-filter=box  
 
-python dataset_tool.py --source=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/val2017 \
-                        --dest=/scratch/gilbreth/abelde/Thesis/scripts/StyleGAN2/stylegan2-ada-pytorch/datasets/256/EyePACS_AIROGS_labelled.zip \
+python dataset_tool.py --source=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet_debug_subset/train \
+                        --dest=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/256/imagenet.zip \
                         --width=256 --height=256 --resize-filter=box   

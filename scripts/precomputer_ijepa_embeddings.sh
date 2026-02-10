@@ -1,16 +1,16 @@
 #!/bin/bash
 #SBATCH -A pfw-cs
-#SBATCH -p a100-40gb
-#SBATCH -q standby
-#SBATCH --job-name=SAM_emb_extract
-#SBATCH --nodes=2
-#SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=2
-#SBATCH --cpus-per-task=32
+#SBATCH -p training
+#SBATCH -q training
+#SBATCH --job-name=Fetch_emb
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=64
 #SBATCH --mem-per-gpu=80G
-#SBATCH --time=04:00:00
-#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/sam_embeddings-a100.out
-#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/sam_embeddings-a100.err
+#SBATCH --time=24:00:00
+#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/ijepa_embeddings.out
+#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/ijepa_embeddings.err
 
 set -e
 set -o pipefail
@@ -20,38 +20,19 @@ conda activate /scratch/gilbreth/abelde/Thesis/StructureAwareGen/SegmentationAwa
 
 which python
 
-# Setup multi-node communication
-export MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
-export MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
-export OMP_NUM_THREADS=16
+python /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/precompute_ijepa_embeddings.py \
+     --image_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train \
+     --output_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/output_dir/ijepa_embeddings \
+     --ijepa_checkpoint /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/pretrained_enc_ckpts/ijepa/IN1K-vit.h.14-300e.pth.tar \
+     --batch_size 64 \
+     --num_workers 24
 
-echo "MASTER_ADDR: $MASTER_ADDR"
-echo "MASTER_PORT: $MASTER_PORT"
-echo "SLURM_NODELIST: $SLURM_NODELIST"
+echo "Finished!"
+# echo "Finished. Going to the next script for verifying!"
 
-# Pre-extract SAM embeddings for 40% of ImageNet (parallel across 2 nodes × 2 GPUs = 4 GPUs)
-# This cache will be shared between RDM and StyleGAN2 training
-echo "Starting SAM embedding extraction..."
-echo "Using 2 nodes with 2 GPUs each (4 GPUs total) for 40% of ImageNet"
-
-srun torchrun \
-    --nnodes=2 \
-    --nproc_per_node=2 \
-    --rdzv_id=$SLURM_JOB_ID \
-    --rdzv_backend=c10d \
-    --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
-    /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/segProto/precompute_sam_embeddings.py \
-    --image_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train \
-    --output_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/StyleGAN2/seg-aware-stylegan2/sam_cache_unified-a100 \
-    --checkpoint /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/segProto/checkpoints/sam_vit_b_01ec64.pth \
-    --subset_fraction 0.4 \
-    --seed 42 \
-    --skip_existing
-
-echo "SAM extraction finished!"
-echo "Cache ready for RDM and StyleGAN2 training."
-
-
+# python scripts/verify_data_alignment.py \
+#      --image_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train \
+#      --sam_npz_dir ... --ijepa_npz_dir ...
 
 
 
