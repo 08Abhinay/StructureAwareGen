@@ -109,6 +109,15 @@ def pre_extract_sam_embeddings(training_set, loss_kwargs, rank, num_gpus, device
             print("[Pre-extract] No image paths found in dataset, skipping")
         return
     
+    # Skip pre-extraction for zip datasets (paths contain '::') since
+    # SAM extraction can't open files inside zips directly.
+    # AlignedSegDataset already has pre-computed embeddings so this is fine.
+    if any('::' in str(p) for p in all_paths[:10]):
+        if rank == 0:
+            print("[Pre-extract] Dataset uses zip archive — skipping on-the-fly SAM pre-extraction")
+            print("              (Use pre-computed embeddings via --use-seg-embeddings instead)")
+        return
+    
     # Split images across GPUs: rank gets every num_gpus-th image
     rank_paths = all_paths[rank::num_gpus]
     

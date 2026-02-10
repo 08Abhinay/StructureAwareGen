@@ -83,6 +83,7 @@ def setup_training_loop_kwargs(
     ijepa_npz_dir = None,      # Directory with I-JEPA .npz embeddings: <path>
     max_segments = None,       # Maximum number of segments: <int>, default = 250
     use_seg_embeddings = None, # Use pre-computed segmentation embeddings: <bool>, default = False
+    origin_map_json = None,    # Path to origin_map.json (zip name → original name mapping): <path>
     
     # SAM kwargs (on-the-fly extraction with stochastic conditioning)
     sam_enabled = None,        # Enable SAM extraction: <bool>, default = False
@@ -176,6 +177,7 @@ def setup_training_loop_kwargs(
             path=data,
             sam_npz_dir=sam_npz_dir,
             ijepa_npz_dir=ijepa_npz_dir,
+            origin_map_json=origin_map_json,
             max_segments=max_segments,
             use_labels=True,
             max_size=None,
@@ -184,6 +186,7 @@ def setup_training_loop_kwargs(
         print(f'Using AlignedSegDataset with pre-computed embeddings')
         print(f'  SAM embeddings: {sam_npz_dir}')
         print(f'  I-JEPA embeddings: {ijepa_npz_dir}')
+        print(f'  Origin map: {origin_map_json}')
         print(f'  Max segments: {max_segments}')
     else:
         args.training_set_kwargs = dnnlib.EasyDict(
@@ -586,6 +589,7 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--ijepa-npz-dir', help='Directory with I-JEPA .npz embeddings', metavar='DIR', type=str)
 @click.option('--max-segments', help='Maximum number of segments', metavar='INT', type=int, default=250, show_default=True)
 @click.option('--use-seg-embeddings/--no-seg-embeddings', help='Use pre-computed segmentation embeddings', default=False, show_default=True)
+@click.option('--origin-map-json', help='Path to origin_map.json (maps zip filenames to original image stems for NPZ lookup)', metavar='PATH', type=str)
 
 # SAM on-the-fly extraction options
 @click.option('--sam-enabled', help='Enable on-the-fly SAM extraction with stochastic conditioning', type=bool, default=False, show_default=True)

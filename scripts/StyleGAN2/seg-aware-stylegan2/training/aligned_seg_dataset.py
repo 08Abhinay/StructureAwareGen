@@ -6,6 +6,7 @@ Supports both conditional and unconditional training via use_labels flag.
 """
 
 import os
+import json
 import numpy as np
 from pathlib import Path
 from .dataset import ImageFolderDataset
@@ -16,9 +17,10 @@ class AlignedSegDataset(ImageFolderDataset):
     Dataset that loads aligned triplets of (image, global_vec, seg_tokens).
     
     Args:
-        path: Path to image directory
+        path: Path to image directory/zip
         sam_npz_dir: Path to SAM embeddings directory
-        ijepa_npz_dir: Path to I-JEPA embeddings directory  
+        ijepa_npz_dir: Path to I-JEPA embeddings directory
+        origin_map_json: Path to origin_map.json (maps zip filenames → original stems)
         max_segments: Maximum number of segments (for padding)
         use_labels: If True, use class labels (conditional). If False, all labels=0 (unconditional)
         **super_kwargs: Additional arguments for ImageFolderDataset base class
@@ -29,6 +31,7 @@ class AlignedSegDataset(ImageFolderDataset):
         path,
         sam_npz_dir=None,
         ijepa_npz_dir=None,
+        origin_map_json=None,
         max_segments=250,
         use_labels=False,
         **super_kwargs
@@ -45,23 +48,58 @@ class AlignedSegDataset(ImageFolderDataset):
         self.max_segments = max_segments
         self.image_dir = Path(path)
         
+        # --- Load origin map (zip filename → original class/stem) ---
+        self._origin_map = {}
+        if origin_map_json is not None:
+            om_path = Path(origin_map_json)
+            if om_path.exists():
+                with open(om_path, 'r') as f:
+                    self._origin_map = json.load(f)
+                print(f"  Loaded origin_map with {len(self._origin_map)} entries from {om_path}")
+            else:
+                print(f"  WARNING: origin_map_json not found at {om_path}")
+                print(f"           NPZ lookup will use zip filenames directly (likely won't find files)")
+        else:
+            print(f"  INFO: No origin_map_json provided — assuming image filenames match NPZ filenames")
+        
         if not self.sam_npz_dir.exists():
             raise ValueError(f"SAM directory not found: {sam_npz_dir}")
         if not self.ijepa_npz_dir.exists():
             raise ValueError(f"I-JEPA directory not found: {ijepa_npz_dir}")
         
+        # Sanity check: verify first filename maps correctly
+        if self._origin_map and len(self._image_fnames) > 0:
+            test_fname = self._image_fnames[0]
+            if test_fname in self._origin_map:
+                orig = self._origin_map[test_fname]
+                print(f"  origin_map sanity check: '{test_fname}' -> '{orig}' OK")
+            else:
+                print(f"  WARNING: first image '{test_fname}' NOT in origin_map — check mapping!")
+        
         print(f"AlignedSegDataset initialized:")
         print(f"  Images: {path}")
         print(f"  SAM embeddings: {sam_npz_dir}")
         print(f"  I-JEPA embeddings: {ijepa_npz_dir}")
+        print(f"  Origin map entries: {len(self._origin_map)}")
         print(f"  Max segments: {max_segments}")
         print(f"  Use labels (conditional): {use_labels}")
     
     def _get_corresponding_npz(self, image_fname, npz_dir):
-        """Get corresponding .npz path for an image filename."""
+        """
+        Get corresponding .npz path for an image filename.
+        
+        If origin_map is loaded, translates zip names like
+          "00000/img00000005.png" -> original "0/980" -> npz_dir/0/980.npz
+        
+        Falls back to using the zip filename directly if no mapping exists.
+        """
+        if self._origin_map and image_fname in self._origin_map:
+            orig_key = self._origin_map[image_fname]   # e.g. "0/980"
+            return npz_dir / f"{orig_key}.npz"
+        
+        # Fallback: use zip filename directly (works for non-zip or unmapped datasets)
         rel_path = Path(image_fname)
-        npz_path = npz_dir / rel_path.parent / f"{rel_path.stem}.npz"
-        return npz_path
+        return npz_dir / rel_path.parent / f"{rel_path.stem}.npz"
     
     def __getitem__(self, idx):
         """
@@ -73,7 +111,13 @@ class AlignedSegDataset(ImageFolderDataset):
             - seg_pad_mask: [max_segments] boolean mask (True = padding)
             - num_segments: scalar, actual number of segments
         """
-        image, label = super().__getitem__(idx)
+        # Parent returns dict (with 'image', 'label', 'paths') or tuple
+        result = super().__getitem__(idx)
+        if isinstance(result, dict):
+            image = result['image']
+            label = result['label']
+        else:
+            image, label = result
         
         fname = self._image_fnames[self._raw_idx[idx]]
         
@@ -82,10 +126,12 @@ class AlignedSegDataset(ImageFolderDataset):
             ijepa_data = np.load(ijepa_path)
             global_vec = ijepa_data['emb'].astype(np.float32)
             
+            if global_vec.ndim > 1:
+                global_vec = global_vec.squeeze()
             assert global_vec.shape == (256,), f"I-JEPA embedding shape mismatch: {global_vec.shape}"
             
         except FileNotFoundError:
-            print(f"Warning: I-JEPA embedding not found for {fname}, using zeros")
+            print(f"Warning: I-JEPA embedding not found for {fname} (tried {ijepa_path}), using zeros")
             global_vec = np.zeros(256, dtype=np.float32)
         except Exception as e:
             print(f"Error loading I-JEPA for {fname}: {e}, using zeros")
@@ -93,6 +139,11 @@ class AlignedSegDataset(ImageFolderDataset):
         
         try:
             sam_path = self._get_corresponding_npz(fname, self.sam_npz_dir)
+            # SAM precompute may store under {class}/masks_npz/{stem}.npz
+            if not sam_path.exists():
+                alt_path = sam_path.parent / "masks_npz" / sam_path.name
+                if alt_path.exists():
+                    sam_path = alt_path
             sam_data = np.load(sam_path)
             seg_tokens = sam_data['emb'].astype(np.float32)
             
@@ -117,7 +168,7 @@ class AlignedSegDataset(ImageFolderDataset):
                 ])
             
         except FileNotFoundError:
-            print(f"Warning: SAM embedding not found for {fname}, using zeros")
+            print(f"Warning: SAM embedding not found for {fname} (tried {sam_path}), using zeros")
             seg_tokens = np.zeros((self.max_segments, 256), dtype=np.float32)
             seg_pad_mask = np.ones(self.max_segments, dtype=np.bool_)
             num_segments = 0
