@@ -106,7 +106,7 @@ class AlignedSegDataset(ImageFolderDataset):
         Returns dict with:
             - image: [C, H, W] image tensor
             - label: [num_classes] one-hot label (or zeros if unconditional)
-            - global_vec: [256] I-JEPA global vector
+            - global_vec: [1280] I-JEPA global vector (ViT-H/14)
             - seg_tokens: [max_segments, 256] SAM segment tokens (padded)
             - seg_pad_mask: [max_segments] boolean mask (True = padding)
             - num_segments: scalar, actual number of segments
@@ -128,14 +128,14 @@ class AlignedSegDataset(ImageFolderDataset):
             
             if global_vec.ndim > 1:
                 global_vec = global_vec.squeeze()
-            assert global_vec.shape == (256,), f"I-JEPA embedding shape mismatch: {global_vec.shape}"
+            assert global_vec.shape == (1280,), f"I-JEPA embedding shape mismatch: {global_vec.shape}"
             
         except FileNotFoundError:
             print(f"Warning: I-JEPA embedding not found for {fname} (tried {ijepa_path}), using zeros")
-            global_vec = np.zeros(256, dtype=np.float32)
+            global_vec = np.zeros(1280, dtype=np.float32)
         except Exception as e:
             print(f"Error loading I-JEPA for {fname}: {e}, using zeros")
-            global_vec = np.zeros(256, dtype=np.float32)
+            global_vec = np.zeros(1280, dtype=np.float32)
         
         try:
             sam_path = self._get_corresponding_npz(fname, self.sam_npz_dir)
