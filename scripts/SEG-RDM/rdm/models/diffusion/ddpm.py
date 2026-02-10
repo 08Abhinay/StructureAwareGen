@@ -961,44 +961,52 @@ class UnifiedSegRDM(RDM):
         """
         Diversity loss: -log det(C + εI) encourages diverse segment embeddings.
         Prevents collapse where all masks encode the same information.
-        
+
+        Tokens are L2-normalised first so eigenvalues live in [0, 1] and
+        the log-determinant is divided by the embedding dimension C to make
+        the loss scale-invariant (otherwise it grows ∝ C ≈ 256).
+
         Args:
             seg_tokens: [B, N_seg, C] segment embeddings (excluding global token)
             padding_mask: [B, N_seg+1] boolean mask (True = padded), includes global
             eps: Small constant for numerical stability
-            
+
         Returns:
             Scalar diversity loss (higher = more collapsed)
         """
         import torch.nn.functional as F
-        
+
         B, N, C = seg_tokens.shape
-        
+
         # Remove padding
         if padding_mask is not None:
             mask = ~padding_mask[:, 1:]  # Exclude global token position
         else:
             mask = torch.ones(B, N, dtype=torch.bool, device=seg_tokens.device)
-        
+
         losses = []
         for i in range(B):
             valid_tokens = seg_tokens[i, mask[i]]  # [N_valid, C]
             if valid_tokens.shape[0] < 2:
                 continue  # Need at least 2 tokens for covariance
-            
+
+            # L2-normalise so covariance eigenvalues are bounded in [0, 1]
+            valid_tokens = F.normalize(valid_tokens, dim=1)
+
             # Compute covariance matrix
             mean = valid_tokens.mean(dim=0, keepdim=True)  # [1, C]
             centered = valid_tokens - mean  # [N_valid, C]
             cov = (centered.T @ centered) / valid_tokens.shape[0]  # [C, C]
-            
+
             # Regularize and compute log determinant
             cov_reg = cov + eps * torch.eye(C, device=cov.device)
-            
+
             # Use slogdet for numerical stability
             sign, logdet = torch.slogdet(cov_reg)
             if sign > 0:  # Only use if positive definite
-                losses.append(-logdet)
-        
+                # Normalise by dimension so loss doesn't scale with C
+                losses.append(-logdet / C)
+
         return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=seg_tokens.device)
     
     def compute_alignment_loss(self, global_vec, seg_tokens, padding_mask=None, tau=0.07):
