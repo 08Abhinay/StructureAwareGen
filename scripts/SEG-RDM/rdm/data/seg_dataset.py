@@ -224,6 +224,11 @@ class SegmentationMaskDataset(Dataset):
                 # Get embeddings (already 256-dim from SAM)
                 if 'emb' in data and data['emb'] is not None:
                     embs = data['emb']  # [N, 256] float16
+                    
+                    # Check for object dtype (corrupt npz files)
+                    if embs.dtype == np.object_:
+                        raise ValueError(f"npz file has object dtype, likely corrupt")
+                    
                     embs = torch.from_numpy(embs).float()  # Convert to float32
                 else:
                     # Fallback if embeddings not in file
