@@ -237,6 +237,7 @@ class SAMExtractor:
         max_masks: int = 250,
         rank: Optional[int] = None,
         world_size: Optional[int] = None,
+        origin_map: Optional[Dict[str, str]] = None,
         # AMG parameters (matching precompute_sam_embeddings.py defaults)
         points_per_side: int = 32,
         pred_iou_thresh: float = 0.82,
@@ -257,6 +258,7 @@ class SAMExtractor:
             max_masks: Maximum number of mask embeddings to keep per image
             rank: Process rank for distributed training (None = auto-detect)
             world_size: Total number of processes (None = auto-detect)
+            origin_map: Dict mapping zip filenames to original names (e.g. "00004/img00004572.png" -> "921/499656")
             points_per_side: AMG points per side for mask generation
             pred_iou_thresh: AMG predicted IoU threshold
             stability_score_thresh: AMG stability score threshold
@@ -280,9 +282,16 @@ class SAMExtractor:
         self.dedup_iou_thresh = dedup_iou_thresh
         self.min_mask_region_area = min_mask_region_area
 
+        # Origin map for translating zip names to original names
+        # so cache paths match AlignedSegDataset._get_corresponding_npz()
+        self.origin_map = origin_map or {}
+
         # Distributed training support
         self.rank = rank if rank is not None else get_rank()
         self.world_size = world_size if world_size is not None else get_world_size()
+
+        if self.origin_map and self.rank == 0:
+            print(f"[SAMExtractor] origin_map loaded with {len(self.origin_map)} entries")
 
         # Lazy initialization - SAM not loaded until needed
         self.sam = None
@@ -337,18 +346,32 @@ class SAMExtractor:
     # Cache path helpers (O(1) lookup)
     # ------------------------------------------------------------------
 
+    def _resolve_image_key(self, image_path: str) -> str:
+        """Strip zip prefix and return the bare relative path."""
+        if "::" in image_path:
+            image_path = image_path.split("::", 1)[1]
+        return image_path
+
     def _get_npz_cache_path(self, image_path: str) -> str:
         """
         Get NPZ cache file path for an image. O(1) path computation.
 
-        Cache structure: {cache_dir}/{class_folder}/masks_npz/{image_stem}.npz
-        Example: /sam_cache_unified/00003/masks_npz/img00003170.npz
+        If origin_map is available, translates zip names to original names
+        so the cache path matches AlignedSegDataset._get_corresponding_npz():
+          "00004/img00004572.png" -> origin_map -> "921/499656"
+          -> {cache_dir}/921/499656.npz
 
-        Matches AlignedSegDataset fallback lookup exactly.
+        Without origin_map, falls back to:
+          {cache_dir}/{class_folder}/masks_npz/{image_stem}.npz
         """
-        # Strip zip prefix if present  (e.g. "imagenet.zip::00003/img.png" → "00003/img.png")
-        if "::" in image_path:
-            image_path = image_path.split("::", 1)[1]
+        image_path = self._resolve_image_key(image_path)
+
+        # Use origin_map if available (matches AlignedSegDataset._get_corresponding_npz)
+        if self.origin_map and image_path in self.origin_map:
+            orig_key = self.origin_map[image_path]  # e.g. "921/499656"
+            return os.path.join(self.cache_dir, f"{orig_key}.npz")
+
+        # Fallback: use zip filename structure
         path_obj = Path(image_path)
         class_folder = path_obj.parent.name      # e.g. "00003"
         image_stem = path_obj.stem                # e.g. "img00003170"
@@ -358,12 +381,19 @@ class SAMExtractor:
         """
         Get metadata JSON cache file path for an image. O(1) path computation.
 
-        Meta structure: {cache_dir}/{class_folder}/meta/{image_stem}.json
-        Example: /sam_cache_unified/00003/meta/img00003170.json
+        Uses origin_map if available to stay consistent with _get_npz_cache_path.
         """
-        # Strip zip prefix if present
-        if "::" in image_path:
-            image_path = image_path.split("::", 1)[1]
+        image_path = self._resolve_image_key(image_path)
+
+        # Use origin_map if available
+        if self.origin_map and image_path in self.origin_map:
+            orig_key = self.origin_map[image_path]  # e.g. "921/499656"
+            parts = orig_key.split("/")
+            if len(parts) == 2:
+                return os.path.join(self.cache_dir, parts[0], "meta", f"{parts[1]}.json")
+            return os.path.join(self.cache_dir, "meta", f"{orig_key.replace('/', '_')}.json")
+
+        # Fallback
         path_obj = Path(image_path)
         class_folder = path_obj.parent.name
         image_stem = path_obj.stem

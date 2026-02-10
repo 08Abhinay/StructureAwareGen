@@ -43,6 +43,7 @@ class StyleGAN2Loss(Loss):
                  sam_min_mask_region_area=100,
                  lambda_seg_align=0.1, lambda_seg_diversity=0.05,
                  seg_align_tau=0.07,
+                 origin_map=None,
                  rank=0, num_gpus=1):
         super().__init__()
         self.device = device
@@ -88,6 +89,7 @@ class StyleGAN2Loss(Loss):
                 max_masks=sam_max_masks,
                 rank=rank,
                 world_size=num_gpus,
+                origin_map=origin_map,
                 # AMG parameters
                 points_per_side=sam_points_per_side,
                 pred_iou_thresh=sam_pred_iou_thresh,

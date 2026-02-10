@@ -375,6 +375,17 @@ def training_loop(
     rdm_mix_prob = loss_kwargs.pop('rdm_mix_prob', 0.0)
     rdm_warmup_kimg = loss_kwargs.pop('rdm_warmup_kimg', 10000)
 
+    # Load origin_map for SAMExtractor cache path alignment with AlignedSegDataset
+    _origin_map_json_path = loss_kwargs.pop('origin_map_json', None)
+    _origin_map = None
+    if _origin_map_json_path is not None:
+        import json as _json
+        with open(_origin_map_json_path, 'r') as f:
+            _origin_map = _json.load(f)
+        if rank == 0:
+            print(f'[training_loop] Loaded origin_map ({len(_origin_map)} entries) for SAMExtractor')
+    loss_kwargs['origin_map'] = _origin_map
+
     if rank == 0:
         print('Setting up training phases...')
     loss = dnnlib.util.construct_class_by_name(device=device, **ddp_modules, **loss_kwargs) # subclass of training.loss.Loss

@@ -311,6 +311,8 @@ def setup_training_loop_kwargs(
         seg_align_tau=seg_align_tau if seg_align_tau is not None else 0.07,
         lambda_seg_align=lambda_seg_align if lambda_seg_align is not None else 0.1,
         lambda_seg_diversity=lambda_seg_diversity if lambda_seg_diversity is not None else 0.05,
+        # Origin map for SAMExtractor cache path alignment with AlignedSegDataset
+        origin_map_json=origin_map_json,
         # RDM mixed training (read by training_loop.py, not the Loss class)
         rdm_checkpoint=rdm_checkpoint,
         rdm_mix_prob=rdm_mix_prob if rdm_mix_prob is not None else 0.0,
