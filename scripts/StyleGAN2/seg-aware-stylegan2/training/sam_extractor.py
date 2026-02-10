@@ -341,27 +341,33 @@ class SAMExtractor:
         """
         Get NPZ cache file path for an image. O(1) path computation.
 
-        Cache structure: {cache_dir}/masks_npz/{class_folder}/{image_stem}.npz
-        Example: /sam_cache_unified/masks_npz/n01440764/n01440764_10026.npz
+        Cache structure: {cache_dir}/{class_folder}/masks_npz/{image_stem}.npz
+        Example: /sam_cache_unified/00003/masks_npz/img00003170.npz
 
-        Matches precompute_sam_embeddings.py output structure exactly.
+        Matches AlignedSegDataset fallback lookup exactly.
         """
+        # Strip zip prefix if present  (e.g. "imagenet.zip::00003/img.png" → "00003/img.png")
+        if "::" in image_path:
+            image_path = image_path.split("::", 1)[1]
         path_obj = Path(image_path)
-        class_folder = path_obj.parent.name      # e.g. "n01440764"
-        image_stem = path_obj.stem                # e.g. "n01440764_10026"
-        return os.path.join(self.cache_dir, "masks_npz", class_folder, f"{image_stem}.npz")
+        class_folder = path_obj.parent.name      # e.g. "00003"
+        image_stem = path_obj.stem                # e.g. "img00003170"
+        return os.path.join(self.cache_dir, class_folder, "masks_npz", f"{image_stem}.npz")
 
     def _get_meta_cache_path(self, image_path: str) -> str:
         """
         Get metadata JSON cache file path for an image. O(1) path computation.
 
-        Meta structure: {cache_dir}/meta/{class_folder}/{image_stem}.json
-        Example: /sam_cache_unified/meta/n01440764/n01440764_10026.json
+        Meta structure: {cache_dir}/{class_folder}/meta/{image_stem}.json
+        Example: /sam_cache_unified/00003/meta/img00003170.json
         """
+        # Strip zip prefix if present
+        if "::" in image_path:
+            image_path = image_path.split("::", 1)[1]
         path_obj = Path(image_path)
         class_folder = path_obj.parent.name
         image_stem = path_obj.stem
-        return os.path.join(self.cache_dir, "meta", class_folder, f"{image_stem}.json")
+        return os.path.join(self.cache_dir, class_folder, "meta", f"{image_stem}.json")
 
     # ------------------------------------------------------------------
     # Cache validation (all 5 keys)
