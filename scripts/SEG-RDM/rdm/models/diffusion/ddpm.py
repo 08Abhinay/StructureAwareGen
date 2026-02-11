@@ -948,6 +948,16 @@ class UnifiedSegRDM(RDM):
         print(f"UnifiedSegRDM: max_segments={max_segments}, seg_npz_dir={seg_npz_dir}")
         print(f"  Diversity loss weight: {lambda_diversity}")
         print(f"  Alignment loss weight: {lambda_alignment}")
+
+        # Learnable projection for alignment loss — maps both global (I-JEPA)
+        # and segment (SAM) tokens into a shared 128-dim space before InfoNCE.
+        align_proj_dim = 128
+        self.seg_align_proj = nn.Sequential(
+            nn.Linear(self.channels, self.channels),
+            nn.GELU(),
+            nn.Linear(self.channels, align_proj_dim),
+        )
+        print(f"  Alignment projection: {self.channels} -> {align_proj_dim}")
         
     def _to_diffusion_format(self, tokens: torch.Tensor) -> torch.Tensor:
         """Convert [B, N, C] to [B, C, 1, N] for DDPM compatibility."""
@@ -1012,11 +1022,11 @@ class UnifiedSegRDM(RDM):
     def compute_alignment_loss(self, global_vec, seg_tokens, padding_mask=None, tau=0.07):
         """
         Alignment loss: Encourages global and segment embeddings to be semantically aligned.
-        Uses InfoNCE-style contrastive loss.
+        Uses InfoNCE-style contrastive loss with a learned projection MLP.
         
         Args:
-            global_vec: [B, C] global I-JEPA embeddings
-            seg_tokens: [B, N_seg, C] segment SAM embeddings
+            global_vec: [B, C] global I-JEPA embeddings (reconstructed)
+            seg_tokens: [B, N_seg, C] segment SAM embeddings (reconstructed)
             padding_mask: [B, N_seg+1] boolean mask (True = padded)
             tau: Temperature for contrastive loss
             
@@ -1027,11 +1037,15 @@ class UnifiedSegRDM(RDM):
         
         B, N, C = seg_tokens.shape
         
-        # L2 normalize
-        global_norm = F.normalize(global_vec, dim=1)  # [B, C]
-        seg_norm = F.normalize(seg_tokens, dim=2)  # [B, N, C]
+        # Project both streams into shared alignment space via learned MLP
+        global_proj = self.seg_align_proj(global_vec)                            # [B, proj_dim]
+        seg_proj = self.seg_align_proj(seg_tokens.reshape(B * N, C)).reshape(B, N, -1)  # [B, N, proj_dim]
         
-        # Compute similarities: global[i] with all segments
+        # L2 normalize in projected space
+        global_norm = F.normalize(global_proj, dim=1)   # [B, proj_dim]
+        seg_norm = F.normalize(seg_proj, dim=2)          # [B, N, proj_dim]
+        
+        # Compute similarities: global[i] with all segments (temperature-scaled)
         sim = torch.einsum('bc,bnc->bn', global_norm, seg_norm) / tau  # [B, N]
         
         # Apply padding mask
@@ -1046,25 +1060,29 @@ class UnifiedSegRDM(RDM):
         else:
             pos_sim = sim.mean(dim=1)  # [B]
         
-        # Negative: cross-image similarities (in-batch negatives)
-        # For each sample, compute mean similarity with other samples' segments
-        neg_sims = []
-        for i in range(B):
-            neg_indices = [j for j in range(B) if j != i]
-            if neg_indices:
-                if padding_mask is not None:
-                    mask_neg = ~padding_mask[neg_indices, 1:]  # [B-1, N]
-                    sim_neg = torch.einsum('c,bnc->bn', global_norm[i], seg_norm[neg_indices])  # [B-1, N]
-                    sim_neg = (sim_neg * mask_neg.float()).sum(dim=1) / mask_neg.float().sum(dim=1).clamp(min=1)
-                    neg_sims.append(sim_neg.mean())
-                else:
-                    sim_neg = torch.einsum('c,bnc->bn', global_norm[i], seg_norm[neg_indices]).mean()
-                    neg_sims.append(sim_neg)
+        # Negative: cross-image similarities (vectorized, temperature-scaled)
+        # Build full cross-similarity matrix: [B, B, N]
+        cross_sim = torch.einsum('id,jnd->ijn', global_norm, seg_norm) / tau  # [B, B, N]
         
-        if not neg_sims:
+        if padding_mask is not None:
+            seg_mask = ~padding_mask[:, 1:]  # [B, N]
+            # Expand mask for cross-sim: mask out padded segments of each target image
+            cross_sim = cross_sim.masked_fill(~seg_mask.unsqueeze(0), -1e9)  # broadcast [1,B,N]
+            mask_float_cross = seg_mask.unsqueeze(0).float()  # [1, B, N]
+            # Mean over valid segments per target image
+            cross_mean = (cross_sim * mask_float_cross).sum(dim=2) / mask_float_cross.sum(dim=2).clamp(min=1)  # [B, B]
+        else:
+            cross_mean = cross_sim.mean(dim=2)  # [B, B]
+        
+        # Exclude self from negatives: set diagonal to -inf, then mean over others
+        diag_mask = torch.eye(B, dtype=torch.bool, device=global_vec.device)
+        cross_mean = cross_mean.masked_fill(diag_mask, -1e9)
+        
+        if B <= 1:
             return torch.tensor(0.0, device=global_vec.device)
         
-        neg_sim = torch.stack(neg_sims)  # [B]
+        # Mean negative sim per sample (over B-1 other images)
+        neg_sim = cross_mean.masked_fill(diag_mask, 0.0).sum(dim=1) / (B - 1)
         
         # InfoNCE loss: -log(exp(pos) / (exp(pos) + exp(neg)))
         loss = -torch.log(
@@ -1152,6 +1170,17 @@ class UnifiedSegRDM(RDM):
         if 'seg_embs' in batch:
             seg_tokens = batch['seg_embs'].to(device)  # [B, max_segments, 256]
             num_segments = batch['num_segments']  # [B] actual segment counts
+            
+            # Z-score normalize SAM tokens to match global token distribution.
+            # Only normalize valid (non-padded) segments per sample.
+            B_seg, max_seg_local, C_seg = seg_tokens.shape
+            for i in range(B_seg):
+                n = int(num_segments[i])
+                if n > 0:
+                    valid = seg_tokens[i, :n, :]  # [n, C]
+                    seg_std = torch.std(valid, dim=1, keepdim=True).clamp(min=1e-6)  # [n, 1]
+                    seg_mean = torch.mean(valid, dim=1, keepdim=True)                # [n, 1]
+                    seg_tokens[i, :n, :] = (valid - seg_mean) / seg_std * self.input_scale
         else:
             raise ValueError("Batch must contain 'seg_embs' and 'num_segments' from SAM")
             

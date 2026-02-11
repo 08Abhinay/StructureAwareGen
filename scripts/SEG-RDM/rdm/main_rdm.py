@@ -295,6 +295,10 @@ def main(args):
     params = list(model_without_ddp.model.parameters())
     if model_without_ddp.cond_stage_model is not None:
         params += list(model_without_ddp.cond_stage_model.parameters())
+    # Include alignment projection MLP in optimizer (lives on UnifiedSegRDM, not self.model)
+    if hasattr(model_without_ddp, 'seg_align_proj'):
+        params += list(model_without_ddp.seg_align_proj.parameters())
+        print(f"  Added seg_align_proj to optimizer ({sum(p.numel() for p in model_without_ddp.seg_align_proj.parameters())} params)")
     n_params = sum(p.numel() for p in model_without_ddp.parameters() if p.requires_grad)
     print("Number of trainable parameters: {}M".format(n_params / 1e6))
     if global_rank == 0:

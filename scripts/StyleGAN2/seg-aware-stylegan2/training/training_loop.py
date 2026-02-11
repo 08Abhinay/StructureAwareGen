@@ -426,6 +426,23 @@ def training_loop(
                 print('[RDM] Continuing without RDM mixed training')
             rdm_sampler = None
     
+    # Learnable projection: RDM outputs 256-dim global_vec, but G/D expect 1280-dim (raw I-JEPA).
+    # This small network is trained end-to-end with G and D during RDM-mixed batches.
+    rdm_global_proj = None
+    rdm_proj_opt = None
+    if rdm_sampler is not None:
+        ijepa_dim = loss_kwargs.get('ijepa_out_dim', 1280)
+        rdm_global_proj = torch.nn.Sequential(
+            torch.nn.Linear(256, 512),
+            torch.nn.LeakyReLU(0.2),
+            torch.nn.Linear(512, ijepa_dim),
+        ).to(device).train()
+        # Give the projection its own optimizer (same LR as G)
+        rdm_proj_opt = torch.optim.Adam(rdm_global_proj.parameters(), lr=G_opt_kwargs.get('lr', 0.0025), betas=[0.0, 0.99])
+        if rank == 0:
+            n_proj = sum(p.numel() for p in rdm_global_proj.parameters())
+            print(f'[RDM] Initialized rdm_global_proj (256 -> {ijepa_dim}): {n_proj} params')
+    
     phases = []
     for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
         if reg_interval is None:
@@ -542,7 +559,12 @@ def training_loop(
                         # Replace BOTH global_vec and seg_tokens with RDM samples
                         # Note: We keep real images but use synthetic embeddings for conditioning
                         # This teaches the decoder to handle RDM-sampled embeddings
-                        phase_real_global_vec = rdm_batch['global_vec'].to(device).split(batch_gpu)
+                        
+                        # Project RDM 256-dim global_vec -> 1280-dim to match G/D expectations
+                        rdm_gv = rdm_batch['global_vec'].to(device)  # [B, 256]
+                        if rdm_global_proj is not None:
+                            rdm_gv = rdm_global_proj(rdm_gv)  # [B, 1280]
+                        phase_real_global_vec = rdm_gv.split(batch_gpu)
                         phase_real_seg_tokens = rdm_batch['seg_tokens'].to(device).split(batch_gpu)
                         
                         # Create padding masks (RDM generates fixed length, no padding)
@@ -615,6 +637,10 @@ def training_loop(
                     if param.grad is not None:
                         misc.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
                 phase.opt.step()
+                # Step the RDM projection optimizer alongside G phases
+                if rdm_proj_opt is not None and phase.name.startswith('G'):
+                    rdm_proj_opt.step()
+                    rdm_proj_opt.zero_grad()
             if phase.end_event is not None:
                 phase.end_event.record(torch.cuda.current_stream(device))
 

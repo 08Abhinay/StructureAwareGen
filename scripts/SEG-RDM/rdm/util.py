@@ -546,7 +546,11 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
         if os.path.exists(last_path):
             resume_path = last_path
     checkpoint = torch.load(resume_path, map_location='cpu', weights_only=False)
-    model_without_ddp.load_state_dict(checkpoint['model'])
+    missing, unexpected = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+    if missing:
+        print(f"[Resume] Missing keys (freshly initialized): {missing}")
+    if unexpected:
+        print(f"[Resume] Unexpected keys (ignored): {unexpected}")
     print("Resume checkpoint %s" % resume_path)
     if 'optimizer' in checkpoint and 'epoch' in checkpoint and not (
         hasattr(args, 'evaluate') and args.evaluate

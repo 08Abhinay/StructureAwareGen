@@ -403,9 +403,12 @@ class StyleGAN2Loss(Loss):
         training_stats.report("Loss/IJEPA_weight", lam)
 
         # ───────────────── semantic targets ─────────────────────────────────────
-        # Use pre-computed I-JEPA embedding if available, else run live encoder
+        # Use pre-computed I-JEPA embedding if available, else run live encoder.
+        # NOTE: Do NOT detach real_global_vec — for real batches it has no grad_fn
+        # (loaded from disk), but for RDM-mixed batches it flows through the
+        # learnable rdm_global_proj (256→1280) and needs gradient.
         if real_global_vec is not None:
-            target_f = real_global_vec.detach()                   # (B, ijepa_out_dim)
+            target_f = real_global_vec                            # (B, ijepa_out_dim)
         else:
             target_f = self._feat(real_img).detach()              # (B, ijepa_out_dim)
         batch_size_pl   = gen_z.shape[0] // self.pl_batch_shrink
