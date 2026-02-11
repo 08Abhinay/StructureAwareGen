@@ -545,7 +545,7 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
         last_path = os.path.join(args.resume, "checkpoint-last.pth")
         if os.path.exists(last_path):
             resume_path = last_path
-    checkpoint = torch.load(resume_path, map_location='cpu')
+    checkpoint = torch.load(resume_path, map_location='cpu', weights_only=False)
     model_without_ddp.load_state_dict(checkpoint['model'])
     print("Resume checkpoint %s" % resume_path)
     if 'optimizer' in checkpoint and 'epoch' in checkpoint and not (

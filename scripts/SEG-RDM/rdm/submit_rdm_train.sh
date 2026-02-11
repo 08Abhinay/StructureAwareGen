@@ -1,40 +1,59 @@
 #!/bin/bash
 #SBATCH -A pfw-cs
-#SBATCH -p a30
-#SBATCH -q standby
-#SBATCH --job-name=rdm_ijepa_h14_2g
-#SBATCH --nodes=
-#SBATCH --ntasks=1
-#SBATCH --gpus-per-node=2
-#SBATCH --cpus-per-task=10
+#SBATCH -p training
+#SBATCH -q training
+#SBATCH --job-name=ijepa_and_seg_aware
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=4
+#SBATCH --cpus-per-task=32
 #SBATCH --mem-per-gpu=80G
-#SBATCH --time=04:00:00
-#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/rdm_ijepa_h14.out
-#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/rdm_ijepa_h14.err
-
-set -e
-set -o pipefail
+#SBATCH --time=24:00:00
+#SBATCH --constraint=J
+#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/ijepa_and_seg_aware-batch_128/.out
+#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/ijepa_and_seg_aware-batch_128/.err
 
 module load anaconda
-source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate /scratch/gilbreth/abelde/Thesis/StructureAwareGen/SegmentationAwareGen
 
-which python
+export OMP_NUM_THREADS=$((SLURM_CPUS_PER_TASK / 2))
 
 cd /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM
 export PYTHONPATH="$PWD:$PYTHONPATH"
-export PATH="/scratch/gilbreth/abelde/Thesis/StructureAwareGen/SegmentationAwareGen/bin:$PATH"
 
-mkdir -p /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/ijepa_h14
+mkdir -p /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES
+mkdir -p /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out_final/2_nodes/batch_128/ijepa_and_seg_aware
 
-srun torchrun --standalone --nproc_per_node=2 -m rdm.main_rdm \
-  --config /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/configs/rdm_default.yaml \
-  --input_size 256 \
-  --blr 1e-6 \
-  --weight_decay 0.01 \
-  --epochs 200 \
-  --batch_size 16 \
-  --accum_iter 1 \
-  --output_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/ijepa_h14 \
-  --log_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/ijepa_h14 \
-  --data_path /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf
+MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
+MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
+
+RESUME_ARG=""
+if ls /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out_final/2_nodes/batch_128/ijepa_and_seg_aware/checkpoint-*.pth 1> /dev/null 2>&1; then
+  LAST_CKPT=$(ls -t /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out_final/2_nodes/batch_128/ijepa_and_seg_aware/checkpoint-*.pth | head -n 1)
+  RESUME_ARG="--resume $LAST_CKPT"
+fi
+
+# One torchrun per node (srun launches 4 tasks total, 1 per node)
+srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
+  torchrun \
+    --nnodes=$SLURM_NNODES \
+    --nproc_per_node=2 \
+    --node_rank=$SLURM_PROCID \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+    --rdzv_id=$SLURM_JOB_ID \
+    -m rdm.main_rdm \
+      --config /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/configs/unified_seg_rdm.yaml \
+      --input_size 256 \
+      --blr 1e-6 \
+      --weight_decay 0.01 \
+      --epochs 200 \
+      --batch_size 64 \
+      --accum_iter 1 \
+      --output_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out_final/2_nodes/batch_128/ijepa_and_seg_aware \
+      --log_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm \
+      --data_path /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf \
+      --use_seg_dataset \
+      --mask_npz_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/sam_cache_unified/ \
+      --ijepa_cache_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/ijepa_embeddings \
+      --max_segments 250 \

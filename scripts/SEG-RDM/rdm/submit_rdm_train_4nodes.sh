@@ -3,7 +3,7 @@
 #SBATCH -p a30
 #SBATCH -q standby
 #SBATCH --job-name=ijepa_and_seg_aware
-#SBATCH --nodes=2
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=2
 #SBATCH --cpus-per-task=10
@@ -21,14 +21,14 @@ cd /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM
 export PYTHONPATH="$PWD:$PYTHONPATH"
 
 mkdir -p /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES
-mkdir -p /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_16/ijepa_and_seg_aware
+mkdir -p /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out_final/4_nodes/batch_64/ijepa_and_seg_aware
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
 MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
 
 RESUME_ARG=""
-if ls /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_16/ijepa_and_seg_aware/checkpoint-*.pth 1> /dev/null 2>&1; then
-  LAST_CKPT=$(ls -t /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_16/ijepa_and_seg_aware/checkpoint-*.pth | head -n 1)
+if ls /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out_final/4_nodes/batch_64/ijepa_and_seg_aware/checkpoint-*.pth 1> /dev/null 2>&1; then
+  LAST_CKPT=$(ls -t /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out_final/4_nodes/batch_64/ijepa_and_seg_aware/checkpoint-*.pth | head -n 1)
   RESUME_ARG="--resume $LAST_CKPT"
 fi
 
@@ -48,11 +48,12 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
       --weight_decay 0.01 \
       --epochs 200 \
       --batch_size 16 \
-      --accum_iter 1 \
-      --output_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out/4_nodes/batch_16/ijepa_and_seg_aware \
+      --accum_iter 4 \
+      --output_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/rdm_out_final/4_nodes/batch_64/ijepa_and_seg_aware \
       --log_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm \
       --data_path /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf \
       --use_seg_dataset \
       --mask_npz_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/sam_cache_unified/ \
-      --ijepa_cache_dir rdm/output_dir/ijepa_embeddings \
+      --ijepa_cache_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/ijepa_embeddings \
       --max_segments 250 \
+      $RESUME_ARG
