@@ -331,12 +331,14 @@ def training_loop(
     G_ema = copy.deepcopy(G).eval()
 
     # Resume from existing pickle.
+    _resume_rdm_proj_state = None  # Will be used later to restore rdm_global_proj
     if (resume_pkl is not None) and (rank == 0):
         print(f'Resuming from "{resume_pkl}"')
         with dnnlib.util.open_url(resume_pkl) as f:
             resume_data = legacy.load_network_pkl(f)
         for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
             misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
+        _resume_rdm_proj_state = resume_data.get('rdm_global_proj', None)
 
     # Print network summary tables.
     if rank == 0:
@@ -431,7 +433,7 @@ def training_loop(
     rdm_global_proj = None
     rdm_proj_opt = None
     if rdm_sampler is not None:
-        ijepa_dim = loss_kwargs.get('ijepa_out_dim', 1280)
+        ijepa_dim = getattr(loss, 'ijepa_out_dim', 1280)
         rdm_global_proj = torch.nn.Sequential(
             torch.nn.Linear(256, 512),
             torch.nn.LeakyReLU(0.2),
@@ -442,6 +444,15 @@ def training_loop(
         if rank == 0:
             n_proj = sum(p.numel() for p in rdm_global_proj.parameters())
             print(f'[RDM] Initialized rdm_global_proj (256 -> {ijepa_dim}): {n_proj} params')
+        # Restore from checkpoint if resuming (rank 0 only has the state)
+        if _resume_rdm_proj_state is not None:
+            rdm_global_proj.load_state_dict(_resume_rdm_proj_state)
+            if rank == 0:
+                print('[RDM] Restored rdm_global_proj weights from checkpoint')
+        # Synchronize weights across ranks (either restored or freshly initialized)
+        if num_gpus > 1:
+            for param in rdm_global_proj.parameters():
+                dist.broadcast(param.data, src=0)
     
     phases = []
     for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
@@ -546,6 +557,7 @@ def training_loop(
             
             # RDM Mixed Training: Replace real embeddings with RDM-sampled ones
             # with probability rdm_mix_prob (after warmup)
+            is_rdm_batch = False  # Track whether this batch uses RDM-projected embeddings
             if rdm_sampler is not None and has_seg_data and cur_nimg >= rdm_warmup_kimg * 1000:
                 # Compute current mix probability (gradual ramp-up)
                 progress = (cur_nimg - rdm_warmup_kimg * 1000) / (10000 * 1000)  # Ramp over 10M images
@@ -560,11 +572,12 @@ def training_loop(
                         # Note: We keep real images but use synthetic embeddings for conditioning
                         # This teaches the decoder to handle RDM-sampled embeddings
                         
-                        # Project RDM 256-dim global_vec -> 1280-dim to match G/D expectations
+                        # Store raw 256-dim RDM vectors; projection to 1280-dim is
+                        # deferred to the per-phase loop so each phase gets its own
+                        # autograd graph (prevents double-backward crash).
                         rdm_gv = rdm_batch['global_vec'].to(device)  # [B, 256]
-                        if rdm_global_proj is not None:
-                            rdm_gv = rdm_global_proj(rdm_gv)  # [B, 1280]
                         phase_real_global_vec = rdm_gv.split(batch_gpu)
+                        is_rdm_batch = True
                         phase_real_seg_tokens = rdm_batch['seg_tokens'].to(device).split(batch_gpu)
                         
                         # Create padding masks (RDM generates fixed length, no padding)
@@ -601,6 +614,10 @@ def training_loop(
                 # Extract segmentation data for this round if available
                 if has_seg_data:
                     real_global_vec = phase_real_global_vec[round_idx]
+                    # For RDM batches, project 256→1280 here so each phase
+                    # gets its own computation graph (avoids double-backward).
+                    if is_rdm_batch and rdm_global_proj is not None:
+                        real_global_vec = rdm_global_proj(real_global_vec)
                     real_seg_tokens = phase_real_seg_tokens[round_idx]
                     real_seg_pad_mask = phase_real_seg_pad_mask[round_idx]
                 else:
@@ -712,6 +729,9 @@ def training_loop(
                     module = copy.deepcopy(module).eval().requires_grad_(False).cpu()
                 snapshot_data[name] = module
                 del module # conserve memory
+            # Save rdm_global_proj state if it exists (not a DDP module, save as state_dict)
+            if rdm_global_proj is not None:
+                snapshot_data['rdm_global_proj'] = copy.deepcopy(rdm_global_proj).cpu().state_dict()
             snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
             if rank == 0:
                 with open(snapshot_pkl, 'wb') as f:

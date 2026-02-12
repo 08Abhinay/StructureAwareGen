@@ -115,7 +115,9 @@ class StyleGAN2Loss(Loss):
         print(f"[Loss] I-JEPA encoder output dim = {self.ijepa_out_dim}")
 
         # SAM -> I-JEPA projection MLP for alignment loss
-        if sam_enabled and lambda_seg_align > 0:
+        # NOTE: Decoupled from sam_enabled — alignment works with pre-computed
+        # embeddings (AlignedSegDataset) even when sam_enabled=False.
+        if lambda_seg_align > 0:
             self.sam_proj_mlp = nn.Sequential(
                 nn.Linear(256, 512),
                 nn.LeakyReLU(0.2, inplace=True),
