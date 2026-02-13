@@ -48,6 +48,7 @@ class RDMSampler:
         try:
             from rdm.models.diffusion.ddim import DDIMSampler
             from rdm.util import instantiate_from_config
+            from omegaconf import OmegaConf
         except ImportError as e:
             raise ImportError(
                 f"Failed to import SEG-RDM modules. Make sure {seg_rdm_path} exists. Error: {e}"
@@ -63,6 +64,10 @@ class RDMSampler:
                 "Checkpoint is missing the 'config' key (or config has no 'model' entry). "
                 "Re-train the RDM with the updated save_model() that embeds the YAML config."
             )
+        
+        # Convert plain dict back to OmegaConf for attribute access
+        # (checkpoint saves as plain dict via OmegaConf.to_container())
+        config = OmegaConf.create(config)
 
         # --- Instantiate model from config -----------------------------------
         # Remove pretrained_enc_config so the 630M I-JEPA encoder is NOT

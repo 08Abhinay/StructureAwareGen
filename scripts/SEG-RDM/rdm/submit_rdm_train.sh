@@ -37,7 +37,7 @@ fi
 srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
   torchrun \
     --nnodes=$SLURM_NNODES \
-    --nproc_per_node=2 \
+    --nproc_per_node=4 \
     --node_rank=$SLURM_PROCID \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
