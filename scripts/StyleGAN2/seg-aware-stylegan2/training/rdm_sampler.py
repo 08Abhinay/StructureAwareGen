@@ -69,46 +69,56 @@ class RDMSampler:
                 'model': {
                     'target': 'rdm.models.diffusion.ddpm.UnifiedSegRDM',
                     'params': {
+                        # UnifiedSegRDM specific params
+                        'max_segments': 250,
+                        'lambda_diversity': 0.1,
+                        'lambda_alignment': 0.05,
+                        
+                        # Diffusion parameters
                         'timesteps': 1000,
                         'beta_schedule': 'linear',
-                        'loss_type': 'l2',
-                        'ckpt_path': None,
-                        'ignore_keys': [],
-                        'load_only_unet': False,
-                        'monitor': 'val/loss',
-                        'use_ema': True,
-                        'input_key': 'unified_tokens',
-                        'log_every_t': 100,
-                        'clip_denoised': True,
-                        'linear_start': 0.00085,
-                        'linear_end': 0.0120,
-                        'cosine_s': 0.008,
-                        'given_betas': None,
-                        'original_elbo_weight': 0.0,
-                        'v_posterior': 0.0,
-                        'l_simple_weight': 1.0,
-                        'conditioning_key': None,
+                        'linear_start': 0.0001,
+                        'linear_end': 0.02,
                         'parameterization': 'x0',
-                        'scheduler_config': None,
-                        'use_positional_encodings': False,
+                        
+                        # Loss weights
+                        'loss_type': 'l2',
+                        'l_simple_weight': 1.0,
+                        'original_elbo_weight': 0.0,
                         'learn_logvar': False,
-                        'logvar_init': 0.0,
-                        'class_cond': False,
-                        # Diffusion backbone (what we actually need for sampling)
+                        
+                        # Model architecture
+                        'conditioning_key': None,
+                        'channels': 256,
+                        'image_size': 251,
+                        
+                        # EMA and checkpointing
+                        'use_ema': True,
+                        'clip_denoised': False,
+                        
+                        # Unified Transformer backbone
                         'unet_config': {
                             'target': 'rdm.modules.diffusionmodules.unified_transformer.UnifiedSegTransformer',
                             'params': {
-                                'in_channels': 256,
-                                'model_channels': 768,
-                                'num_heads': 12,
-                                'num_blocks': 8,
-                                'max_tokens': 256,
-                                'dropout': 0.0,
+                                'token_dim': 256,
+                                'd_model': 768,
+                                'n_heads': 12,
+                                'n_layers': 8,
+                                'd_ff': 3072,
+                                'dropout': 0.1,
+                                'max_seq_len': 256,
+                                'time_emb_dim': 256,
                             }
                         },
+                        
                         # Skip pretrained encoder (not needed for sampling)
                         'pretrained_enc_config': None,
                         'cond_stage_config': '__is_unconditional__',
+                        
+                        # Scaling
+                        'input_scale': 1.0,
+                        'scale_factor': 1.0,
+                        'scale_by_std': False,
                     }
                 }
             }
