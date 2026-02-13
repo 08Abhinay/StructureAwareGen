@@ -57,25 +57,76 @@ class RDMSampler:
         # Load checkpoint
         ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-        # --- Retrieve config ------------------------------------------------
+        # --- Retrieve or reconstruct config ------------------------------------------------
         config = ckpt.get('config')
-        if config is None or 'model' not in config:
-            raise RuntimeError(
-                "Checkpoint is missing the 'config' key (or config has no 'model' entry). "
-                "Re-train the RDM with the updated save_model() that embeds the YAML config."
-            )
+        
+        if config is None:
+            # Old checkpoint format without embedded config
+            # Manually construct the model config for UnifiedSegRDM
+            print("[RDM] Old checkpoint format detected (no 'config' key). Building config manually...")
+            
+            config = {
+                'model': {
+                    'target': 'rdm.models.diffusion.ddpm.UnifiedSegRDM',
+                    'params': {
+                        'timesteps': 1000,
+                        'beta_schedule': 'linear',
+                        'loss_type': 'l2',
+                        'ckpt_path': None,
+                        'ignore_keys': [],
+                        'load_only_unet': False,
+                        'monitor': 'val/loss',
+                        'use_ema': True,
+                        'input_key': 'unified_tokens',
+                        'log_every_t': 100,
+                        'clip_denoised': True,
+                        'linear_start': 0.00085,
+                        'linear_end': 0.0120,
+                        'cosine_s': 0.008,
+                        'given_betas': None,
+                        'original_elbo_weight': 0.0,
+                        'v_posterior': 0.0,
+                        'l_simple_weight': 1.0,
+                        'conditioning_key': None,
+                        'parameterization': 'x0',
+                        'scheduler_config': None,
+                        'use_positional_encodings': False,
+                        'learn_logvar': False,
+                        'logvar_init': 0.0,
+                        'class_cond': False,
+                        # Diffusion backbone (what we actually need for sampling)
+                        'unet_config': {
+                            'target': 'rdm.modules.diffusionmodules.unified_transformer.UnifiedSegTransformer',
+                            'params': {
+                                'in_channels': 256,
+                                'model_channels': 768,
+                                'num_heads': 12,
+                                'num_blocks': 8,
+                                'max_tokens': 256,
+                                'dropout': 0.0,
+                            }
+                        },
+                        # Skip pretrained encoder (not needed for sampling)
+                        'pretrained_enc_config': None,
+                        'cond_stage_config': '__is_unconditional__',
+                    }
+                }
+            }
+            print("[RDM] Using default UnifiedSegRDM architecture")
         
         # Convert plain dict back to OmegaConf for attribute access
         # (checkpoint saves as plain dict via OmegaConf.to_container())
-        config = OmegaConf.create(config)
+        if isinstance(config, dict):
+            config = OmegaConf.create(config)
 
         # --- Instantiate model from config -----------------------------------
         # Remove pretrained_enc_config so the 630M I-JEPA encoder is NOT
         # loaded at inference time (we only need the diffusion backbone).
         model_cfg = config['model']
-        if 'params' in model_cfg and 'pretrained_enc_config' in model_cfg['params']:
-            model_cfg['params']['pretrained_enc_config'] = {'params': {}}
-            print("[RDM] Skipping pretrained encoder init (not needed for sampling)")
+        if 'params' in model_cfg and 'pretrained_enc_config' in model_cfg.get('params', {}):
+            if model_cfg['params']['pretrained_enc_config'] is not None:
+                model_cfg['params']['pretrained_enc_config'] = None
+                print("[RDM] Skipping pretrained encoder init (not needed for sampling)")
 
         self.model = instantiate_from_config(model_cfg)
 
