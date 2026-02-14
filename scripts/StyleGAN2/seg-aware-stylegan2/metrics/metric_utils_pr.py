@@ -451,7 +451,7 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
                 
                 # Sample from RDM
                 rdm_batch = rdm_sampler.sample(batch_size=batch_gen, num_segments=250)
-                e_ijepa = rdm_batch['global_vectors'].to(opts.device)
+                e_ijepa = rdm_batch['global_vec'].to(opts.device)
                 seg_tokens = rdm_batch['seg_tokens'].to(opts.device)
                 seg_pad_mask = torch.zeros(batch_gen, 250, dtype=torch.bool, device=opts.device)
                 
