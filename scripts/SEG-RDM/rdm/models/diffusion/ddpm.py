@@ -929,8 +929,10 @@ class UnifiedSegRDM(RDM):
     Uses pre-computed SAM embeddings instead of computing them during training.
     """
     
-    def __init__(self, seg_npz_dir: str = None, max_segments: int = 250, 
+    def __init__(self, seg_npz_dir: str = None, max_segments: int = 250,
                  lambda_diversity: float = 0.1, lambda_alignment: float = 0.05,
+                 train_align_projection: bool = False,
+                 normalize_seg_tokens: bool = False,
                  *args, **kwargs):
         """
         Args:
@@ -938,26 +940,30 @@ class UnifiedSegRDM(RDM):
             max_segments: Maximum number of segments (for padding)
             lambda_diversity: Weight for diversity loss (default: 0.1)
             lambda_alignment: Weight for alignment loss (default: 0.05)
+            train_align_projection: Whether to train alignment projection parameters.
+            normalize_seg_tokens: Whether to z-score SAM tokens before diffusion.
         """
         super().__init__(*args, **kwargs)
         self.seg_npz_dir = seg_npz_dir
         self.max_segments = max_segments
         self.lambda_diversity = lambda_diversity
         self.lambda_alignment = lambda_alignment
+        self.train_align_projection = train_align_projection
+        self.normalize_seg_tokens = normalize_seg_tokens
         self.first_stage_key = "image"
         print(f"UnifiedSegRDM: max_segments={max_segments}, seg_npz_dir={seg_npz_dir}")
         print(f"  Diversity loss weight: {lambda_diversity}")
         print(f"  Alignment loss weight: {lambda_alignment}")
+        print(f"  Normalize SAM tokens: {normalize_seg_tokens}")
 
-        # Learnable projection for alignment loss — maps both global (I-JEPA)
-        # and segment (SAM) tokens into a shared 128-dim space before InfoNCE.
-        align_proj_dim = 128
-        self.seg_align_proj = nn.Sequential(
-            nn.Linear(self.channels, self.channels),
-            nn.GELU(),
-            nn.Linear(self.channels, align_proj_dim),
+        # Alignment projection starts as identity so frozen mode behaves like legacy alignment.
+        self.seg_align_proj = nn.Linear(self.channels, self.channels, bias=False)
+        nn.init.eye_(self.seg_align_proj.weight)
+        self.seg_align_proj.requires_grad_(train_align_projection)
+        print(
+            f"  Alignment projection: {self.channels} -> {self.channels} "
+            f"(trainable={train_align_projection})"
         )
-        print(f"  Alignment projection: {self.channels} -> {align_proj_dim}")
         
     def _to_diffusion_format(self, tokens: torch.Tensor) -> torch.Tensor:
         """Convert [B, N, C] to [B, C, 1, N] for DDPM compatibility."""
@@ -1022,7 +1028,7 @@ class UnifiedSegRDM(RDM):
     def compute_alignment_loss(self, global_vec, seg_tokens, padding_mask=None, tau=0.07):
         """
         Alignment loss: Encourages global and segment embeddings to be semantically aligned.
-        Uses InfoNCE-style contrastive loss with a learned projection MLP.
+        Uses InfoNCE-style contrastive loss with an optional linear projection.
         
         Args:
             global_vec: [B, C] global I-JEPA embeddings (reconstructed)
@@ -1037,13 +1043,13 @@ class UnifiedSegRDM(RDM):
         
         B, N, C = seg_tokens.shape
         
-        # Project both streams into shared alignment space via learned MLP
-        global_proj = self.seg_align_proj(global_vec)                            # [B, proj_dim]
-        seg_proj = self.seg_align_proj(seg_tokens.reshape(B * N, C)).reshape(B, N, -1)  # [B, N, proj_dim]
+        # Project both streams into shared alignment space.
+        global_proj = self.seg_align_proj(global_vec)  # [B, C]
+        seg_proj = self.seg_align_proj(seg_tokens.reshape(B * N, C)).reshape(B, N, C)  # [B, N, C]
         
         # L2 normalize in projected space
-        global_norm = F.normalize(global_proj, dim=1)   # [B, proj_dim]
-        seg_norm = F.normalize(seg_proj, dim=2)          # [B, N, proj_dim]
+        global_norm = F.normalize(global_proj, dim=1)  # [B, C]
+        seg_norm = F.normalize(seg_proj, dim=2)  # [B, N, C]
         
         # Compute similarities: global[i] with all segments (temperature-scaled)
         sim = torch.einsum('bc,bnc->bn', global_norm, seg_norm) / tau  # [B, N]
@@ -1171,16 +1177,17 @@ class UnifiedSegRDM(RDM):
             seg_tokens = batch['seg_embs'].to(device)  # [B, max_segments, 256]
             num_segments = batch['num_segments']  # [B] actual segment counts
             
-            # Z-score normalize SAM tokens to match global token distribution.
-            # Only normalize valid (non-padded) segments per sample.
-            B_seg, max_seg_local, C_seg = seg_tokens.shape
-            for i in range(B_seg):
-                n = int(num_segments[i])
-                if n > 0:
-                    valid = seg_tokens[i, :n, :]  # [n, C]
-                    seg_std = torch.std(valid, dim=1, keepdim=True).clamp(min=1e-6)  # [n, 1]
-                    seg_mean = torch.mean(valid, dim=1, keepdim=True)                # [n, 1]
-                    seg_tokens[i, :n, :] = (valid - seg_mean) / seg_std * self.input_scale
+            if self.normalize_seg_tokens:
+                # Optional SAM token normalization.
+                # Only normalize valid (non-padded) segments per sample.
+                B_seg, _, _ = seg_tokens.shape
+                for i in range(B_seg):
+                    n = int(num_segments[i])
+                    if n > 0:
+                        valid = seg_tokens[i, :n, :]  # [n, C]
+                        seg_std = torch.std(valid, dim=1, keepdim=True).clamp(min=1e-6)  # [n, 1]
+                        seg_mean = torch.mean(valid, dim=1, keepdim=True)  # [n, 1]
+                        seg_tokens[i, :n, :] = (valid - seg_mean) / seg_std * self.input_scale
         else:
             raise ValueError("Batch must contain 'seg_embs' and 'num_segments' from SAM")
             

@@ -6,7 +6,7 @@ model:
   params:
     # SAM parameters (embeddings loaded by dataset, not model)
     max_segments: 250  # Maximum number of segments (250 from SAM + 1 global = 251 total)
-    lambda_diversity: 0.1  # Diversity loss weight (prevents segment collapse)
+    lambda_diversity: 0.05  # Diversity loss weight (reduced to avoid over-dominating total loss)
     lambda_alignment: 0.05  # Alignment loss weight (global-segment consistency)
     
     # IJEPA cache (optional - speeds up training by using pre-extracted embeddings)

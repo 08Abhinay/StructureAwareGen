@@ -196,50 +196,45 @@ class SegmentationMaskDataset(Dataset):
                 - scores: [N] confidence scores for each segment
                 - seg_masks: [N, H, W] binary masks (optional, for visualization)
         """
-        # Load image
+        max_retries = min(5, len(self.image_paths))
+        loaded = False
+        last_error = None
         img_path = self.image_paths[idx]
-        try:
-            image = Image.open(img_path).convert("RGB")
-            image = self.transform(image)  # [3, H, W]
-        except Exception as e:
-            print(f"Error loading image {img_path}: {e}")
-            # Return a dummy black image on error
-            image = torch.zeros(3, self.image_size, self.image_size)
-        
-        # Load SAM embeddings from npz (use pre-stored path)
         name = self._get_basename(img_path)
-        npz_path = self.npz_paths[idx]  # Use stored path instead of reconstructing
-        
-        if not os.path.exists(npz_path):
-            # Handle missing npz gracefully
-            print(f"WARNING: npz not found: {npz_path}, using dummy data")
-            seg_embs = torch.zeros(self.max_segments, 256)
-            num_segments = 0
-            scores = torch.zeros(0)
-            seg_masks = None
-        else:
+
+        for retry in range(max_retries):
+            current_idx = (idx + retry) % len(self.image_paths)
+            img_path = self.image_paths[current_idx]
+            npz_path = self.npz_paths[current_idx]
+            name = self._get_basename(img_path)
             try:
+                image = Image.open(img_path).convert("RGB")
+                image = self.transform(image)  # [3, H, W]
+            except Exception as e:
+                print(f"Error loading image {img_path}: {e}")
+                image = torch.zeros(3, self.image_size, self.image_size)
+
+            try:
+                if not os.path.exists(npz_path):
+                    raise FileNotFoundError(f"npz not found: {npz_path}")
+
                 data = np.load(npz_path, allow_pickle=True)
-                
+
                 # Get embeddings (already 256-dim from SAM)
-                if 'emb' in data and data['emb'] is not None:
-                    embs = data['emb']  # [N, 256] float16
-                    
-                    # Check for object dtype (corrupt npz files)
-                    if embs.dtype == np.object_:
-                        raise ValueError(f"npz file has object dtype, likely corrupt")
-                    
-                    embs = torch.from_numpy(embs).float()  # Convert to float32
-                else:
-                    # Fallback if embeddings not in file
-                    embs = torch.randn(1, 256)  # Dummy embedding
-                
+                if 'emb' not in data or data['emb'] is None:
+                    raise ValueError("missing 'emb' in npz")
+
+                embs = data['emb']  # [N, 256] float16/float32
+                if embs.dtype == np.object_:
+                    raise ValueError("npz file has object dtype, likely corrupt")
+                embs = torch.from_numpy(embs).float()  # Convert to float32
+
                 # Get scores
                 if 'scores' in data:
                     scores = torch.from_numpy(data['scores']).float()
                 else:
                     scores = torch.ones(len(embs))
-                
+
                 # Optionally load binary masks (for visualization/debugging)
                 seg_masks = None
                 if 'packed' in data and 'shape' in data:
@@ -250,32 +245,47 @@ class SegmentationMaskDataset(Dataset):
                         HW = H * W
                         masks_flat = np.unpackbits(packed, axis=1)[:, :HW]
                         seg_masks = torch.from_numpy(masks_flat.reshape(N, H, W)).bool()
-                
+
                 N_actual = embs.shape[0]
-                
+
                 # Pad or truncate to max_segments
                 if N_actual < self.max_segments:
-                    # Pad with zeros
                     pad_size = self.max_segments - N_actual
-                    seg_embs = torch.cat([
-                        embs,
-                        torch.zeros(pad_size, 256)
-                    ], dim=0)
+                    seg_embs = torch.cat([embs, torch.zeros(pad_size, 256)], dim=0)
                     num_segments = N_actual
                 else:
-                    # Truncate if we have too many
                     seg_embs = embs[:self.max_segments]
                     num_segments = self.max_segments
                     scores = scores[:self.max_segments]
                     if seg_masks is not None:
                         seg_masks = seg_masks[:self.max_segments]
-                        
+
+                loaded = True
+                break
             except Exception as e:
-                print(f"Error loading npz {npz_path}: {e}")
-                seg_embs = torch.zeros(self.max_segments, 256)
-                num_segments = 0
-                scores = torch.zeros(0)
-                seg_masks = None
+                last_error = e
+                print(
+                    f"WARNING: skipping SAM sample idx={current_idx} "
+                    f"(attempt {retry + 1}/{max_retries}) at {npz_path}: {e}"
+                )
+
+        if not loaded:
+            # Final fallback if all nearby samples are invalid.
+            img_path = self.image_paths[idx]
+            name = self._get_basename(img_path)
+            try:
+                image = Image.open(img_path).convert("RGB")
+                image = self.transform(image)
+            except Exception:
+                image = torch.zeros(3, self.image_size, self.image_size)
+            print(
+                f"ERROR: failed to load valid SAM embeddings after {max_retries} attempts "
+                f"(start idx={idx}). Last error: {last_error}. Using dummy embeddings."
+            )
+            seg_embs = torch.zeros(self.max_segments, 256)
+            num_segments = 0
+            scores = torch.zeros(0)
+            seg_masks = None
         
         # Load pre-cached IJEPA embedding if available
         ijepa_emb = None

@@ -555,7 +555,10 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
     if 'optimizer' in checkpoint and 'epoch' in checkpoint and not (
         hasattr(args, 'evaluate') and args.evaluate
     ):
-        optimizer.load_state_dict(checkpoint['optimizer'])
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+        except ValueError as err:
+            print(f"[Resume] Skipping optimizer state due to mismatch: {err}")
         args.start_epoch = checkpoint['epoch'] + 1
         if 'scaler' in checkpoint:
             loss_scaler.load_state_dict(checkpoint['scaler'])
