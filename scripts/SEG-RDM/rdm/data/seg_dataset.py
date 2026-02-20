@@ -37,6 +37,7 @@ class SegmentationMaskDataset(Dataset):
         file_ext: str = "*.jpg",
         normalize: bool = True,
         ijepa_cache_dir: Optional[str] = None,
+        emb_source: str = "sam",
     ):
         """
         Args:
@@ -47,6 +48,8 @@ class SegmentationMaskDataset(Dataset):
             file_ext: File extension pattern for images (e.g., "*.jpg", "*.png")
             normalize: Whether to normalize images to [-1, 1] range (DDPM expects this)
             ijepa_cache_dir: Optional directory with pre-cached IJEPA embeddings (speeds up training)
+            emb_source: Embedding source type ("sam", "ijepa", "dinov2", "dino").
+                        When not "sam", npz may contain 'emb_image_mean' for mean-subtracted embeddings.
         """
         self.image_dir = image_dir
         self.mask_npz_dir = mask_npz_dir
@@ -54,6 +57,7 @@ class SegmentationMaskDataset(Dataset):
         self.image_size = image_size
         self.normalize = normalize
         self.ijepa_cache_dir = ijepa_cache_dir
+        self.emb_source = emb_source
         
         # Find all images with corresponding SAM embeddings
         # Scan mask_npz_dir subdirectories: {mask_npz_dir}/0/masks_npz/, /1/masks_npz/, etc.
@@ -146,11 +150,12 @@ class SegmentationMaskDataset(Dataset):
         elif missing_images:
             print(f"WARNING: {len(missing_images)} npz files have no matching images")
         
-        print(f"SegmentationMaskDataset: Loaded {len(self.image_paths)} images with SAM embeddings")
+        print(f"SegmentationMaskDataset: Loaded {len(self.image_paths)} images with {emb_source} embeddings")
         print(f"  (filtered from {len(npz_files)} npz files)")
         print(f"  image_dir: {image_dir}")
         print(f"  mask_npz_dir: {mask_npz_dir}")
         print(f"  max_segments: {max_segments}")
+        print(f"  emb_source: {emb_source}")
         
         # Verify at least one image has corresponding npz
         if len(self.image_paths) > 0:
@@ -247,11 +252,17 @@ class SegmentationMaskDataset(Dataset):
                         seg_masks = torch.from_numpy(masks_flat.reshape(N, H, W)).bool()
 
                 N_actual = embs.shape[0]
+                emb_dim = embs.shape[1] if embs.dim() == 2 else 256
+
+                # Load per-image mean if present (from region embedding extraction)
+                emb_image_mean = None
+                if 'emb_image_mean' in data:
+                    emb_image_mean = torch.from_numpy(np.array(data['emb_image_mean'])).float()
 
                 # Pad or truncate to max_segments
                 if N_actual < self.max_segments:
                     pad_size = self.max_segments - N_actual
-                    seg_embs = torch.cat([embs, torch.zeros(pad_size, 256)], dim=0)
+                    seg_embs = torch.cat([embs, torch.zeros(pad_size, emb_dim)], dim=0)
                     num_segments = N_actual
                 else:
                     seg_embs = embs[:self.max_segments]
@@ -279,13 +290,14 @@ class SegmentationMaskDataset(Dataset):
             except Exception:
                 image = torch.zeros(3, self.image_size, self.image_size)
             print(
-                f"ERROR: failed to load valid SAM embeddings after {max_retries} attempts "
+                f"ERROR: failed to load valid embeddings after {max_retries} attempts "
                 f"(start idx={idx}). Last error: {last_error}. Using dummy embeddings."
             )
             seg_embs = torch.zeros(self.max_segments, 256)
             num_segments = 0
             scores = torch.zeros(0)
             seg_masks = None
+            emb_image_mean = None
         
         # Load pre-cached IJEPA embedding if available
         ijepa_emb = None
@@ -316,7 +328,12 @@ class SegmentationMaskDataset(Dataset):
             'num_segments': num_segments,  # actual count
             'scores': scores,  # [N]
             'filename': name,
+            'emb_source': self.emb_source,
         }
+        
+        # Add per-image mean (for mean-subtracted region embeddings)
+        if emb_image_mean is not None:
+            output['emb_image_mean'] = emb_image_mean  # [256]
         
         # Add IJEPA embedding if loaded from cache
         if ijepa_emb is not None:
@@ -422,6 +439,14 @@ def collate_seg_batch(batch):
         'scores': scores,
         'filename': [item['filename'] for item in batch],
     }
+    
+    # Add emb_source tag if present
+    if 'emb_source' in batch[0]:
+        output['emb_source'] = batch[0]['emb_source']
+    
+    # Add per-image mean if present (for mean-subtracted region embeddings)
+    if 'emb_image_mean' in batch[0]:
+        output['emb_image_mean'] = torch.stack([item['emb_image_mean'] for item in batch])
     
     # Add pre-cached IJEPA embeddings if present
     if 'ijepa_emb' in batch[0]:

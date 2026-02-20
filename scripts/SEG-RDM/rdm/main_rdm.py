@@ -59,6 +59,10 @@ def get_args_parser():
                         help='Maximum number of segments for padding')
     parser.add_argument('--ijepa_cache_dir', type=str, default=None,
                         help='Optional directory with pre-cached IJEPA embeddings (speeds up training)')
+    parser.add_argument('--emb_source', type=str, default='sam',
+                        choices=['sam', 'ijepa', 'dinov2', 'dino'],
+                        help='Embedding source: sam (SAM encoder), ijepa/dinov2/dino (ViT patch tokens). '
+                             'Non-sam sources expect emb_image_mean in npz for mean-subtracted embeddings.')
 
     # Dataset parameters
     parser.add_argument('--data_path', default='./data/imagenet', type=str,
@@ -175,9 +179,11 @@ def main(args):
             file_ext="*.JPEG",  # ImageNet uses .JPEG
             normalize=True,  # DDPM expects [-1, 1] range
             ijepa_cache_dir=args.ijepa_cache_dir,  # Optional pre-cached IJEPA embeddings
+            emb_source=args.emb_source,  # sam, ijepa, dinov2, dino
         )
         print(f"Using SegmentationMaskDataset: {len(dataset_train)} samples")
-        print(f"  SAM embeddings: {args.mask_npz_dir}")
+        print(f"  Embeddings: {args.mask_npz_dir}")
+        print(f"  emb_source: {args.emb_source}")
         print(f"  max_segments: {args.max_segments}")
         if args.ijepa_cache_dir:
             print(f"  IJEPA cache: {args.ijepa_cache_dir} (pre-cached embeddings)")
