@@ -1,49 +1,52 @@
 """
-SAM (Segment Anything Model) Extractor with Caching and Stochastic Conditioning
+SAM (Segment Anything Model) Extractor with Unified Cache and Stochastic Conditioning
 
 This module provides on-the-fly SAM extraction during StyleGAN2 training with:
 - Lazy SAM initialization (only loads when needed)
-- Cache-based system to avoid re-extracting images
-- Validation of cached embeddings
-- Async disk writes for non-blocking I/O
+- Unified cache system compatible with precompute_sam_embeddings.py format
+- Validation of cached embeddings (all 5 keys: packed, shape, scores, label_map, emb)
+- Async disk writes for non-blocking I/O (both NPZ and metadata JSON)
 - Stochastic conditioning (dropout-like SAM usage)
+- Multi-GPU safe: each GPU extracts its own batch images independently
+  (natural load balancing via DistributedSampler in training_loop.py)
 
 Design:
-- Cache key: Image file path (deterministic, not seed-dependent)
-- Cache format: {class_folder}/{image_stem}.npz
-- Cache contents: {'emb': (N, 256) float16, 'scores': (N,) float32}
-- Coverage: Probabilistic extraction ensures eventual full coverage (0.75^N decay)
+- Cache key: Image file path -> O(1) deterministic path mapping
+- Cache format: {cache_dir}/masks_npz/{class_folder}/{image_stem}.npz
+- Cache contents: {'packed': (N, ceil(H*W/8)) uint8, 'shape': (3,) int32,
+                   'scores': (N,) float32, 'label_map': (H,W) int32,
+                   'emb': (N, 256) float16}
+- Metadata: {cache_dir}/meta/{class_folder}/{image_stem}.json
+- Compatible with precompute_sam_embeddings.py output
 
 Usage:
     extractor = SAMExtractor(
         sam_checkpoint="sam_vit_b_01ec64.pth",
-        cache_dir="./sam_cache",
+        cache_dir="/path/to/sam_cache_unified",
         device="cuda",
         model_type="vit_b"
     )
-    
+
     # Extract or load from cache
     embeddings = extractor.extract_or_load(image_paths, images)
-    
+
     # Pad to batch format
     padded_emb, pad_mask = pad_embeddings_batch(embeddings)
 """
 
 import os
+import json
+import time
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import threading
 import queue
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 import PIL.Image
-try:
-    from filelock import FileLock
-except ImportError:
-    FileLock = None
-    print("[SAMExtractor] Warning: filelock not installed. Install with: pip install filelock")
-    print("[SAMExtractor] Falling back to non-locking mode (may cause issues with multi-GPU)")
+
 try:
     from filelock import FileLock
 except ImportError:
@@ -52,9 +55,9 @@ except ImportError:
     print("[SAMExtractor] Falling back to non-locking mode (may cause issues with multi-GPU)")
 
 
-#----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Distributed training utilities
-#----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def is_distributed() -> bool:
     """Check if running in distributed mode"""
@@ -77,51 +80,133 @@ def barrier():
     if is_distributed():
         dist.barrier()
 
-#----------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Mask utility functions (matching precompute_sam_embeddings.py)
+# ---------------------------------------------------------------------------
+
+def mask_stats(mask_bool: np.ndarray) -> Optional[dict]:
+    """Compute statistics for a binary mask (same as precompute_sam_embeddings.py)."""
+    mask_bool = np.asarray(mask_bool, dtype=bool)
+    ys, xs = np.where(mask_bool)
+    if xs.size == 0:
+        return None
+
+    h, w = mask_bool.shape
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+
+    area_frac = float(mask_bool.mean())
+    cx = float(xs.mean() / w)
+    cy = float(ys.mean() / h)
+
+    bw = float((x1 - x0 + 1) / w)
+    bh = float((y1 - y0 + 1) / h)
+    bbox_area_frac = float(((x1 - x0 + 1) * (y1 - y0 + 1)) / (h * w))
+
+    bbox_area_px = max(1, (x1 - x0 + 1) * (y1 - y0 + 1))
+    fill_frac = float(mask_bool.sum() / bbox_area_px)
+
+    return {
+        "area_frac": area_frac,
+        "cx": cx, "cy": cy,
+        "bbox_w": bw, "bbox_h": bh,
+        "bbox_area_frac": bbox_area_frac,
+        "bbox_xyxy": [x0, y0, x1, y1],
+        "fill_frac": fill_frac,
+    }
+
+
+def bbox_xywh_from_mask(mask_bool: np.ndarray) -> Optional[list]:
+    """Extract bounding box in xywh format from mask (same as precompute_sam_embeddings.py)."""
+    ys, xs = np.where(mask_bool)
+    if xs.size == 0:
+        return None
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    return [x0, y0, int(x1 - x0 + 1), int(y1 - y0 + 1)]
+
+
+def iou(a: np.ndarray, b: np.ndarray) -> float:
+    """Compute IoU between two binary masks."""
+    inter = np.logical_and(a, b).sum()
+    if inter == 0:
+        return 0.0
+    union = np.logical_or(a, b).sum()
+    return float(inter / max(1, union))
+
+
+# ---------------------------------------------------------------------------
 
 class AsyncWriter:
-    """Background thread for non-blocking file writes"""
-    
+    """Background thread for non-blocking file writes (NPZ + JSON metadata)"""
+
     def __init__(self):
         self.queue = queue.Queue()
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
-    
+
     def _worker(self):
         """Worker thread that processes write requests"""
         while True:
             item = self.queue.get()
             if item is None:  # Sentinel to stop thread
                 break
-            
-            filepath, data = item
+
             try:
-                os.makedirs(os.path.dirname(filepath), exist_ok=True)
-                
-                # Use file locking for multi-GPU safety
-                if FileLock is not None:
-                    lock_path = filepath + '.lock'
-                    with FileLock(lock_path, timeout=300):  # 5 min timeout
-                        # Double-check if another process wrote it while we waited
+                job_type = item.get('type', 'npz')
+
+                if job_type == 'npz':
+                    filepath = item['filepath']
+                    data = item['data']
+                    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+                    if FileLock is not None:
+                        lock_path = filepath + '.lock'
+                        with FileLock(lock_path, timeout=300):
+                            if not os.path.exists(filepath):
+                                np.savez_compressed(filepath, **data)
+                        try:
+                            os.remove(lock_path)
+                        except OSError:
+                            pass
+                    else:
                         if not os.path.exists(filepath):
                             np.savez_compressed(filepath, **data)
-                    # Clean up lock file
-                    try:
-                        os.remove(lock_path)
-                    except:
-                        pass
-                else:
-                    # Fallback without locking (single-GPU or filelock not installed)
-                    np.savez_compressed(filepath, **data)
+
+                elif job_type == 'json':
+                    filepath = item['filepath']
+                    data = item['data']
+                    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+                    if FileLock is not None:
+                        lock_path = filepath + '.lock'
+                        with FileLock(lock_path, timeout=300):
+                            if not os.path.exists(filepath):
+                                with open(filepath, 'w') as f:
+                                    json.dump(data, f, indent=2)
+                        try:
+                            os.remove(lock_path)
+                        except OSError:
+                            pass
+                    else:
+                        if not os.path.exists(filepath):
+                            with open(filepath, 'w') as f:
+                                json.dump(data, f, indent=2)
+
             except Exception as e:
-                print(f"[AsyncWriter] Failed to save {filepath}: {e}")
+                print(f"[AsyncWriter] Failed to save {item.get('filepath', 'unknown')}: {e}")
             finally:
                 self.queue.task_done()
-    
-    def save(self, filepath: str, data: dict):
-        """Queue a save operation"""
-        self.queue.put((filepath, data))
-    
+
+    def save_npz(self, filepath: str, data: dict):
+        """Queue a NPZ save operation"""
+        self.queue.put({'type': 'npz', 'filepath': filepath, 'data': data})
+
+    def save_json(self, filepath: str, data: dict):
+        """Queue a JSON save operation"""
+        self.queue.put({'type': 'json', 'filepath': filepath, 'data': data})
+
     def shutdown(self):
         """Wait for all pending writes and stop thread"""
         self.queue.join()
@@ -131,14 +216,18 @@ class AsyncWriter:
 
 class SAMExtractor:
     """
-    SAM extractor with lazy initialization, caching, and validation.
-    
+    SAM extractor with lazy initialization, unified caching, and validation.
+
+    Unified Cache: Uses same directory structure as precompute_sam_embeddings.py
+      - NPZ: {cache_dir}/masks_npz/{class}/{stem}.npz  (5 keys)
+      - Meta: {cache_dir}/meta/{class}/{stem}.json
     Lazy Init: SAM model only loaded when first extraction is needed
-    Cache: Image path → .npz file mapping (check cache first)
-    Validation: File size >1KB, required keys present, valid shapes
+    Validation: File size >1KB, all 5 required keys present, valid shapes
     Async Writes: Non-blocking disk I/O via background thread
+    Multi-GPU: Each GPU extracts its own assigned batch images (natural parallelism
+               via DistributedSampler — GPUs never see the same image in a batch)
     """
-    
+
     def __init__(
         self,
         sam_checkpoint: str,
@@ -147,49 +236,84 @@ class SAMExtractor:
         model_type: str = "vit_b",
         max_masks: int = 250,
         rank: Optional[int] = None,
-        world_size: Optional[int] = None
+        world_size: Optional[int] = None,
+        origin_map: Optional[Dict[str, str]] = None,
+        # AMG parameters (matching precompute_sam_embeddings.py defaults)
+        points_per_side: int = 32,
+        pred_iou_thresh: float = 0.82,
+        stability_score_thresh: float = 0.85,
+        box_nms_thresh: float = 0.70,
+        crop_n_layers: int = 0,
+        dedup_iou_thresh: float = 0.95,
+        min_mask_region_area: int = 100,
     ):
         """
-        Initialize SAM extractor
-        
+        Initialize SAM extractor.
+
         Args:
             sam_checkpoint: Path to SAM checkpoint file
-            cache_dir: Directory to store cached embeddings
+            cache_dir: Unified cache directory (same as precompute_sam_embeddings.py output_dir)
             device: Device to run SAM on ("cuda" or "cpu")
             model_type: SAM model type ("vit_b", "vit_l", "vit_h")
             max_masks: Maximum number of mask embeddings to keep per image
             rank: Process rank for distributed training (None = auto-detect)
             world_size: Total number of processes (None = auto-detect)
+            origin_map: Dict mapping zip filenames to original names (e.g. "00004/img00004572.png" -> "921/499656")
+            points_per_side: AMG points per side for mask generation
+            pred_iou_thresh: AMG predicted IoU threshold
+            stability_score_thresh: AMG stability score threshold
+            box_nms_thresh: AMG box NMS threshold
+            crop_n_layers: AMG crop layers
+            dedup_iou_thresh: IoU threshold for greedy deduplication
+            min_mask_region_area: Minimum mask region area (post-processing)
         """
         self.sam_checkpoint = sam_checkpoint
         self.cache_dir = cache_dir
         self.device = device
         self.model_type = model_type
         self.max_masks = max_masks
-        
+
+        # AMG parameters
+        self.points_per_side = points_per_side
+        self.pred_iou_thresh = pred_iou_thresh
+        self.stability_score_thresh = stability_score_thresh
+        self.box_nms_thresh = box_nms_thresh
+        self.crop_n_layers = crop_n_layers
+        self.dedup_iou_thresh = dedup_iou_thresh
+        self.min_mask_region_area = min_mask_region_area
+
+        # Origin map for translating zip names to original names
+        # so cache paths match AlignedSegDataset._get_corresponding_npz()
+        self.origin_map = origin_map or {}
+
         # Distributed training support
         self.rank = rank if rank is not None else get_rank()
         self.world_size = world_size if world_size is not None else get_world_size()
-        
+
+        if self.origin_map and self.rank == 0:
+            print(f"[SAMExtractor] origin_map loaded with {len(self.origin_map)} entries")
+
         # Lazy initialization - SAM not loaded until needed
         self.sam = None
         self.mask_generator = None
-        
+        self.predictor = None
+
         # Async writer for non-blocking saves
         self.async_writer = AsyncWriter()
-        
+
         # Stats
         self.cache_hits = 0
         self.cache_misses = 0
         self.extractions = 0
-    
+        self.lock_wait_time = 0.0  # cumulative seconds spent waiting on locks
+
     def _lazy_init_sam(self):
         """Lazy initialization of SAM model (only when first needed)"""
         if self.sam is not None:
             return
-        
-        print(f"[SAMExtractor] Loading SAM model from {self.sam_checkpoint}")
-        
+
+        print(f"[SAMExtractor][Rank {self.rank}] Loading SAM model from {self.sam_checkpoint}")
+
         try:
             from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
         except ImportError:
@@ -197,112 +321,163 @@ class SAMExtractor:
                 "segment_anything not installed. Install with: "
                 "pip install git+https://github.com/facebookresearch/segment-anything.git"
             )
-        
+
         # Load SAM model
         self.sam = sam_model_registry[self.model_type](checkpoint=self.sam_checkpoint)
         self.sam.to(device=self.device)
         self.sam.eval()
-        
-        # Create mask generator and predictor
-        self.mask_generator = SamAutomaticMaskGenerator(self.sam)
-        self.predictor = SamPredictor(self.sam)  # For extracting image embeddings
-        
-        print(f"[SAMExtractor] SAM model loaded successfully")
-    
-    def _get_rank_subset(self, image_paths: List[str]) -> List[str]:
+
+        # Create mask generator with AMG parameters matching precompute_sam_embeddings.py
+        self.mask_generator = SamAutomaticMaskGenerator(
+            model=self.sam,
+            points_per_side=self.points_per_side,
+            pred_iou_thresh=self.pred_iou_thresh,
+            stability_score_thresh=self.stability_score_thresh,
+            box_nms_thresh=self.box_nms_thresh,
+            crop_n_layers=self.crop_n_layers,
+            min_mask_region_area=0,  # We do post-processing manually (same as precompute)
+        )
+        self.predictor = SamPredictor(self.sam)
+
+        print(f"[SAMExtractor][Rank {self.rank}] SAM model loaded successfully "
+              f"(points_per_side={self.points_per_side}, pred_iou_thresh={self.pred_iou_thresh})")
+
+    # ------------------------------------------------------------------
+    # Cache path helpers (O(1) lookup)
+    # ------------------------------------------------------------------
+
+    def _resolve_image_key(self, image_path: str) -> str:
+        """Strip zip prefix and return the bare relative path."""
+        if "::" in image_path:
+            image_path = image_path.split("::", 1)[1]
+        return image_path
+
+    def _get_npz_cache_path(self, image_path: str) -> str:
         """
-        Get subset of images for this rank to process.
-        Uses strided indexing for load balancing: rank 0 gets [0,4,8,...], rank 1 gets [1,5,9,...]
-        
-        Args:
-            image_paths: Full list of image paths
-            
-        Returns:
-            Subset for this rank
+        Get NPZ cache file path for an image. O(1) path computation.
+
+        If origin_map is available, translates zip names to original names
+        so the cache path matches precompute_sam_embeddings.py output:
+          "00004/img00004572.png" -> origin_map -> "921/499656"
+          -> {cache_dir}/921/masks_npz/499656.npz
+
+        Without origin_map, falls back to:
+          {cache_dir}/{class_folder}/masks_npz/{image_stem}.npz
         """
-        if self.world_size == 1:
-            return image_paths
-        
-        # Strided indexing: [rank::world_size]
-        return image_paths[self.rank::self.world_size]
-    
-    def _get_cache_path(self, image_path: str) -> str:
-        """
-        Get cache file path for an image.
-        
-        Cache structure: {cache_dir}/{parent_folder}/{image_stem}.npz
-        Example: /sam_cache/n01440764/n01440764_10026.npz
-        
-        Args:
-            image_path: Full path to image file
-            
-        Returns:
-            Path to cache file
-        """
+        image_path = self._resolve_image_key(image_path)
+
+        # Use origin_map if available (matches precompute_sam_embeddings.py layout)
+        if self.origin_map and image_path in self.origin_map:
+            orig_key = self.origin_map[image_path]  # e.g. "921/499656"
+            parts = orig_key.split("/")
+            if len(parts) == 2:
+                return os.path.join(self.cache_dir, parts[0], "masks_npz", f"{parts[1]}.npz")
+            return os.path.join(self.cache_dir, "masks_npz", f"{orig_key}.npz")
+
+        # Fallback: use zip filename structure
         path_obj = Path(image_path)
-        parent_folder = path_obj.parent.name
+        class_folder = path_obj.parent.name      # e.g. "00003"
+        image_stem = path_obj.stem                # e.g. "img00003170"
+        return os.path.join(self.cache_dir, class_folder, "masks_npz", f"{image_stem}.npz")
+
+    def _get_meta_cache_path(self, image_path: str) -> str:
+        """
+        Get metadata JSON cache file path for an image. O(1) path computation.
+
+        Uses origin_map if available to stay consistent with _get_npz_cache_path.
+        """
+        image_path = self._resolve_image_key(image_path)
+
+        # Use origin_map if available
+        if self.origin_map and image_path in self.origin_map:
+            orig_key = self.origin_map[image_path]  # e.g. "921/499656"
+            parts = orig_key.split("/")
+            if len(parts) == 2:
+                return os.path.join(self.cache_dir, parts[0], "meta", f"{parts[1]}.json")
+            return os.path.join(self.cache_dir, "meta", f"{orig_key.replace('/', '_')}.json")
+
+        # Fallback
+        path_obj = Path(image_path)
+        class_folder = path_obj.parent.name
         image_stem = path_obj.stem
-        cache_path = os.path.join(self.cache_dir, parent_folder, f"{image_stem}.npz")
-        return cache_path
-    
+        return os.path.join(self.cache_dir, class_folder, "meta", f"{image_stem}.json")
+
+    # ------------------------------------------------------------------
+    # Cache validation (all 5 keys)
+    # ------------------------------------------------------------------
+
     def _validate_cache(self, cache_path: str) -> bool:
         """
-        Validate cached embeddings.
-        
+        Validate cached embeddings. Checks all 5 keys matching
+        precompute_sam_embeddings.py format.
+
         Checks:
         - File exists and size > 1KB
-        - Has required keys: 'emb', 'scores'
-        - Valid shapes
-        
-        Args:
-            cache_path: Path to cache file
-            
-        Returns:
-            True if valid, False otherwise
+        - Has required keys: 'packed', 'shape', 'scores', 'label_map', 'emb'
+        - Valid shapes: shape=(3,), N=shape[0], scores=(N,), emb=(N,256), label_map 2D
+        - N <= 1000 (sanity bound)
         """
         if not os.path.exists(cache_path):
             return False
-        
+
         # Check file size (should be at least 1KB)
-        if os.path.getsize(cache_path) < 1024:
+        try:
+            if os.path.getsize(cache_path) < 1024:
+                return False
+        except OSError:
             return False
-        
+
         try:
             data = np.load(cache_path)
-            
-            # Check required keys
-            if 'emb' not in data or 'scores' not in data:
-                return False
-            
-            emb = data['emb']
+
+            # Check all 5 required keys
+            required_keys = ['packed', 'shape', 'scores', 'label_map', 'emb']
+            for key in required_keys:
+                if key not in data:
+                    return False
+
+            shape = data['shape']
             scores = data['scores']
-            
-            # Check shapes
-            if emb.ndim != 2 or emb.shape[1] != 256:
+            emb = data['emb']
+            label_map = data['label_map']
+
+            # Validate shape array
+            if len(shape) != 3:
                 return False
-            
-            if scores.ndim != 1 or len(scores) != emb.shape[0]:
+            N = int(shape[0])
+
+            # Validate N is reasonable
+            if N > 1000:
                 return False
-            
+
+            # Validate scores
+            if scores.ndim != 1 or scores.shape[0] != N:
+                return False
+
+            # Validate embeddings
+            if emb.ndim != 2 or emb.shape[0] != N or emb.shape[1] != 256:
+                return False
+
+            # Validate label_map
+            if label_map.ndim != 2:
+                return False
+
             return True
-            
+
         except Exception as e:
             print(f"[SAMExtractor] Cache validation failed for {cache_path}: {e}")
             return False
-    
+
     def _load_from_cache(self, cache_path: str) -> Optional[Dict[str, np.ndarray]]:
         """
         Load embeddings from cache.
-        
-        Args:
-            cache_path: Path to cache file
-            
+
         Returns:
             Dict with 'emb' and 'scores' if valid, None otherwise
         """
         if not self._validate_cache(cache_path):
             return None
-        
+
         try:
             data = np.load(cache_path)
             self.cache_hits += 1
@@ -314,24 +489,36 @@ class SAMExtractor:
             print(f"[SAMExtractor] Failed to load cache {cache_path}: {e}")
             self.cache_misses += 1
             return None
-    
-    def _extract_single(self, image_path: str, image_tensor: Optional[torch.Tensor] = None) -> Dict[str, np.ndarray]:
+
+    # ------------------------------------------------------------------
+    # Extraction (matching precompute_sam_embeddings.py output format)
+    # ------------------------------------------------------------------
+
+    def _extract_single(
+        self,
+        image_path: str,
+        image_tensor: Optional[torch.Tensor] = None
+    ) -> Dict[str, object]:
         """
         Extract SAM embeddings for a single image.
-        Uses production method from segmentation-play.ipynb.
-        
+        Produces output matching precompute_sam_embeddings.py format exactly:
+        - NPZ with 5 keys: packed, shape, scores, label_map, emb
+        - Metadata dict for JSON
+
         Args:
             image_path: Path to image file
-            image_tensor: Optional pre-loaded image tensor (B, C, H, W) in [-1, 1]
-            
+            image_tensor: Optional pre-loaded image tensor (1, C, H, W) in [-1, 1]
+
         Returns:
-            Dict with 'emb' (N, 256) and 'scores' (N,)
+            Dict with:
+                'emb': (N, 256) float16
+                'scores': (N,) float32
+                'npz_data': dict with all 5 keys for saving
+                'metadata': dict for JSON saving
         """
-        import torch.nn.functional as F
-        
         # Lazy init SAM if not already loaded
         self._lazy_init_sam()
-        
+
         # Load image
         if image_tensor is not None:
             # Convert from tensor [-1, 1] to numpy [0, 255]
@@ -339,63 +526,154 @@ class SAMExtractor:
             if img_np.shape[2] == 1:  # Grayscale
                 img_np = np.repeat(img_np, 3, axis=2)
         else:
-            # Load from disk
             image = PIL.Image.open(image_path).convert('RGB')
             img_np = np.array(image, dtype=np.uint8)
-        
-        # Generate masks using AMG
-        masks = self.mask_generator.generate(img_np)
-        
-        # Get image embedding once (for all masks)
+
+        H, W, _ = img_np.shape
+
+        # 1) Generate proposals via AMG
+        amg = self.mask_generator.generate(img_np)
+
+        # 2) Compute image embedding once (for all masks)
         self.predictor.set_image(img_np)
         feat = self.predictor.get_image_embedding()  # (1, C, H_feat, W_feat)
         hf, wf = feat.shape[-2], feat.shape[-1]
-        
-        # Extract embeddings and scores for each mask
-        embeddings = []
-        scores = []
-        
-        for mask in masks:
-            seg = mask['segmentation'].astype(bool)
-            
-            # Compute score (same as production notebook)
-            pred_iou = float(mask.get('predicted_iou', 0.0))
-            stability_score = float(mask.get('stability_score', 0.0))
-            score = pred_iou * stability_score
-            
-            # Extract per-mask embedding from SAM image encoder
-            # This is the production method from segmentation-play.ipynb
+
+        # 3) Process candidates (matching precompute_sam_embeddings.py logic)
+        candidates = []
+        for orig_i, m in enumerate(amg):
+            seg = m['segmentation'].astype(bool)
+
+            area_px = int(seg.sum())
+            if area_px == 0:
+                continue
+
+            pred_iou = float(m.get('predicted_iou', 0.0))
+            stab = float(m.get('stability_score', 0.0))
+            score = pred_iou * stab
+
+            st = mask_stats(seg)
+            if st is None:
+                continue
+
+            # Per-mask embedding from SAM image encoder
             mask_t = torch.from_numpy(seg[None, None].astype(np.float32)).to(self.device)
             mask_small = F.interpolate(mask_t, size=(hf, wf), mode="nearest")
             denom = mask_small.sum(dim=(2, 3)) + 1e-6
-            emb_t = (feat * mask_small).sum(dim=(2, 3)) / denom  # (1, C)
-            emb = emb_t.squeeze(0).detach().cpu().to(torch.float16).numpy()  # (C,)
-            
-            embeddings.append(emb)
-            scores.append(score)
-        
-        # Convert to numpy arrays
-        if len(embeddings) == 0:
-            # No masks found - create dummy embedding
-            embeddings = np.zeros((1, 256), dtype=np.float16)
-            scores = np.zeros((1,), dtype=np.float32)
+            emb_t = (feat * mask_small).sum(dim=(2, 3)) / denom
+            emb = emb_t.squeeze(0).detach().cpu().to(torch.float16).numpy()
+
+            candidates.append({
+                "orig_amg_index": int(orig_i),
+                "seg": seg,
+                "score": float(score),
+                "predicted_iou": pred_iou,
+                "stability_score": stab,
+                "area_px": area_px,
+                "bbox_xywh": bbox_xywh_from_mask(seg),
+                "stats": st,
+                "emb": emb,
+            })
+
+        # 4) Sort by score and deduplicate (greedy IoU, same as precompute)
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        kept = []
+        for cand in candidates:
+            if len(kept) >= self.max_masks:
+                break
+            ok = True
+            for prev in kept:
+                if iou(cand["seg"], prev["seg"]) >= self.dedup_iou_thresh:
+                    ok = False
+                    break
+            if ok:
+                kept.append(cand)
+
+        # 5) Build final arrays (matching precompute format)
+        N = len(kept)
+        if N == 0:
+            masks = np.zeros((0, H, W), dtype=np.bool_)
+            scores = np.zeros((0,), dtype=np.float32)
+            embs = np.zeros((0, 256), dtype=np.float16)
+            label_map = -np.ones((H, W), dtype=np.int32)
         else:
-            embeddings = np.stack(embeddings, axis=0)  # (N, 256)
-            scores = np.array(scores, dtype=np.float32)
-            
-            # Sort by score (descending) and keep top max_masks
-            if len(scores) > self.max_masks:
-                top_indices = np.argsort(scores)[::-1][:self.max_masks]
-                embeddings = embeddings[top_indices]
-                scores = scores[top_indices]
-        
-        self.extractions += 1
-        
-        return {
-            'emb': embeddings,
-            'scores': scores
+            masks = np.stack([k["seg"] for k in kept], axis=0).astype(np.bool_)
+            scores = np.asarray([k["score"] for k in kept], dtype=np.float32)
+            embs = np.stack([k["emb"] for k in kept], axis=0)  # (N, 256) float16
+
+            # Non-overlapping label map (same as precompute)
+            label_map = -np.ones((H, W), dtype=np.int32)
+            occupied = np.zeros((H, W), dtype=bool)
+            order = np.argsort(-scores)
+            for new_id in order:
+                pix = masks[new_id] & (~occupied)
+                if pix.sum() == 0:
+                    continue
+                label_map[pix] = int(new_id)
+                occupied[pix] = True
+
+        # 6) Pack masks for compressed storage
+        packed = (np.packbits(masks.reshape(masks.shape[0], -1), axis=1)
+                  if masks.shape[0] > 0
+                  else np.zeros((0, 0), dtype=np.uint8))
+
+        # 7) Build NPZ data dict (all 5 keys)
+        npz_data = {
+            'packed': packed,
+            'shape': np.array(masks.shape, dtype=np.int32),
+            'scores': scores,
+            'label_map': label_map,
+            'emb': embs,
         }
-    
+
+        # 8) Build metadata for JSON (matching precompute format)
+        amg_params = {
+            "points_per_side": self.points_per_side,
+            "pred_iou_thresh": self.pred_iou_thresh,
+            "stability_score_thresh": self.stability_score_thresh,
+            "box_nms_thresh": self.box_nms_thresh,
+            "crop_n_layers": self.crop_n_layers,
+            "dedup_iou_thresh": self.dedup_iou_thresh,
+            "max_keep": self.max_masks,
+        }
+
+        meta_masks = []
+        for new_id, k in enumerate(kept):
+            st = dict(k["stats"])
+            st.update({
+                "mask_index": int(new_id),
+                "orig_amg_index": int(k["orig_amg_index"]),
+                "score": float(k["score"]),
+                "predicted_iou": float(k["predicted_iou"]),
+                "stability_score": float(k["stability_score"]),
+                "area_px": int(k["area_px"]),
+                "bbox_xywh": k["bbox_xywh"],
+            })
+            meta_masks.append(st)
+
+        metadata = {
+            "image": str(image_path),
+            "device": str(self.device),
+            "num_masks": int(N),
+            "source": "on-the-fly (SAMExtractor)",
+            "amg_params": amg_params,
+            "masks": meta_masks,
+        }
+
+        self.extractions += 1
+
+        return {
+            'emb': embs,
+            'scores': scores,
+            'npz_data': npz_data,
+            'metadata': metadata,
+        }
+
+    # ------------------------------------------------------------------
+    # Main entry point: extract or load from cache
+    # ------------------------------------------------------------------
+
     def extract_or_load(
         self,
         image_paths: List[str],
@@ -403,76 +681,96 @@ class SAMExtractor:
     ) -> List[Dict[str, np.ndarray]]:
         """
         Extract or load SAM embeddings for a batch of images.
-        
-        Checks cache first, extracts if not found, saves to cache asynchronously.
-        
+        Processes images sequentially (consistent with precompute_sam_embeddings.py).
+        Each GPU processes its own batch images independently (natural parallelism
+        via DistributedSampler in training_loop.py).
+
+        Checks cache first, extracts if not found, saves to cache asynchronously
+        (both NPZ and metadata JSON).
+
         Args:
             image_paths: List of image file paths
             image_tensors: Optional pre-loaded image tensors (B, C, H, W) in [-1, 1]
-            
+
         Returns:
             List of dicts with 'emb' (N, 256) and 'scores' (N,) for each image
         """
         results = []
-        
+
         for i, image_path in enumerate(image_paths):
-            cache_path = self._get_cache_path(image_path)
-            
-            # Try loading from cache
-            cached = self._load_from_cache(cache_path)
-            
+            npz_path = self._get_npz_cache_path(image_path)
+
+            # Try loading from cache (O(1) path lookup + file read)
+            cached = self._load_from_cache(npz_path)
+
             if cached is not None:
                 results.append(cached)
             else:
+                self.cache_misses += 1
+
                 # Use file locking to prevent concurrent extraction by multiple GPUs
                 if FileLock is not None:
-                    lock_path = cache_path + '.lock'
+                    lock_path = npz_path + '.lock'
                     try:
+                        lock_start = time.monotonic()
                         with FileLock(lock_path, timeout=300):  # 5 min timeout
-                            # Double-check cache after acquiring lock (another GPU may have written it)
-                            cached = self._load_from_cache(cache_path)
+                            lock_elapsed = time.monotonic() - lock_start
+                            self.lock_wait_time += lock_elapsed
+
+                            if lock_elapsed > 30.0:
+                                print(f"[SAMExtractor][Rank {self.rank}] WARNING: "
+                                      f"Lock wait {lock_elapsed:.1f}s for {Path(image_path).name}")
+
+                            # Double-check cache (another GPU may have written it)
+                            cached = self._load_from_cache(npz_path)
                             if cached is not None:
                                 results.append(cached)
                             else:
                                 # Extract from image
                                 img_tensor = image_tensors[i:i+1] if image_tensors is not None else None
                                 extracted = self._extract_single(image_path, img_tensor)
-                                results.append(extracted)
-                                
-                                # Save to cache asynchronously (will use locking internally)
-                                self.async_writer.save(cache_path, extracted)
+                                results.append({'emb': extracted['emb'], 'scores': extracted['scores']})
+
+                                # Save NPZ and metadata JSON asynchronously
+                                self.async_writer.save_npz(npz_path, extracted['npz_data'])
+                                meta_path = self._get_meta_cache_path(image_path)
+                                self.async_writer.save_json(meta_path, extracted['metadata'])
                         # Clean up lock file
                         try:
                             os.remove(lock_path)
-                        except:
+                        except OSError:
                             pass
                     except Exception as e:
-                        print(f"[SAMExtractor] Lock timeout or error for {image_path}: {e}")
+                        print(f"[SAMExtractor][Rank {self.rank}] Lock error for {image_path}: {e}")
                         # Fallback: extract without saving to cache
                         img_tensor = image_tensors[i:i+1] if image_tensors is not None else None
                         extracted = self._extract_single(image_path, img_tensor)
-                        results.append(extracted)
+                        results.append({'emb': extracted['emb'], 'scores': extracted['scores']})
                 else:
                     # No locking available - extract and save
                     img_tensor = image_tensors[i:i+1] if image_tensors is not None else None
                     extracted = self._extract_single(image_path, img_tensor)
-                    results.append(extracted)
-                    self.async_writer.save(cache_path, extracted)
-        
+                    results.append({'emb': extracted['emb'], 'scores': extracted['scores']})
+
+                    self.async_writer.save_npz(npz_path, extracted['npz_data'])
+                    meta_path = self._get_meta_cache_path(image_path)
+                    self.async_writer.save_json(meta_path, extracted['metadata'])
+
         return results
-    
+
     def get_stats(self) -> dict:
         """Get cache statistics"""
         total = self.cache_hits + self.cache_misses
         hit_rate = self.cache_hits / total if total > 0 else 0.0
-        
+
         return {
             'cache_hits': self.cache_hits,
             'cache_misses': self.cache_misses,
             'extractions': self.extractions,
-            'hit_rate': hit_rate
+            'hit_rate': hit_rate,
+            'lock_wait_time_s': self.lock_wait_time,
         }
-    
+
     def __del__(self):
         """Cleanup async writer on deletion"""
         if hasattr(self, 'async_writer'):
@@ -485,25 +783,25 @@ def pad_embeddings_batch(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Pad variable-length embeddings to batch format.
-    
+
     Args:
         embeddings_list: List of dicts with 'emb' (N_i, 256) and 'scores' (N_i,)
         device: Device to put tensors on
-        
+
     Returns:
         Tuple of:
         - padded_emb: (B, max_N, 256) tensor
         - pad_mask: (B, max_N) bool tensor (True = padding, False = valid)
     """
     batch_size = len(embeddings_list)
-    
+
     # Find max number of masks in batch
     max_masks = max(len(item['scores']) for item in embeddings_list)
-    
+
     # Create padded tensors
     padded_emb = torch.zeros(batch_size, max_masks, 256, dtype=torch.float32, device=device)
     pad_mask = torch.ones(batch_size, max_masks, dtype=torch.bool, device=device)  # True = padding
-    
+
     # Fill in actual embeddings
     for i, item in enumerate(embeddings_list):
         n_masks = len(item['scores'])
@@ -512,5 +810,5 @@ def pad_embeddings_batch(
             emb_tensor = torch.from_numpy(item['emb'].astype(np.float32))
             padded_emb[i, :n_masks] = emb_tensor.to(device)
             pad_mask[i, :n_masks] = False  # Mark as valid (not padding)
-    
+
     return padded_emb, pad_mask

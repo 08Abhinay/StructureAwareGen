@@ -1,0 +1,140 @@
+# Unified Segmentation RDM — I-JEPA Region Embeddings
+# Uses ViT patch tokens pooled per SAM mask (REN-style) instead of SAM encoder features.
+# Embeddings are mean-subtracted and projected to 256-dim.
+
+model:
+  target: rdm.models.diffusion.ddpm.UnifiedSegRDM
+  params:
+    # SAM parameters (embeddings loaded by dataset, not model)
+    max_segments: 250
+    lambda_diversity: 0.05
+    lambda_alignment: 0.05
+    emb_source: "ijepa"  # ViT-pooled region embeddings (not SAM encoder)
+    
+    # With mean-subtracted region embeddings, z-score is not needed
+    normalize_seg_tokens: false
+    
+    # Diffusion parameters
+    timesteps: 1000
+    beta_schedule: "linear"
+    linear_start: 0.0001
+    linear_end: 0.02
+    parameterization: "x0"
+    
+    # Loss weights
+    loss_type: "l2"
+    l_simple_weight: 1.0
+    original_elbo_weight: 0.0
+    learn_logvar: false
+    
+    # Model architecture
+    conditioning_key: null
+    channels: 256
+    image_size: 251  # max_segments + 1 global token
+    
+    # EMA
+    use_ema: true
+    clip_denoised: false
+    
+    # Unified Transformer backbone
+    unet_config:
+      target: rdm.modules.diffusionmodules.unified_transformer.UnifiedSegTransformer
+      params:
+        token_dim: 256
+        d_model: 768
+        n_heads: 12
+        n_layers: 8
+        d_ff: 3072
+        dropout: 0.1
+        max_seq_len: 256
+        time_emb_dim: 256
+    
+    # I-JEPA encoder for global vectors
+    pretrained_enc_config:
+      target: rdm.pretrained_enc.models_pretrained_enc
+      params:
+        pretrained_enc_arch: "ijepa_vit_h14"
+        pretrained_enc_path: "/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/pretrained_enc_ckpts/ijepa/IN1K-vit.h.14-300e.pth.tar"
+        proj_dim: 256
+        pretrained_enc_withproj: false
+    
+    # No conditioning (unconditional)
+    cond_stage_config: "__is_unconditional__"
+    
+    # Scaling
+    input_scale: 1.0
+    scale_factor: 1.0
+    scale_by_std: false
+
+
+# Data configuration — points to I-JEPA region embedding cache
+data:
+  target: rdm.data.seg_dataset.SegmentationMaskDataset
+  params:
+    image_dir: "/scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train"
+    mask_npz_dir: "/scratch/gilbreth/abelde/Thesis/StructureAwareGen/sam_cache_ijepa"
+    max_segments: 250
+    image_size: 256
+    file_ext: "*.JPEG"
+    normalize: true
+    emb_source: "ijepa"
+  
+  batch_size: 32
+  num_workers: 8
+  shuffle: true
+  pin_memory: true
+
+
+# Training configuration
+training:
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  warmup_steps: 5000
+  max_steps: 500000
+  
+  scheduler:
+    target: torch.optim.lr_scheduler.CosineAnnealingLR
+    params:
+      T_max: 500000
+      eta_min: 1.0e-6
+  
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  
+  log_every_n_steps: 100
+  val_check_interval: 5000
+  save_checkpoint_every_n_steps: 10000
+  
+  checkpoint_dir: "checkpoints/unified_seg_rdm_ijepa_embs"
+  resume_from_checkpoint: null
+  
+  num_val_samples: 8
+  use_fp16: true
+  num_gpus: 1
+  strategy: "ddp"
+
+
+# Inference configuration
+inference:
+  num_samples: 16
+  batch_size: 8
+  num_segments: 180
+  ddpm_steps: 1000
+  ddpm_eta: 0.0
+  output_dir: "samples/unified_seg_rdm_ijepa_embs"
+  save_intermediates: false
+  visualize_masks: true
+  visualize_attention: false
+
+
+# Logging
+logging:
+  use_wandb: true
+  wandb_project: "unified-seg-rdm"
+  wandb_entity: null
+  wandb_run_name: "unified-seg-rdm-ijepa-embs-v1"
+  use_tensorboard: true
+  tensorboard_dir: "logs/tensorboard"
+  log_images: true
+  log_gradients: false
+  log_model_architecture: true

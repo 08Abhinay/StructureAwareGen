@@ -83,6 +83,7 @@ def setup_training_loop_kwargs(
     ijepa_npz_dir = None,      # Directory with I-JEPA .npz embeddings: <path>
     max_segments = None,       # Maximum number of segments: <int>, default = 250
     use_seg_embeddings = None, # Use pre-computed segmentation embeddings: <bool>, default = False
+    origin_map_json = None,    # Path to origin_map.json (zip name → original name mapping): <path>
     
     # SAM kwargs (on-the-fly extraction with stochastic conditioning)
     sam_enabled = None,        # Enable SAM extraction: <bool>, default = False
@@ -91,6 +92,25 @@ def setup_training_loop_kwargs(
     sam_cache_dir = None,     # Directory to cache SAM embeddings: <path>
     sam_model_type = None,    # SAM model type: 'vit_b', 'vit_l', 'vit_h', default = 'vit_b'
     sam_max_masks = None,     # Maximum number of masks per image: <int>, default = 250
+    sam_emb_logging = None,   # Enable SAM embedding cache hit/miss logging: <bool>, default = False
+    # AMG parameters (matching precompute_sam_embeddings.py)
+    sam_points_per_side = None,          # AMG points per side: <int>, default = 32
+    sam_pred_iou_thresh = None,          # AMG predicted IoU threshold: <float>, default = 0.82
+    sam_stability_score_thresh = None,   # AMG stability score threshold: <float>, default = 0.85
+    sam_box_nms_thresh = None,           # AMG box NMS threshold: <float>, default = 0.70
+    sam_crop_n_layers = None,            # AMG crop layers: <int>, default = 0
+    sam_dedup_iou_thresh = None,         # IoU threshold for deduplication: <float>, default = 0.95
+    sam_min_mask_region_area = None,     # Minimum mask region area: <int>, default = 100
+    seg_align_tau = None,                # Temperature for contrastive alignment loss: <float>, default = 0.07
+    
+    # RDM mixed training options
+    rdm_checkpoint = None,               # RDM checkpoint for mixed training: <path>
+    rdm_mix_prob = None,                 # Probability of replacing real embeddings with RDM samples: <float>, default = 0.0
+    rdm_warmup_kimg = None,              # Kimg before RDM mixing starts: <float>, default = 10000
+    
+    # Alignment and diversity loss weights
+    lambda_seg_align = None,             # Weight for contrastive alignment loss: <float>, default = 0.1
+    lambda_seg_diversity = None,         # Weight for diversity loss: <float>, default = 0.05
 ):
     args = dnnlib.EasyDict()
     desc = ''
@@ -157,6 +177,7 @@ def setup_training_loop_kwargs(
             path=data,
             sam_npz_dir=sam_npz_dir,
             ijepa_npz_dir=ijepa_npz_dir,
+            origin_map_json=origin_map_json,
             max_segments=max_segments,
             use_labels=True,
             max_size=None,
@@ -165,6 +186,7 @@ def setup_training_loop_kwargs(
         print(f'Using AlignedSegDataset with pre-computed embeddings')
         print(f'  SAM embeddings: {sam_npz_dir}')
         print(f'  I-JEPA embeddings: {ijepa_npz_dir}')
+        print(f'  Origin map: {origin_map_json}')
         print(f'  Max segments: {max_segments}')
     else:
         args.training_set_kwargs = dnnlib.EasyDict(
@@ -276,7 +298,25 @@ def setup_training_loop_kwargs(
         sam_checkpoint=sam_checkpoint,
         sam_cache_dir=sam_cache_dir,
         sam_model_type=sam_model_type if sam_model_type is not None else 'vit_b',
-        sam_max_masks=sam_max_masks if sam_max_masks is not None else 250
+        sam_max_masks=sam_max_masks if sam_max_masks is not None else 250,
+        sam_emb_logging=sam_emb_logging if sam_emb_logging is not None else False,
+        # AMG parameters (matching precompute_sam_embeddings.py)
+        sam_points_per_side=sam_points_per_side if sam_points_per_side is not None else 32,
+        sam_pred_iou_thresh=sam_pred_iou_thresh if sam_pred_iou_thresh is not None else 0.82,
+        sam_stability_score_thresh=sam_stability_score_thresh if sam_stability_score_thresh is not None else 0.85,
+        sam_box_nms_thresh=sam_box_nms_thresh if sam_box_nms_thresh is not None else 0.70,
+        sam_crop_n_layers=sam_crop_n_layers if sam_crop_n_layers is not None else 0,
+        sam_dedup_iou_thresh=sam_dedup_iou_thresh if sam_dedup_iou_thresh is not None else 0.95,
+        sam_min_mask_region_area=sam_min_mask_region_area if sam_min_mask_region_area is not None else 100,
+        seg_align_tau=seg_align_tau if seg_align_tau is not None else 0.07,
+        lambda_seg_align=lambda_seg_align if lambda_seg_align is not None else 0.1,
+        lambda_seg_diversity=lambda_seg_diversity if lambda_seg_diversity is not None else 0.05,
+        # Origin map for SAMExtractor cache path alignment with AlignedSegDataset
+        origin_map_json=origin_map_json,
+        # RDM mixed training (read by training_loop.py, not the Loss class)
+        rdm_checkpoint=rdm_checkpoint,
+        rdm_mix_prob=rdm_mix_prob if rdm_mix_prob is not None else 0.0,
+        rdm_warmup_kimg=rdm_warmup_kimg if rdm_warmup_kimg is not None else 10000,
     )
     
     args.total_kimg = spec.kimg
@@ -551,14 +591,34 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--ijepa-npz-dir', help='Directory with I-JEPA .npz embeddings', metavar='DIR', type=str)
 @click.option('--max-segments', help='Maximum number of segments', metavar='INT', type=int, default=250, show_default=True)
 @click.option('--use-seg-embeddings/--no-seg-embeddings', help='Use pre-computed segmentation embeddings', default=False, show_default=True)
+@click.option('--origin-map-json', help='Path to origin_map.json (maps zip filenames to original image stems for NPZ lookup)', metavar='PATH', type=str)
 
 # SAM on-the-fly extraction options
 @click.option('--sam-enabled', help='Enable on-the-fly SAM extraction with stochastic conditioning', type=bool, default=False, show_default=True)
 @click.option('--sam-prob', help='Probability of using SAM per batch (stochastic conditioning)', type=float, default=0.25, show_default=True)
 @click.option('--sam-checkpoint', help='Path to SAM checkpoint file (e.g., sam_vit_b_01ec64.pth)', metavar='PATH', type=str)
-@click.option('--sam-cache-dir', help='Directory to cache SAM embeddings', metavar='DIR', type=str)
+@click.option('--sam-cache-dir', help='Directory to cache SAM embeddings (unified cache, same as precompute output_dir)', metavar='DIR', type=str)
 @click.option('--sam-model-type', help='SAM model type', type=click.Choice(['vit_b', 'vit_l', 'vit_h']), default='vit_b', show_default=True)
 @click.option('--sam-max-masks', help='Maximum number of SAM masks per image', type=int, default=250, show_default=True)
+@click.option('--sam-emb-logging', help='Enable SAM embedding cache hit/miss logging', type=bool, default=False, show_default=True)
+# AMG parameters (matching precompute_sam_embeddings.py)
+@click.option('--sam-points-per-side', help='AMG points per side for mask generation', type=int, default=32, show_default=True)
+@click.option('--sam-pred-iou-thresh', help='AMG predicted IoU threshold', type=float, default=0.82, show_default=True)
+@click.option('--sam-stability-score-thresh', help='AMG stability score threshold', type=float, default=0.85, show_default=True)
+@click.option('--sam-box-nms-thresh', help='AMG box NMS threshold', type=float, default=0.70, show_default=True)
+@click.option('--sam-crop-n-layers', help='AMG crop layers', type=int, default=0, show_default=True)
+@click.option('--sam-dedup-iou-thresh', help='IoU threshold for greedy mask deduplication', type=float, default=0.95, show_default=True)
+@click.option('--sam-min-mask-region-area', help='Minimum mask region area (post-processing)', type=int, default=100, show_default=True)
+@click.option('--seg-align-tau', help='Temperature for contrastive alignment loss (InfoNCE)', type=float, default=0.07, show_default=True)
+
+# RDM mixed training options
+@click.option('--rdm-checkpoint', help='RDM checkpoint for mixed training (Stage-1 model)', metavar='PATH', type=str)
+@click.option('--rdm-mix-prob', help='Probability of replacing real embeddings with RDM samples', type=float, default=0.0, show_default=True)
+@click.option('--rdm-warmup-kimg', help='Kimg of real-only training before RDM mixing begins', type=float, default=10000, show_default=True)
+
+# Alignment and diversity loss weights
+@click.option('--lambda-seg-align', help='Weight for contrastive alignment loss (InfoNCE)', type=float, default=0.1, show_default=True)
+@click.option('--lambda-seg-diversity', help='Weight for segment diversity loss (-log det)', type=float, default=0.05, show_default=True)
 
 
 def main(ctx, outdir, dry_run, **config_kwargs):

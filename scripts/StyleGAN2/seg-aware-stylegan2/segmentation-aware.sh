@@ -21,9 +21,21 @@ DATA_PATH="/scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/256/chest_x
 OUT_BASE="/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/StyleGAN2/seg-aware-stylegan2/outputs/Chest"
 IJEPA_CKPT="/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/pretrained_enc_ckpts/ijepa/IN1K-vit.h.14-300e.pth.tar"
 
+# ---- Pre-computed embedding directories ----
+SAM_NPZ_DIR="/scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/256/sam_embeddings"
+IJEPA_NPZ_DIR="/scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/256/ijepa_embeddings"
+
+# ---- RDM mixed training (Stage-1 checkpoint) ----
+# Set RDM_CKPT to enable mixed training; leave empty to disable
+RDM_CKPT=""  # e.g. "/scratch/gilbreth/abelde/Thesis/.../seg_rdm_epoch_200.pt"
+RDM_MIX_PROB="0.3"
+RDM_WARMUP_KIMG="10000"
+
 # ---- Hyperparams ----
 SEM_MIX="0.9"
 FUSION_ALPHA="0.2"
+LAMBDA_SEG_ALIGN="0.1"
+LAMBDA_SEG_DIVERSITY="0.05"
 
 # ---- Resources ----
 GPUS=1   # must match #SBATCH --gpus-per-node
@@ -68,6 +80,14 @@ python train.py \
   --ijepa_warmup_kimg 5.4 \
   --sem_mixing_prob "${SEM_MIX}" \
   --fusion_alpha "${FUSION_ALPHA}" \
+  --use-seg-embeddings \
+  --sam-npz-dir "${SAM_NPZ_DIR}" \
+  --ijepa-npz-dir "${IJEPA_NPZ_DIR}" \
+  --lambda-seg-align "${LAMBDA_SEG_ALIGN}" \
+  --lambda-seg-diversity "${LAMBDA_SEG_DIVERSITY}" \
+  ${RDM_CKPT:+--rdm-checkpoint "${RDM_CKPT}"} \
+  ${RDM_CKPT:+--rdm-mix-prob "${RDM_MIX_PROB}"} \
+  ${RDM_CKPT:+--rdm-warmup-kimg "${RDM_WARMUP_KIMG}"} \
   --resume noresume
 
 

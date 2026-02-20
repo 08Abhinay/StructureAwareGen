@@ -1,15 +1,15 @@
 #!/bin/bash
 #SBATCH -A pfw-cs
-#SBATCH -p training
-#SBATCH -q training
+#SBATCH -p a30
+#SBATCH -q standby
 #SBATCH --job-name=SAM_emb_extract
-#SBATCH --nodes=1
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=32
+#SBATCH --gpus-per-node=2
+#SBATCH --cpus-per-task=16
 #SBATCH --mem-per-gpu=80G
-#SBATCH --time=24:00:00
-#SBATCH --constraint=J
+#SBATCH --time=04:00:00
+
 #SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/sam_embeddings.out
 #SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/sam_embeddings.err
 
@@ -33,9 +33,9 @@ echo "Starting SAM embedding extraction..."
 echo "Using 1 node with 4 GPUs for 40% of ImageNet"
 echo "Master node: $MASTER_ADDR:$MASTER_PORT"
 
-torchrun \
-    --nnodes=1 \
-    --nproc_per_node=4 \
+srun torchrun \
+    --nnodes=2 \
+    --nproc_per_node=2 \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
     --rdzv_id=$SLURM_JOB_ID \

@@ -126,12 +126,16 @@ def train_one_epoch_seg(model: torch.nn.Module,
             util.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
         # Move batch dict to device
-        # batch keys: image, seg_embs, num_segments, scores, filename
+        # batch keys: image, seg_embs, num_segments, scores, filename, [emb_image_mean], [ijepa_emb]
         batch_device = {
             'image': batch['image'].to(device, non_blocking=True),
             'seg_embs': batch['seg_embs'].to(device, non_blocking=True),
             'num_segments': batch['num_segments'].to(device, non_blocking=True),
         }
+
+        # Add per-image mean (from mean-subtracted region embeddings)
+        if 'emb_image_mean' in batch:
+            batch_device['emb_image_mean'] = batch['emb_image_mean'].to(device, non_blocking=True)
 
         # Add IJEPA embeddings if available (for cached mode)
         if 'ijepa_emb' in batch:

@@ -67,7 +67,7 @@ def open_image_folder(source_dir, *, max_images: Optional[int]):
             img   = np.array(PIL.Image.open(path))
             label = class_to_id[path.parent.name]
 
-            yield dict(img=img, label=label)
+            yield dict(img=img, label=label, rel_path=rel)
             if idx >= max_idx-1:
                 break
 
@@ -534,7 +534,30 @@ def convert_dataset(
         'labels': labels if all(x is not None for x in labels) else None
     }
     save_bytes(os.path.join(archive_root_dir, 'dataset.json'), json.dumps(metadata))
+
+    # Build and save origin_map.json (maps zip filenames -> original image stems for NPZ lookup)
+    origin_map = {}
+    for idx, image, _img in temp_images:
+        rel_path = image.get('rel_path')
+        if rel_path is not None:
+            idx_str = f'{idx:08d}'
+            archive_fname = f'{idx_str[:5]}/img{idx_str}.png'
+            rel_p = Path(rel_path)
+            origin_map[archive_fname] = str(rel_p.parent / rel_p.stem)
+
+    if origin_map:
+        save_bytes(os.path.join(archive_root_dir, 'origin_map.json'), json.dumps(origin_map))
+        print(f"Saved origin_map.json with {len(origin_map)} entries (inside archive)")
+
     close_dest()
+
+    # Also save origin_map.json as external file next to the destination for training CLI
+    if origin_map:
+        dest_dir = os.path.dirname(os.path.abspath(dest))
+        ext_map_path = os.path.join(dest_dir, 'origin_map.json')
+        with open(ext_map_path, 'w') as f:
+            json.dump(origin_map, f)
+        print(f"Also saved external origin_map.json -> {ext_map_path}")
 
 if __name__ == "__main__":
     convert_dataset() # pylint: disable=no-value-for-parameter

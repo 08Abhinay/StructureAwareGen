@@ -32,89 +32,132 @@ class RDMSampler:
         self._load_checkpoint(rdm_checkpoint_path)
         
     def _load_checkpoint(self, checkpoint_path):
-        """Load RDM model from checkpoint."""
+        """Load RDM model from checkpoint.
+
+        Expected checkpoint keys (produced by SEG-RDM main_rdm.py):
+            config   – full OmegaConf dict with model.target / model.params
+            model    – raw model state_dict
+            model_ema – EMA state_dict (or None)
+            args, optimizer, epoch, scaler – training metadata
+        """
         # Add SEG-RDM to path
         seg_rdm_path = Path(__file__).parent.parent.parent.parent / 'SEG-RDM'
         if str(seg_rdm_path) not in sys.path:
             sys.path.insert(0, str(seg_rdm_path))
-        
+
         try:
-            from rdm.models.diffusion.ddpm import UnifiedSegRDM
             from rdm.models.diffusion.ddim import DDIMSampler
+            from rdm.util import instantiate_from_config
+            from omegaconf import OmegaConf
         except ImportError as e:
             raise ImportError(
                 f"Failed to import SEG-RDM modules. Make sure {seg_rdm_path} exists. Error: {e}"
             )
-        
+
         # Load checkpoint
         ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+        # --- Retrieve or reconstruct config ------------------------------------------------
+        config = ckpt.get('config')
         
-        # Handle different checkpoint formats
-        if 'model' in ckpt:
-            state_dict = ckpt['model']
-        elif 'model_state_dict' in ckpt:
-            state_dict = ckpt['model_state_dict']
-        elif 'state_dict' in ckpt:
-            state_dict = ckpt['state_dict']
-        else:
-            state_dict = ckpt
-        
-        # Extract model config (if available)
-        if 'config' in ckpt:
-            config = ckpt['config']
-        elif 'args' in ckpt and hasattr(ckpt['args'], 'max_segments'):
-            # Extract from args (SEG-RDM checkpoint format)
-            max_segments = ckpt['args'].max_segments
-            print(f"Extracted max_segments={max_segments} from checkpoint args")
+        if config is None:
+            # Old checkpoint format without embedded config
+            # Manually construct the model config for UnifiedSegRDM
+            print("[RDM] Old checkpoint format detected (no 'config' key). Building config manually...")
+            
             config = {
                 'model': {
+                    'target': 'rdm.models.diffusion.ddpm.UnifiedSegRDM',
                     'params': {
-                        'channels': 256,
-                        'max_segments': max_segments,
-                    }
-                }
-            }
-        else:
-            # Use default config
-            print("Warning: No config found in checkpoint, using defaults")
-            config = {
-                'model': {
-                    'params': {
-                        'channels': 256,
+                        # UnifiedSegRDM specific params
                         'max_segments': 250,
+                        'lambda_diversity': 0.1,
+                        'lambda_alignment': 0.05,
+                        
+                        # Diffusion parameters
+                        'timesteps': 1000,
+                        'beta_schedule': 'linear',
+                        'linear_start': 0.0001,
+                        'linear_end': 0.02,
+                        'parameterization': 'x0',
+                        
+                        # Loss weights
+                        'loss_type': 'l2',
+                        'l_simple_weight': 1.0,
+                        'original_elbo_weight': 0.0,
+                        'learn_logvar': False,
+                        
+                        # Model architecture
+                        'conditioning_key': None,
+                        'channels': 256,
+                        'image_size': 251,
+                        
+                        # EMA and checkpointing
+                        'use_ema': True,
+                        'clip_denoised': False,
+                        
+                        # Unified Transformer backbone
+                        'unet_config': {
+                            'target': 'rdm.modules.diffusionmodules.unified_transformer.UnifiedSegTransformer',
+                            'params': {
+                                'token_dim': 256,
+                                'd_model': 768,
+                                'n_heads': 12,
+                                'n_layers': 8,
+                                'd_ff': 3072,
+                                'dropout': 0.1,
+                                'max_seq_len': 256,
+                                'time_emb_dim': 256,
+                            }
+                        },
+                        
+                        # Skip pretrained encoder (not needed for sampling)
+                        'pretrained_enc_config': None,
+                        'cond_stage_config': '__is_unconditional__',
+                        
+                        # Scaling
+                        'input_scale': 1.0,
+                        'scale_factor': 1.0,
+                        'scale_by_std': False,
                     }
                 }
             }
+            print("[RDM] Using default UnifiedSegRDM architecture")
         
-        # Instantiate model
-        # Note: You may need to adjust this based on your checkpoint structure
-        from rdm.util import instantiate_from_config
-        
-        if 'model' in config:
-            self.model = instantiate_from_config(config['model'])
-        else:
-            # Fallback: create model with default params
-            self.model = UnifiedSegRDM(
-                timesteps=1000,
-                channels=256,
-                max_segments=250,
-                # Add other required params
-            )
-        
-        # Load state dict
-        if self.use_ema and 'model_ema' in ckpt:
-            print("Using EMA weights")
+        # Convert plain dict back to OmegaConf for attribute access
+        # (checkpoint saves as plain dict via OmegaConf.to_container())
+        if isinstance(config, dict):
+            config = OmegaConf.create(config)
+
+        # --- Instantiate model from config -----------------------------------
+        # Remove pretrained_enc_config so the 630M I-JEPA encoder is NOT
+        # loaded at inference time (we only need the diffusion backbone).
+        model_cfg = config['model']
+        if 'params' in model_cfg and 'pretrained_enc_config' in model_cfg.get('params', {}):
+            if model_cfg['params']['pretrained_enc_config'] is not None:
+                model_cfg['params']['pretrained_enc_config'] = None
+                print("[RDM] Skipping pretrained encoder init (not needed for sampling)")
+
+        self.model = instantiate_from_config(model_cfg)
+
+        # --- Load weights ----------------------------------------------------
+        if self.use_ema and ckpt.get('model_ema') is not None:
+            print("[RDM] Loading EMA weights")
             self.model.load_state_dict(ckpt['model_ema'], strict=False)
+        elif 'model' in ckpt:
+            print("[RDM] Loading raw model weights")
+            self.model.load_state_dict(ckpt['model'], strict=False)
         else:
-            self.model.load_state_dict(state_dict, strict=False)
-        
+            raise RuntimeError("Checkpoint contains neither 'model' nor 'model_ema' state_dict.")
+
         self.model = self.model.to(self.device)
         self.model.eval()
-        
+
         # Create DDIM sampler for fast sampling
         self.ddim_sampler = DDIMSampler(self.model)
-        
-        print(f"RDM model loaded successfully (EMA: {self.use_ema})")
+
+        epoch = ckpt.get('epoch', '?')
+        print(f"[RDM] Model loaded successfully (epoch={epoch}, EMA={self.use_ema})")
     
     @torch.no_grad()
     def sample(self, batch_size=1, num_segments=180, cond=None, use_ddim=True):
@@ -129,7 +172,7 @@ class RDMSampler:
             
         Returns:
             dict with keys:
-                'global_vectors': [batch_size, 256] global I-JEPA embeddings
+                'global_vec': [batch_size, 256] global I-JEPA embeddings
                 'seg_tokens': [batch_size, num_segments, 256] SAM segment embeddings
                 'num_segments': [batch_size] actual segment counts (all = num_segments)
         """
@@ -166,7 +209,7 @@ class RDMSampler:
         num_segments_arr = torch.full((batch_size,), num_segments, dtype=torch.long)
         
         return {
-            'global_vectors': global_vectors,
+            'global_vec': global_vectors,
             'seg_tokens': seg_tokens,
             'num_segments': num_segments_arr,
         }
@@ -197,12 +240,12 @@ class RDMSampler:
                 num_segments=num_segments,
                 use_ddim=True
             )
-            all_global.append(samples['global_vectors'])
+            all_global.append(samples['global_vec'])
             all_seg.append(samples['seg_tokens'])
         
         # Concatenate
         cache = {
-            'global_vectors': torch.cat(all_global, dim=0),  # [cache_size, 256]
+            'global_vec': torch.cat(all_global, dim=0),  # [cache_size, 256]
             'seg_tokens': torch.cat(all_seg, dim=0),  # [cache_size, num_segments, 256]
         }
         
@@ -252,7 +295,7 @@ class CachedRDMSampler:
             self._refresh_cache()
         
         # Get batch from cache
-        global_batch = self.cache['global_vectors'][
+        global_batch = self.cache['global_vec'][
             self.current_idx:self.current_idx + batch_size
         ]
         seg_batch = self.cache['seg_tokens'][
@@ -262,7 +305,7 @@ class CachedRDMSampler:
         self.current_idx += batch_size
         
         return {
-            'global_vectors': global_batch,
+            'global_vec': global_batch,
             'seg_tokens': seg_batch,
             'num_segments': torch.full((batch_size,), self.num_segments, dtype=torch.long),
         }
@@ -281,10 +324,10 @@ if __name__ == '__main__':
     # Sample embeddings
     samples = sampler.sample(batch_size=4, num_segments=180)
     
-    print("Global vectors:", samples['global_vectors'].shape)  # [4, 256]
+    print("Global vectors:", samples['global_vec'].shape)  # [4, 256]
     print("Segment tokens:", samples['seg_tokens'].shape)  # [4, 180, 256]
     
     # Use cached sampler for efficient training
     cached_sampler = CachedRDMSampler(sampler, cache_size=500)
     batch = cached_sampler.sample(batch_size=8)
-    print("Cached batch:", batch['global_vectors'].shape)
+    print("Cached batch:", batch['global_vec'].shape)

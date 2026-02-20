@@ -929,8 +929,11 @@ class UnifiedSegRDM(RDM):
     Uses pre-computed SAM embeddings instead of computing them during training.
     """
     
-    def __init__(self, seg_npz_dir: str = None, max_segments: int = 250, 
+    def __init__(self, seg_npz_dir: str = None, max_segments: int = 250,
                  lambda_diversity: float = 0.1, lambda_alignment: float = 0.05,
+                 train_align_projection: bool = False,
+                 normalize_seg_tokens: bool = False,
+                 emb_source: str = "sam",
                  *args, **kwargs):
         """
         Args:
@@ -938,16 +941,35 @@ class UnifiedSegRDM(RDM):
             max_segments: Maximum number of segments (for padding)
             lambda_diversity: Weight for diversity loss (default: 0.1)
             lambda_alignment: Weight for alignment loss (default: 0.05)
+            train_align_projection: Whether to train alignment projection parameters.
+            normalize_seg_tokens: Whether to z-score SAM tokens before diffusion.
+            emb_source: Embedding source ("sam", "ijepa", "dinov2", "dino").
+                        When not "sam", expects 'emb_image_mean' in batch and
+                        skips z-score normalisation (embeddings already residualised).
         """
         super().__init__(*args, **kwargs)
         self.seg_npz_dir = seg_npz_dir
         self.max_segments = max_segments
         self.lambda_diversity = lambda_diversity
         self.lambda_alignment = lambda_alignment
+        self.train_align_projection = train_align_projection
+        self.normalize_seg_tokens = normalize_seg_tokens
+        self.emb_source = emb_source
         self.first_stage_key = "image"
         print(f"UnifiedSegRDM: max_segments={max_segments}, seg_npz_dir={seg_npz_dir}")
         print(f"  Diversity loss weight: {lambda_diversity}")
         print(f"  Alignment loss weight: {lambda_alignment}")
+        print(f"  Normalize SAM tokens: {normalize_seg_tokens}")
+        print(f"  Embedding source: {emb_source}")
+
+        # Alignment projection starts as identity so frozen mode behaves like legacy alignment.
+        self.seg_align_proj = nn.Linear(self.channels, self.channels, bias=False)
+        nn.init.eye_(self.seg_align_proj.weight)
+        self.seg_align_proj.requires_grad_(train_align_projection)
+        print(
+            f"  Alignment projection: {self.channels} -> {self.channels} "
+            f"(trainable={train_align_projection})"
+        )
         
     def _to_diffusion_format(self, tokens: torch.Tensor) -> torch.Tensor:
         """Convert [B, N, C] to [B, C, 1, N] for DDPM compatibility."""
@@ -961,54 +983,62 @@ class UnifiedSegRDM(RDM):
         """
         Diversity loss: -log det(C + εI) encourages diverse segment embeddings.
         Prevents collapse where all masks encode the same information.
-        
+
+        Tokens are L2-normalised first so eigenvalues live in [0, 1] and
+        the log-determinant is divided by the embedding dimension C to make
+        the loss scale-invariant (otherwise it grows ∝ C ≈ 256).
+
         Args:
             seg_tokens: [B, N_seg, C] segment embeddings (excluding global token)
             padding_mask: [B, N_seg+1] boolean mask (True = padded), includes global
             eps: Small constant for numerical stability
-            
+
         Returns:
             Scalar diversity loss (higher = more collapsed)
         """
         import torch.nn.functional as F
-        
+
         B, N, C = seg_tokens.shape
-        
+
         # Remove padding
         if padding_mask is not None:
             mask = ~padding_mask[:, 1:]  # Exclude global token position
         else:
             mask = torch.ones(B, N, dtype=torch.bool, device=seg_tokens.device)
-        
+
         losses = []
         for i in range(B):
             valid_tokens = seg_tokens[i, mask[i]]  # [N_valid, C]
             if valid_tokens.shape[0] < 2:
                 continue  # Need at least 2 tokens for covariance
-            
+
+            # L2-normalise so covariance eigenvalues are bounded in [0, 1]
+            valid_tokens = F.normalize(valid_tokens, dim=1)
+
             # Compute covariance matrix
             mean = valid_tokens.mean(dim=0, keepdim=True)  # [1, C]
             centered = valid_tokens - mean  # [N_valid, C]
             cov = (centered.T @ centered) / valid_tokens.shape[0]  # [C, C]
-            
+
             # Regularize and compute log determinant
             cov_reg = cov + eps * torch.eye(C, device=cov.device)
-            
+
             # Use slogdet for numerical stability
             sign, logdet = torch.slogdet(cov_reg)
             if sign > 0:  # Only use if positive definite
-                losses.append(-logdet)
-        
+                # Normalise by dimension so loss doesn't scale with C
+                losses.append(-logdet / C)
+
         return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=seg_tokens.device)
     
     def compute_alignment_loss(self, global_vec, seg_tokens, padding_mask=None, tau=0.07):
         """
         Alignment loss: Encourages global and segment embeddings to be semantically aligned.
-        Uses InfoNCE-style contrastive loss.
+        Uses InfoNCE-style contrastive loss with an optional linear projection.
         
         Args:
-            global_vec: [B, C] global I-JEPA embeddings
-            seg_tokens: [B, N_seg, C] segment SAM embeddings
+            global_vec: [B, C] global I-JEPA embeddings (reconstructed)
+            seg_tokens: [B, N_seg, C] segment SAM embeddings (reconstructed)
             padding_mask: [B, N_seg+1] boolean mask (True = padded)
             tau: Temperature for contrastive loss
             
@@ -1019,11 +1049,15 @@ class UnifiedSegRDM(RDM):
         
         B, N, C = seg_tokens.shape
         
-        # L2 normalize
-        global_norm = F.normalize(global_vec, dim=1)  # [B, C]
-        seg_norm = F.normalize(seg_tokens, dim=2)  # [B, N, C]
+        # Project both streams into shared alignment space.
+        global_proj = self.seg_align_proj(global_vec)  # [B, C]
+        seg_proj = self.seg_align_proj(seg_tokens.reshape(B * N, C)).reshape(B, N, C)  # [B, N, C]
         
-        # Compute similarities: global[i] with all segments
+        # L2 normalize in projected space
+        global_norm = F.normalize(global_proj, dim=1)  # [B, C]
+        seg_norm = F.normalize(seg_proj, dim=2)  # [B, N, C]
+        
+        # Compute similarities: global[i] with all segments (temperature-scaled)
         sim = torch.einsum('bc,bnc->bn', global_norm, seg_norm) / tau  # [B, N]
         
         # Apply padding mask
@@ -1038,25 +1072,29 @@ class UnifiedSegRDM(RDM):
         else:
             pos_sim = sim.mean(dim=1)  # [B]
         
-        # Negative: cross-image similarities (in-batch negatives)
-        # For each sample, compute mean similarity with other samples' segments
-        neg_sims = []
-        for i in range(B):
-            neg_indices = [j for j in range(B) if j != i]
-            if neg_indices:
-                if padding_mask is not None:
-                    mask_neg = ~padding_mask[neg_indices, 1:]  # [B-1, N]
-                    sim_neg = torch.einsum('c,bnc->bn', global_norm[i], seg_norm[neg_indices])  # [B-1, N]
-                    sim_neg = (sim_neg * mask_neg.float()).sum(dim=1) / mask_neg.float().sum(dim=1).clamp(min=1)
-                    neg_sims.append(sim_neg.mean())
-                else:
-                    sim_neg = torch.einsum('c,bnc->bn', global_norm[i], seg_norm[neg_indices]).mean()
-                    neg_sims.append(sim_neg)
+        # Negative: cross-image similarities (vectorized, temperature-scaled)
+        # Build full cross-similarity matrix: [B, B, N]
+        cross_sim = torch.einsum('id,jnd->ijn', global_norm, seg_norm) / tau  # [B, B, N]
         
-        if not neg_sims:
+        if padding_mask is not None:
+            seg_mask = ~padding_mask[:, 1:]  # [B, N]
+            # Expand mask for cross-sim: mask out padded segments of each target image
+            cross_sim = cross_sim.masked_fill(~seg_mask.unsqueeze(0), -1e9)  # broadcast [1,B,N]
+            mask_float_cross = seg_mask.unsqueeze(0).float()  # [1, B, N]
+            # Mean over valid segments per target image
+            cross_mean = (cross_sim * mask_float_cross).sum(dim=2) / mask_float_cross.sum(dim=2).clamp(min=1)  # [B, B]
+        else:
+            cross_mean = cross_sim.mean(dim=2)  # [B, B]
+        
+        # Exclude self from negatives: set diagonal to -inf, then mean over others
+        diag_mask = torch.eye(B, dtype=torch.bool, device=global_vec.device)
+        cross_mean = cross_mean.masked_fill(diag_mask, -1e9)
+        
+        if B <= 1:
             return torch.tensor(0.0, device=global_vec.device)
         
-        neg_sim = torch.stack(neg_sims)  # [B]
+        # Mean negative sim per sample (over B-1 other images)
+        neg_sim = cross_mean.masked_fill(diag_mask, 0.0).sum(dim=1) / (B - 1)
         
         # InfoNCE loss: -log(exp(pos) / (exp(pos) + exp(neg)))
         loss = -torch.log(
@@ -1140,12 +1178,38 @@ class UnifiedSegRDM(RDM):
             
             global_vec = rep  # [B, 256]
         
-        # Get segmentation tokens from batch (pre-computed SAM embeddings)
+        # Get segmentation tokens from batch (pre-computed embeddings)
         if 'seg_embs' in batch:
             seg_tokens = batch['seg_embs'].to(device)  # [B, max_segments, 256]
             num_segments = batch['num_segments']  # [B] actual segment counts
+            
+            # Determine if we have mean-subtracted region embeddings
+            has_mean = 'emb_image_mean' in batch and batch['emb_image_mean'] is not None
+            
+            if has_mean:
+                # Region embeddings (ijepa/dinov2/dino) are already mean-subtracted
+                # and projected to 256-dim. Just scale to match global token range.
+                emb_image_mean = batch['emb_image_mean'].to(device)  # [B, 256]
+                B_seg = seg_tokens.shape[0]
+                for i in range(B_seg):
+                    n = int(num_segments[i])
+                    if n > 0:
+                        valid = seg_tokens[i, :n, :]  # [n, C]
+                        seg_tokens[i, :n, :] = valid * self.input_scale
+            elif self.normalize_seg_tokens:
+                # Legacy SAM token normalisation (z-score per token).
+                B_seg, _, _ = seg_tokens.shape
+                for i in range(B_seg):
+                    n = int(num_segments[i])
+                    if n > 0:
+                        valid = seg_tokens[i, :n, :]  # [n, C]
+                        seg_std = torch.std(valid, dim=1, keepdim=True).clamp(min=1e-6)  # [n, 1]
+                        seg_mean = torch.mean(valid, dim=1, keepdim=True)  # [n, 1]
+                        seg_tokens[i, :n, :] = (valid - seg_mean) / seg_std * self.input_scale
+            else:
+                emb_image_mean = None
         else:
-            raise ValueError("Batch must contain 'seg_embs' and 'num_segments' from SAM")
+            raise ValueError("Batch must contain 'seg_embs' and 'num_segments'")
             
         # Create padding mask
         B, max_seg, C = seg_tokens.shape
@@ -1191,6 +1255,11 @@ class UnifiedSegRDM(RDM):
             xc = None
             
         out = [x, c, padding_mask]
+        # Stash emb_image_mean on the model for p_losses to use
+        if 'emb_image_mean' in batch and batch['emb_image_mean'] is not None:
+            self._batch_emb_image_mean = batch['emb_image_mean'].to(device)
+        else:
+            self._batch_emb_image_mean = None
         if return_original_cond:
             out.append(xc)
         return out
@@ -1284,6 +1353,13 @@ class UnifiedSegRDM(RDM):
             global_recon = tokens_recon[:, 0, :]  # [B, C]
             seg_recon = tokens_recon[:, 1:, :]  # [B, N, C]
             
+            # For alignment loss with mean-subtracted embeddings,
+            # add the image mean back so global and segment tokens are
+            # in the same absolute space for meaningful comparison.
+            seg_for_align = seg_recon
+            if hasattr(self, '_batch_emb_image_mean') and self._batch_emb_image_mean is not None:
+                seg_for_align = seg_recon + self._batch_emb_image_mean.unsqueeze(1)
+            
             # Compute diversity loss
             if self.lambda_diversity > 0:
                 loss_div = self.compute_diversity_loss(seg_recon, padding_mask)
@@ -1292,7 +1368,7 @@ class UnifiedSegRDM(RDM):
             
             # Compute alignment loss
             if self.lambda_alignment > 0:
-                loss_align = self.compute_alignment_loss(global_recon, seg_recon, padding_mask)
+                loss_align = self.compute_alignment_loss(global_recon, seg_for_align, padding_mask)
                 loss_dict[f'{prefix}/loss_alignment'] = loss_align
                 loss = loss + self.lambda_alignment * loss_align
         

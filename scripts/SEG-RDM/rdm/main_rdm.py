@@ -59,6 +59,10 @@ def get_args_parser():
                         help='Maximum number of segments for padding')
     parser.add_argument('--ijepa_cache_dir', type=str, default=None,
                         help='Optional directory with pre-cached IJEPA embeddings (speeds up training)')
+    parser.add_argument('--emb_source', type=str, default='sam',
+                        choices=['sam', 'ijepa', 'dinov2', 'dino'],
+                        help='Embedding source: sam (SAM encoder), ijepa/dinov2/dino (ViT patch tokens). '
+                             'Non-sam sources expect emb_image_mean in npz for mean-subtracted embeddings.')
 
     # Dataset parameters
     parser.add_argument('--data_path', default='./data/imagenet', type=str,
@@ -175,9 +179,11 @@ def main(args):
             file_ext="*.JPEG",  # ImageNet uses .JPEG
             normalize=True,  # DDPM expects [-1, 1] range
             ijepa_cache_dir=args.ijepa_cache_dir,  # Optional pre-cached IJEPA embeddings
+            emb_source=args.emb_source,  # sam, ijepa, dinov2, dino
         )
         print(f"Using SegmentationMaskDataset: {len(dataset_train)} samples")
-        print(f"  SAM embeddings: {args.mask_npz_dir}")
+        print(f"  Embeddings: {args.mask_npz_dir}")
+        print(f"  emb_source: {args.emb_source}")
         print(f"  max_segments: {args.max_segments}")
         if args.ijepa_cache_dir:
             print(f"  IJEPA cache: {args.ijepa_cache_dir} (pre-cached embeddings)")
@@ -295,6 +301,17 @@ def main(args):
     params = list(model_without_ddp.model.parameters())
     if model_without_ddp.cond_stage_model is not None:
         params += list(model_without_ddp.cond_stage_model.parameters())
+    # Include alignment projection only when trainable.
+    if hasattr(model_without_ddp, 'seg_align_proj'):
+        align_proj_params = [p for p in model_without_ddp.seg_align_proj.parameters() if p.requires_grad]
+        if align_proj_params:
+            params += align_proj_params
+            print(
+                f"  Added seg_align_proj to optimizer "
+                f"({sum(p.numel() for p in align_proj_params)} trainable params)"
+            )
+        else:
+            print("  seg_align_proj is frozen (not added to optimizer)")
     n_params = sum(p.numel() for p in model_without_ddp.parameters() if p.requires_grad)
     print("Number of trainable parameters: {}M".format(n_params / 1e6))
     if global_rank == 0:
@@ -331,14 +348,30 @@ def main(args):
                 log_writer=log_writer,
                 args=args
             )
+        # ---- Extract EMA parameters (if model uses LitEma) ---- #
+        ema_params = None
+        if hasattr(model_without_ddp, 'model_ema') and model_without_ddp.model_ema is not None:
+            ema_module = model_without_ddp.model_ema
+            # LitEma stores buffers with dots stripped from param names.
+            # Reverse-map: s_name (dot-free) -> original dotted name
+            s2m = {v: k for k, v in ema_module.m_name2s_name.items()}
+            buffers = dict(ema_module.named_buffers())
+            ema_params = []
+            for name, _p in model_without_ddp.named_parameters():
+                s_name = ema_module.m_name2s_name.get(name)
+                if s_name is not None and s_name in buffers:
+                    ema_params.append(buffers[s_name])
+                else:
+                    ema_params.append(_p.data)  # fallback: use raw weight
+
         if args.output_dir and (epoch % 25 == 0 or epoch + 1 == args.epochs):
             util.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch)
+                loss_scaler=loss_scaler, epoch=epoch, ema_params=ema_params, config=config)
 
         util.save_model_last(
             args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-            loss_scaler=loss_scaler, epoch=epoch)
+            loss_scaler=loss_scaler, epoch=epoch, ema_params=ema_params, config=config)
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      'epoch': epoch, }
 

@@ -14,6 +14,7 @@ from threading import Thread
 import numpy as np
 import torch
 import torch.distributed as dist
+from omegaconf import OmegaConf
 from rdm.env_debug import print_env
 print_env(__name__, globals())
 
@@ -470,7 +471,7 @@ def get_grad_norm_(parameters, norm_type: float = 2.0) -> torch.Tensor:
     return total_norm
 
 
-def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, ema_params=None):
+def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, ema_params=None, config=None):
     output_dir = os.path.abspath(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
     epoch_name = str(epoch)
@@ -493,6 +494,7 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, em
                 'epoch': epoch,
                 'scaler': loss_scaler.state_dict(),
                 'args': args,
+                'config': OmegaConf.to_container(config, resolve=True) if config is not None else None,
             }
 
             save_on_master(to_save, checkpoint_path)
@@ -502,7 +504,7 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, em
                               client_state=client_state)
 
 
-def save_model_last(args, epoch, model, model_without_ddp, optimizer, loss_scaler, ema_params=None):
+def save_model_last(args, epoch, model, model_without_ddp, optimizer, loss_scaler, ema_params=None, config=None):
     output_dir = os.path.abspath(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
     epoch_name = 'last'
@@ -525,6 +527,7 @@ def save_model_last(args, epoch, model, model_without_ddp, optimizer, loss_scale
                 'epoch': epoch,
                 'scaler': loss_scaler.state_dict(),
                 'args': args,
+                'config': OmegaConf.to_container(config, resolve=True) if config is not None else None,
             }
 
             save_on_master(to_save, checkpoint_path)
@@ -542,13 +545,20 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
         last_path = os.path.join(args.resume, "checkpoint-last.pth")
         if os.path.exists(last_path):
             resume_path = last_path
-    checkpoint = torch.load(resume_path, map_location='cpu')
-    model_without_ddp.load_state_dict(checkpoint['model'])
+    checkpoint = torch.load(resume_path, map_location='cpu', weights_only=False)
+    missing, unexpected = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+    if missing:
+        print(f"[Resume] Missing keys (freshly initialized): {missing}")
+    if unexpected:
+        print(f"[Resume] Unexpected keys (ignored): {unexpected}")
     print("Resume checkpoint %s" % resume_path)
     if 'optimizer' in checkpoint and 'epoch' in checkpoint and not (
         hasattr(args, 'evaluate') and args.evaluate
     ):
-        optimizer.load_state_dict(checkpoint['optimizer'])
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+        except ValueError as err:
+            print(f"[Resume] Skipping optimizer state due to mismatch: {err}")
         args.start_epoch = checkpoint['epoch'] + 1
         if 'scaler' in checkpoint:
             loss_scaler.load_state_dict(checkpoint['scaler'])

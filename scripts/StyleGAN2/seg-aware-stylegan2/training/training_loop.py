@@ -109,8 +109,17 @@ def pre_extract_sam_embeddings(training_set, loss_kwargs, rank, num_gpus, device
             print("[Pre-extract] No image paths found in dataset, skipping")
         return
     
-    # Get subset for this rank
-    rank_paths = extractor._get_rank_subset(all_paths)
+    # Skip pre-extraction for zip datasets (paths contain '::') since
+    # SAM extraction can't open files inside zips directly.
+    # AlignedSegDataset already has pre-computed embeddings so this is fine.
+    if any('::' in str(p) for p in all_paths[:10]):
+        if rank == 0:
+            print("[Pre-extract] Dataset uses zip archive — skipping on-the-fly SAM pre-extraction")
+            print("              (Use pre-computed embeddings via --use-seg-embeddings instead)")
+        return
+    
+    # Split images across GPUs: rank gets every num_gpus-th image
+    rank_paths = all_paths[rank::num_gpus]
     
     if rank == 0:
         print(f"Each GPU will process ~{len(rank_paths)} images")
@@ -322,12 +331,14 @@ def training_loop(
     G_ema = copy.deepcopy(G).eval()
 
     # Resume from existing pickle.
+    _resume_rdm_proj_state = None  # Will be used later to restore rdm_global_proj
     if (resume_pkl is not None) and (rank == 0):
         print(f'Resuming from "{resume_pkl}"')
         with dnnlib.util.open_url(resume_pkl) as f:
             resume_data = legacy.load_network_pkl(f)
         for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
             misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
+        _resume_rdm_proj_state = resume_data.get('rdm_global_proj', None)
 
     # Print network summary tables.
     if rank == 0:
@@ -360,16 +371,29 @@ def training_loop(
             ddp_modules[name] = module
 
     # Setup training phases.
+    # Extract RDM keys from loss_kwargs BEFORE passing to Loss constructor
+    # (StyleGAN2Loss.__init__ doesn't accept these; they're only used by training_loop)
+    rdm_checkpoint = loss_kwargs.pop('rdm_checkpoint', None)
+    rdm_mix_prob = loss_kwargs.pop('rdm_mix_prob', 0.0)
+    rdm_warmup_kimg = loss_kwargs.pop('rdm_warmup_kimg', 10000)
+
+    # Load origin_map for SAMExtractor cache path alignment with AlignedSegDataset
+    _origin_map_json_path = loss_kwargs.pop('origin_map_json', None)
+    _origin_map = None
+    if _origin_map_json_path is not None:
+        import json as _json
+        with open(_origin_map_json_path, 'r') as f:
+            _origin_map = _json.load(f)
+        if rank == 0:
+            print(f'[training_loop] Loaded origin_map ({len(_origin_map)} entries) for SAMExtractor')
+    loss_kwargs['origin_map'] = _origin_map
+
     if rank == 0:
         print('Setting up training phases...')
     loss = dnnlib.util.construct_class_by_name(device=device, **ddp_modules, **loss_kwargs) # subclass of training.loss.Loss
     
     # Initialize RDM sampler for mixed training (if enabled)
     rdm_sampler = None
-    rdm_cache = None
-    rdm_checkpoint = loss_kwargs.get('rdm_checkpoint', None)
-    rdm_mix_prob = loss_kwargs.get('rdm_mix_prob', 0.0)
-    rdm_warmup_kimg = loss_kwargs.get('rdm_warmup_kimg', 10000)
     
     if rdm_checkpoint is not None and rdm_mix_prob > 0:
         if rank == 0:
@@ -388,13 +412,13 @@ def training_loop(
                 ddim_steps=50  # Fast sampling
             )
             
-            # Use cached sampler for efficiency (only on rank 0 for now)
-            if rank == 0:
-                rdm_sampler = CachedRDMSampler(
-                    base_sampler,
-                    cache_size=500,  # Pre-generate 500 samples
-                    num_segments=180
-                )
+            # Initialize cached sampler on ALL ranks so every GPU gets RDM
+            # samples during mixed training (avoids gradient inconsistency)
+            rdm_sampler = CachedRDMSampler(
+                base_sampler,
+                cache_size=500,  # Pre-generate 500 samples
+                num_segments=180
+            )
             
             if rank == 0:
                 print('[RDM] Sampler initialized successfully')
@@ -403,6 +427,32 @@ def training_loop(
                 print(f'[RDM] Warning: Failed to initialize RDM sampler: {e}')
                 print('[RDM] Continuing without RDM mixed training')
             rdm_sampler = None
+    
+    # Learnable projection: RDM outputs 256-dim global_vec, but G/D expect 1280-dim (raw I-JEPA).
+    # This small network is trained end-to-end with G and D during RDM-mixed batches.
+    rdm_global_proj = None
+    rdm_proj_opt = None
+    if rdm_sampler is not None:
+        ijepa_dim = getattr(loss, 'ijepa_out_dim', 1280)
+        rdm_global_proj = torch.nn.Sequential(
+            torch.nn.Linear(256, 512),
+            torch.nn.LeakyReLU(0.2),
+            torch.nn.Linear(512, ijepa_dim),
+        ).to(device).train()
+        # Give the projection its own optimizer (same LR as G)
+        rdm_proj_opt = torch.optim.Adam(rdm_global_proj.parameters(), lr=G_opt_kwargs.get('lr', 0.0025), betas=[0.0, 0.99])
+        if rank == 0:
+            n_proj = sum(p.numel() for p in rdm_global_proj.parameters())
+            print(f'[RDM] Initialized rdm_global_proj (256 -> {ijepa_dim}): {n_proj} params')
+        # Restore from checkpoint if resuming (rank 0 only has the state)
+        if _resume_rdm_proj_state is not None:
+            rdm_global_proj.load_state_dict(_resume_rdm_proj_state)
+            if rank == 0:
+                print('[RDM] Restored rdm_global_proj weights from checkpoint')
+        # Synchronize weights across ranks (either restored or freshly initialized)
+        if num_gpus > 1:
+            for param in rdm_global_proj.parameters():
+                dist.broadcast(param.data, src=0)
     
     phases = []
     for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
@@ -507,20 +557,27 @@ def training_loop(
             
             # RDM Mixed Training: Replace real embeddings with RDM-sampled ones
             # with probability rdm_mix_prob (after warmup)
+            is_rdm_batch = False  # Track whether this batch uses RDM-projected embeddings
             if rdm_sampler is not None and has_seg_data and cur_nimg >= rdm_warmup_kimg * 1000:
                 # Compute current mix probability (gradual ramp-up)
                 progress = (cur_nimg - rdm_warmup_kimg * 1000) / (10000 * 1000)  # Ramp over 10M images
                 current_mix_prob = min(rdm_mix_prob, rdm_mix_prob * progress)
                 
-                # Decide whether to use RDM samples this batch
-                if np.random.rand() < current_mix_prob and rank == 0:
+                # Decide whether to use RDM samples this batch (all ranks)
+                if np.random.rand() < current_mix_prob:
                     try:
-                        # Sample from RDM (only rank 0 for simplicity)
                         rdm_batch = rdm_sampler.sample(batch_size=batch_size)
                         
-                        # Replace real embeddings with RDM-sampled ones
+                        # Replace BOTH global_vec and seg_tokens with RDM samples
                         # Note: We keep real images but use synthetic embeddings for conditioning
                         # This teaches the decoder to handle RDM-sampled embeddings
+                        
+                        # Store raw 256-dim RDM vectors; projection to 1280-dim is
+                        # deferred to the per-phase loop so each phase gets its own
+                        # autograd graph (prevents double-backward crash).
+                        rdm_gv = rdm_batch['global_vec'].to(device)  # [B, 256]
+                        phase_real_global_vec = rdm_gv.split(batch_gpu)
+                        is_rdm_batch = True
                         phase_real_seg_tokens = rdm_batch['seg_tokens'].to(device).split(batch_gpu)
                         
                         # Create padding masks (RDM generates fixed length, no padding)
@@ -557,6 +614,10 @@ def training_loop(
                 # Extract segmentation data for this round if available
                 if has_seg_data:
                     real_global_vec = phase_real_global_vec[round_idx]
+                    # For RDM batches, project 256→1280 here so each phase
+                    # gets its own computation graph (avoids double-backward).
+                    if is_rdm_batch and rdm_global_proj is not None:
+                        real_global_vec = rdm_global_proj(real_global_vec)
                     real_seg_tokens = phase_real_seg_tokens[round_idx]
                     real_seg_pad_mask = phase_real_seg_pad_mask[round_idx]
                 else:
@@ -582,7 +643,8 @@ def training_loop(
                     gain=gain,
                     real_seg_tokens=real_seg_tokens,
                     real_seg_pad_mask=real_seg_pad_mask,
-                    image_paths=round_image_paths
+                    image_paths=round_image_paths,
+                    real_global_vec=real_global_vec,
                 )
 
             # Update weights.
@@ -592,6 +654,10 @@ def training_loop(
                     if param.grad is not None:
                         misc.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
                 phase.opt.step()
+                # Step the RDM projection optimizer alongside G phases
+                if rdm_proj_opt is not None and phase.name.startswith('G'):
+                    rdm_proj_opt.step()
+                    rdm_proj_opt.zero_grad()
             if phase.end_event is not None:
                 phase.end_event.record(torch.cuda.current_stream(device))
 
@@ -663,6 +729,9 @@ def training_loop(
                     module = copy.deepcopy(module).eval().requires_grad_(False).cpu()
                 snapshot_data[name] = module
                 del module # conserve memory
+            # Save rdm_global_proj state if it exists (not a DDP module, save as state_dict)
+            if rdm_global_proj is not None:
+                snapshot_data['rdm_global_proj'] = copy.deepcopy(rdm_global_proj).cpu().state_dict()
             snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
             if rank == 0:
                 with open(snapshot_pkl, 'wb') as f:
