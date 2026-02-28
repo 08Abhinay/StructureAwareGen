@@ -1,0 +1,126 @@
+# Unified Segmentation RDM Configuration with .h5 embeddings
+# Uses centralized .h5 file instead of individual .npz files
+
+model:
+  target: rdm.models.diffusion.ddpm.UnifiedSegRDM
+  params:
+    # SAM parameters (embeddings loaded by dataset, not model)
+    max_segments: 250  # Maximum number of segments (250 from SAM + 1 global = 251 total)
+    lambda_diversity: 0.05  # Diversity loss weight (reduced to avoid over-dominating total loss)
+    lambda_alignment: 0.05  # Alignment loss weight (global-segment consistency)
+    
+    # Diffusion parameters
+    timesteps: 1000
+    beta_schedule: "linear"
+    linear_start: 0.0001
+    linear_end: 0.02
+    parameterization: "x0"  # Predict clean data directly (more stable for features)
+    
+    # Loss weights
+    loss_type: "l2"
+    l_simple_weight: 1.0
+    original_elbo_weight: 0.0
+    learn_logvar: false
+    
+    # Model architecture
+    conditioning_key: null  # Unconditional by default, change to "crossattn" for class conditioning
+    channels: 256  # Token dimension
+    image_size: 251  # Sequence length (max_segments + 1 global token)
+    
+    # EMA and checkpointing
+    use_ema: true
+    clip_denoised: false
+    
+    # Unified Transformer backbone
+    unet_config:
+      target: rdm.modules.diffusionmodules.unified_transformer.UnifiedSegTransformer
+      params:
+        token_dim: 256  # Input/output token dimension (SAM embeddings are 256-dim)
+        d_model: 768  # Transformer hidden dimension (BERT-base size)
+        n_heads: 12  # Number of attention heads
+        n_layers: 8  # Number of transformer blocks (8-12 recommended)
+        d_ff: 3072  # Feedforward dimension (4 * d_model)
+        dropout: 0.1  # Dropout probability
+        max_seq_len: 256  # Maximum sequence length
+        time_emb_dim: 256  # Timestep embedding dimension
+    
+    # I-JEPA encoder for global vectors
+    pretrained_enc_config:
+      target: rdm.pretrained_enc.models_pretrained_enc
+      params:
+        pretrained_enc_arch: "ijepa_vit_h14"  # I-JEPA ViT-H/14
+        pretrained_enc_path: "/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/pretrained_enc_ckpts/ijepa/IN1K-vit.h.14-300e.pth.tar"
+        proj_dim: 256  # Project I-JEPA output to 256-dim
+        pretrained_enc_withproj: false
+    
+    # No conditioning (unconditional)
+    cond_stage_config: "__is_unconditional__"
+    
+    # Scaling
+    input_scale: 1.0
+    scale_factor: 1.0
+    scale_by_std: false
+
+
+# Data configuration
+data:
+  target: rdm.data.seg_dataset.SegmentationMaskDataset
+  params:
+    # Image directory
+    image_dir: "/scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train"
+    
+    # H5 file configuration (NEW!)
+    h5_path: "/scratch/gilbreth/abelde/Thesis/StructureAwareGen/ijepa_embeddings.h5"
+    h5_key_format: "{class_id}/{name}"  # Adjust based on your h5 structure
+    
+    # Fallback npz directory (will be used if h5 loading fails)
+    mask_npz_dir: "/scratch/gilbreth/abelde/Thesis/StructureAwareGen/sam_cache_unified"
+    
+    max_segments: 250
+    image_size: 256
+    file_ext: "*.JPEG"  # ImageNet uses .JPEG (uppercase)
+    normalize: true  # Normalize to [-1, 1] for DDPM
+  
+  # DataLoader settings
+  batch_size: 32
+  num_workers: 8
+  shuffle: true
+  pin_memory: true
+
+
+# Training configuration
+training:
+  # Optimization
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  warmup_steps: 5000
+  max_steps: 500000
+  
+  # Learning rate schedule
+  scheduler:
+    target: torch.optim.lr_scheduler.CosineAnnealingLR
+    params:
+      T_max: 500000
+  
+  # Gradient clipping
+  gradient_clip_val: 1.0
+  
+  # Mixed precision
+  use_fp16: true
+  
+  # Logging
+  log_every_n_steps: 100
+  val_check_interval: 5000
+  
+  # Checkpointing
+  save_every_n_steps: 10000
+  keep_n_checkpoints: 5
+
+
+# Logging configuration
+logging:
+  log_dir: "rdm/rdm_out"
+  wandb:
+    project: "unified-seg-rdm"
+    name: "h5-embeddings"
+    enabled: true

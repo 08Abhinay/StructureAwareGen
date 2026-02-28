@@ -2,15 +2,16 @@
 #SBATCH -A pfw-cs
 #SBATCH -p a30
 #SBATCH -q standby
-#SBATCH --job-name=ijepa_and_seg_aware
+#SBATCH --job-name=RDM-train
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=2
-#SBATCH --cpus-per-task=10
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=16
 #SBATCH --mem-per-gpu=80G
 #SBATCH --time=04:00:00
-#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/%x-%j.out
-#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/%x-%j.err
+
+#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/ijepa_and_seg_aware-local/%x-%j.out
+#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/ijepa_and_seg_aware-local/%x-%j.err
 
 
 PROJECT_ROOT="/scratch/gilbreth/abelde/Thesis/StructureAwareGen"
@@ -18,12 +19,18 @@ SEG_RDM_ROOT="${PROJECT_ROOT}/scripts/SEG-RDM"
 RDM_ROOT="${SEG_RDM_ROOT}/rdm"
 
 # Change this one path only when switching experiment output location.
-RUN_DIR="${RDM_ROOT}/rdm_out_final/2_nodes/a30/batch_64/ijepa_and_seg_aware"
+RUN_DIR="${RDM_ROOT}/rdm_out_final/IJEPA_local_feat/a30/2_nodes/"
 
 module load anaconda
 conda activate "${PROJECT_ROOT}/SegmentationAwareGen"
 
-export OMP_NUM_THREADS=$((SLURM_CPUS_PER_TASK / 2))
+# Prevent CPU oversubscription stalls that can trigger NCCL collective timeouts.
+export OMP_NUM_THREADS=2
+export MKL_NUM_THREADS=2
+export OPENBLAS_NUM_THREADS=2
+export NUMEXPR_NUM_THREADS=2
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
 
 cd "${SEG_RDM_ROOT}"
 export PYTHONPATH="$PWD:$PYTHONPATH"
@@ -43,25 +50,30 @@ fi
 TORCHRUN_CMD=(
   torchrun
   --nnodes="$SLURM_NNODES"
-  --nproc_per_node=2
+  --nproc_per_node=1
   --node_rank="$SLURM_PROCID"
   --rdzv_backend=c10d
   --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT"
   --rdzv_id="$SLURM_JOB_ID"
   -m rdm.main_rdm
-  --config "${RDM_ROOT}/configs/unified_seg_rdm.yaml"
+  --config "${RDM_ROOT}/configs/unified_seg_rdm_region_ijepa.yaml"
   --input_size 256
-  --blr 1e-6
+  --blr 5e-7
+  --min_lr 1e-6
+  --cosine_lr
+  --warmup_epochs 5
   --weight_decay 0.01
   --epochs 200
-  --batch_size 16
-  --accum_iter 4
+  --batch_size 32
+  --accum_iter 1
+  --num_workers 4
   --output_dir "${RUN_DIR}"
   --log_dir "${RUN_DIR}"
   --data_path "${PROJECT_ROOT}/dataset/imagenet-1K-hf"
   --use_seg_dataset
-  --mask_npz_dir "${PROJECT_ROOT}/sam_cache_unified"
-  --ijepa_cache_dir "${PROJECT_ROOT}/ijepa_embeddings"
+  --h5_path "${PROJECT_ROOT}/h5_embeddings/region_emb_flat.h5"
+  --ijepa_h5_path "${PROJECT_ROOT}/h5_embeddings/ijepa_emb_flat.h5"
+  --ijepa_lookup_json "${PROJECT_ROOT}/h5_embeddings/ijepa_lookup.json"
   --max_segments 250
 )
 

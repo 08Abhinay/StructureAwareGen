@@ -58,11 +58,24 @@ def get_args_parser():
     parser.add_argument('--max_segments', type=int, default=250,
                         help='Maximum number of segments for padding')
     parser.add_argument('--ijepa_cache_dir', type=str, default=None,
-                        help='Optional directory with pre-cached IJEPA embeddings (speeds up training)')
+                        help='Optional directory with pre-cached IJEPA embeddings in NPZ format (speeds up training)')
     parser.add_argument('--emb_source', type=str, default='sam',
-                        choices=['sam', 'ijepa', 'dinov2', 'dino'],
-                        help='Embedding source: sam (SAM encoder), ijepa/dinov2/dino (ViT patch tokens). '
+                        choices=['sam', 'ijepa', 'dinov2', 'dino', 'region'],
+                        help='Embedding source: sam (SAM encoder), ijepa/dinov2/dino (ViT patch tokens), '
+                             'region (region embeddings with mean subtraction). '
                              'Non-sam sources expect emb_image_mean in npz for mean-subtracted embeddings.')
+    
+    # H5 file support for embeddings
+    parser.add_argument('--h5_path', type=str, default=None,
+                        help='Optional path to centralized .h5 file containing main embeddings (alternative to NPZ files)')
+    parser.add_argument('--h5_key_format', type=str, default='{class_id}/{name}',
+                        help='Format string for h5 keys, e.g., "{class_id}/{name}" or "{name}"')
+    parser.add_argument('--ijepa_h5_path', type=str, default=None,
+                        help='Optional path to .h5 file containing IJEPA embeddings (alternative to ijepa_cache_dir)')
+    parser.add_argument('--ijepa_h5_key_format', type=str, default='{class_id}/{name}',
+                        help='Format string for IJEPA h5 keys')
+    parser.add_argument('--ijepa_lookup_json', type=str, default=None,
+                        help='Path to JSON lookup for flat IJEPA h5 (maps class_id/name -> row index)')
 
     # Dataset parameters
     parser.add_argument('--data_path', default='./data/imagenet', type=str,
@@ -166,9 +179,9 @@ def main(args):
         # Import SegmentationMaskDataset
         from rdm.data.seg_dataset import SegmentationMaskDataset
         
-        # Validate required arguments
-        if args.mask_npz_dir is None:
-            raise ValueError("--mask_npz_dir must be specified when --use_seg_dataset is True")
+        # Validate: need either h5_path or mask_npz_dir
+        if args.mask_npz_dir is None and args.h5_path is None:
+            raise ValueError("--mask_npz_dir or --h5_path must be specified when --use_seg_dataset is True")
         
         # Create segmentation dataset (will filter to only images with SAM embeddings)
         dataset_train = SegmentationMaskDataset(
@@ -178,15 +191,24 @@ def main(args):
             image_size=args.input_size,
             file_ext="*.JPEG",  # ImageNet uses .JPEG
             normalize=True,  # DDPM expects [-1, 1] range
-            ijepa_cache_dir=args.ijepa_cache_dir,  # Optional pre-cached IJEPA embeddings
-            emb_source=args.emb_source,  # sam, ijepa, dinov2, dino
+            ijepa_cache_dir=args.ijepa_cache_dir,  # Optional pre-cached IJEPA embeddings (NPZ)
+            emb_source=args.emb_source,  # sam, ijepa, dinov2, dino, region
+            h5_path=args.h5_path,  # Optional H5 file for main embeddings
+            h5_key_format=args.h5_key_format,  # H5 key format
+            ijepa_h5_path=args.ijepa_h5_path,  # Optional H5 file for IJEPA embeddings
+            ijepa_h5_key_format=args.ijepa_h5_key_format,  # IJEPA H5 key format
+            ijepa_lookup_json=getattr(args, 'ijepa_lookup_json', None),  # Flat IJEPA lookup
         )
         print(f"Using SegmentationMaskDataset: {len(dataset_train)} samples")
-        print(f"  Embeddings: {args.mask_npz_dir}")
+        print(f"  Main embeddings: {args.mask_npz_dir}")
+        if args.h5_path:
+            print(f"  Main H5 file: {args.h5_path}")
         print(f"  emb_source: {args.emb_source}")
         print(f"  max_segments: {args.max_segments}")
-        if args.ijepa_cache_dir:
-            print(f"  IJEPA cache: {args.ijepa_cache_dir} (pre-cached embeddings)")
+        if args.ijepa_h5_path:
+            print(f"  IJEPA cache (H5): {args.ijepa_h5_path}")
+        elif args.ijepa_cache_dir:
+            print(f"  IJEPA cache (NPZ): {args.ijepa_cache_dir}")
         else:
             print(f"  IJEPA cache: None (runtime extraction)")
         

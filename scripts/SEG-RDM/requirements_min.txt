@@ -6,3 +6,5 @@ einops>=0.6
 numpy>=1.23
 tqdm>=4.65
 tensorboard>=2.12
+h5py>=3.0
+pillow>=9.0

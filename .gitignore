@@ -3,6 +3,7 @@ CNN-JEPA/jepa-cnn/
 ijepa-main/ijepa-env/
 ijepa-main/logs/
 SegmentationAwareGen
+paper/
 *.ckpt
 __pycache__
 *.pyc
@@ -70,7 +71,8 @@ ENV/
 *.github/
 scripts/rcg
 *JPEG
-*tex
+# Don't ignore .tex source files - only LaTeX build artifacts
+# *tex  <-- REMOVED: This was ignoring your paper source files!
 # Wandb logs
 wandb/
 

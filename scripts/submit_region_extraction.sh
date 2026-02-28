@@ -3,18 +3,18 @@
 #SBATCH -p a30
 #SBATCH -q standby
 #SBATCH --job-name=region_emb_extract
-#SBATCH --nodes=2
+#SBATCH --nodes=6
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem-per-gpu=80G
 #SBATCH --time=04:00:00
 
-#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/region_emb_extract.out
-#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/region_emb_extract.err
 
-set -e
-set -o pipefail
+
+#SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/region_emb_extract-a100-0.65dedup.out
+#SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/region_emb_extract-a100-0.65dedup.err
+
 
 module load anaconda
 conda activate /scratch/gilbreth/abelde/Thesis/StructureAwareGen/SegmentationAwareGen
@@ -30,7 +30,7 @@ BACKBONE=${BACKBONE:-"ijepa_vit_h14"}
 # Output directory is named after backbone
 case $BACKBONE in
     ijepa_vit_h14)
-        OUTPUT_DIR="/scratch/gilbreth/abelde/Thesis/StructureAwareGen/sam_cache_ijepa"
+        OUTPUT_DIR="/scratch/gilbreth/abelde/Thesis/StructureAwareGen/region_emb_extract-a100-0.65dedup"
         EXTRA_ARGS="--ijepa_checkpoint /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/pretrained_enc_ckpts/ijepa/IN1K-vit.h.14-300e.pth.tar"
         ;;
     dinov2_vitl14)
@@ -59,7 +59,7 @@ echo "Nodes: $SLURM_NNODES, GPUs/node: $SLURM_GPUS_PER_NODE"
 echo "===================================="
 
 srun torchrun \
-    --nnodes=2 \
+    --nnodes=6 \
     --nproc_per_node=2 \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
@@ -77,7 +77,7 @@ srun torchrun \
       --crop_n_layers 0 \
       --max_keep 100 \
       --pred_iou_thresh 0.82 \
-      --dedup_iou_thresh 0.50
+      --dedup_iou_thresh 0.65
 
 echo "Region embedding extraction finished!"
 echo "Backbone: $BACKBONE -> $OUTPUT_DIR"
