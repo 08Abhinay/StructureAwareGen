@@ -1129,8 +1129,12 @@ class UnifiedSegRDM(RDM):
         x_img = x_img.to(memory_format=torch.contiguous_format).float()
         device = x_img.device
         
-        # Check if pre-cached IJEPA embeddings are available in batch
-        if 'ijepa_emb' in batch and batch['ijepa_emb'] is not None:
+        # Check if pre-cached MoCo CLS embeddings are available (already 256-dim, z-score normalised)
+        if 'cls_emb' in batch and batch['cls_emb'] is not None:
+            # MoCo CLS token — already projected to 256-dim and z-score normalized
+            # during extraction (precompute_region_embeddings_h5.py)
+            global_vec = batch['cls_emb'].to(device) * self.input_scale  # [B, 256]
+        elif 'ijepa_emb' in batch and batch['ijepa_emb'] is not None:
             # Use pre-cached embeddings (much faster!)
             rep = batch['ijepa_emb'].to(device)  # [B, 1280] raw ViT-H/14 dimension
             

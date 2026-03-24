@@ -36,9 +36,22 @@ class StyleGAN2Loss(Loss):
                  sam_enabled=False, sam_prob=0.25, sam_checkpoint=None,
                  sam_cache_dir=None, sam_model_type='vit_b', sam_max_masks=250,
                  sam_emb_logging=False,
+                 sam_emb_source='sam_encoder',
+                 sam_region_backbone='ijepa_vit_h14',
+                 sam_region_ijepa_checkpoint=None,
+                 sam_region_proj_path=None,
+                 sam_region_max_keep=100,
+                 sam_region_dedup_iou_thresh=0.65,
+                 sam_region_min_quality_score=0.75,
+                 sam_region_min_area_frac=0.001,
+                 sam_region_max_area_frac=0.85,
+                 sam_region_mean_subtract=False,
+                 sam_h5_delta_dir=None,
+                 sam_preextract=False,
                  # AMG parameters (matching precompute_sam_embeddings.py)
                  sam_points_per_side=32, sam_pred_iou_thresh=0.82,
                  sam_stability_score_thresh=0.85, sam_box_nms_thresh=0.70,
+                 sam_crop_overlap_ratio=0.35, sam_crop_n_points_downscale=2,
                  sam_crop_n_layers=0, sam_dedup_iou_thresh=0.95,
                  sam_min_mask_region_area=100,
                  lambda_seg_align=0.1, lambda_seg_diversity=0.05,
@@ -98,8 +111,24 @@ class StyleGAN2Loss(Loss):
                 crop_n_layers=sam_crop_n_layers,
                 dedup_iou_thresh=sam_dedup_iou_thresh,
                 min_mask_region_area=sam_min_mask_region_area,
+                crop_overlap_ratio=sam_crop_overlap_ratio,
+                crop_n_points_downscale=sam_crop_n_points_downscale,
+                embedding_mode=sam_emb_source,
+                region_backbone=sam_region_backbone,
+                region_ijepa_checkpoint=sam_region_ijepa_checkpoint,
+                region_proj_path=sam_region_proj_path,
+                region_max_keep=sam_region_max_keep,
+                region_dedup_iou_thresh=sam_region_dedup_iou_thresh,
+                region_min_quality_score=sam_region_min_quality_score,
+                region_min_area_frac=sam_region_min_area_frac,
+                region_max_area_frac=sam_region_max_area_frac,
+                region_mean_subtract=sam_region_mean_subtract,
+                h5_delta_dir=sam_h5_delta_dir,
             )
-            print(f"[Loss] SAM extractor enabled with prob={sam_prob}, logging={sam_emb_logging}")
+            print(
+                f"[Loss] SAM extractor enabled with prob={sam_prob}, logging={sam_emb_logging}, "
+                f"source={sam_emb_source}"
+            )
         
         # Separate RNG for SAM decisions (independent of training seed)
         self.sam_rng = random.Random(42)

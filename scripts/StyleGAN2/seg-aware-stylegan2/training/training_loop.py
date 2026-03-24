@@ -67,6 +67,8 @@ def pre_extract_sam_embeddings(training_set, loss_kwargs, rank, num_gpus, device
     # Check if SAM is enabled
     if not loss_kwargs.get('sam_enabled', False):
         return
+    if not loss_kwargs.get('sam_preextract', False):
+        return
     
     sam_checkpoint = loss_kwargs.get('sam_checkpoint')
     sam_cache_dir = loss_kwargs.get('sam_cache_dir')
@@ -81,6 +83,18 @@ def pre_extract_sam_embeddings(training_set, loss_kwargs, rank, num_gpus, device
         print(f"Pre-extracting SAM embeddings across {num_gpus} GPU(s)...")
         print(f"Total images: {len(training_set)}")
         print(f"Cache directory: {sam_cache_dir}")
+
+    origin_map = loss_kwargs.get('origin_map')
+    if origin_map is None and loss_kwargs.get('origin_map_json') is not None:
+        try:
+            with open(loss_kwargs.get('origin_map_json'), 'r') as f:
+                origin_map = json.load(f)
+            if rank == 0:
+                print(f"[Pre-extract] Loaded origin_map ({len(origin_map)} entries)")
+        except Exception as e:
+            if rank == 0:
+                print(f"[Pre-extract] Failed to load origin_map_json: {e}")
+            origin_map = None
     
     # Create SAM extractor
     extractor = SAMExtractor(
@@ -90,7 +104,21 @@ def pre_extract_sam_embeddings(training_set, loss_kwargs, rank, num_gpus, device
         model_type=loss_kwargs.get('sam_model_type', 'vit_b'),
         max_masks=loss_kwargs.get('sam_max_masks', 250),
         rank=rank,
-        world_size=num_gpus
+        world_size=num_gpus,
+        embedding_mode=loss_kwargs.get('sam_emb_source', 'sam_encoder'),
+        region_backbone=loss_kwargs.get('sam_region_backbone', 'ijepa_vit_h14'),
+        region_ijepa_checkpoint=loss_kwargs.get('sam_region_ijepa_checkpoint'),
+        region_proj_path=loss_kwargs.get('sam_region_proj_path'),
+        region_max_keep=loss_kwargs.get('sam_region_max_keep', 100),
+        region_dedup_iou_thresh=loss_kwargs.get('sam_region_dedup_iou_thresh', 0.65),
+        region_min_quality_score=loss_kwargs.get('sam_region_min_quality_score', 0.75),
+        region_min_area_frac=loss_kwargs.get('sam_region_min_area_frac', 0.001),
+        region_max_area_frac=loss_kwargs.get('sam_region_max_area_frac', 0.85),
+        region_mean_subtract=loss_kwargs.get('sam_region_mean_subtract', False),
+        crop_overlap_ratio=loss_kwargs.get('sam_crop_overlap_ratio', 0.35),
+        crop_n_points_downscale=loss_kwargs.get('sam_crop_n_points_downscale', 2),
+        h5_delta_dir=loss_kwargs.get('sam_h5_delta_dir'),
+        origin_map=origin_map,
     )
     
     # Collect all image paths
@@ -319,7 +347,7 @@ def training_loop(
         print('Label shape:', training_set.label_shape)
         print()
     
-    # Pre-extract SAM embeddings if enabled (parallel across GPUs)
+    # Pre-extract SAM embeddings if enabled and requested (parallel across GPUs)
     pre_extract_sam_embeddings(training_set, loss_kwargs, rank, num_gpus, device)
     
     # Construct networks.

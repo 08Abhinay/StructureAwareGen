@@ -618,6 +618,10 @@ def main():
 
     # Runtime
     parser.add_argument('--skip_existing', action='store_true', default=True)
+    parser.add_argument('--start_index', type=int, default=0,
+                        help='Start index (inclusive) in globally sorted image list')
+    parser.add_argument('--end_index', type=int, default=-1,
+                        help='End index (exclusive) in globally sorted image list, -1 means all')
     parser.add_argument('--max_images', type=int, default=-1)
     parser.add_argument('--subset_fraction', type=float, default=1.0)
     parser.add_argument('--seed', type=int, default=42)
@@ -681,6 +685,16 @@ def main():
         if rank == 0:
             print("No images found!")
         return
+
+    # ---- Optional index slicing ----
+    if args.start_index > 0 or args.end_index >= 0:
+        start = max(0, int(args.start_index))
+        end = len(image_paths) if args.end_index < 0 else min(len(image_paths), int(args.end_index))
+        if end < start:
+            end = start
+        image_paths = image_paths[start:end]
+        if rank == 0:
+            print(f"Applied index slice: [{start}:{end}] -> {len(image_paths)} images")
 
     # ---- Stratified subset selection ----
     if args.subset_fraction < 1.0:

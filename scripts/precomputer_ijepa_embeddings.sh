@@ -20,19 +20,20 @@ conda activate /scratch/gilbreth/abelde/Thesis/StructureAwareGen/SegmentationAwa
 
 which python
 
-# python /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/precompute_ijepa_embeddings.py \
-#      --image_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train \
-#      --output_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/output_dir/ijepa_embeddings \
-#      --ijepa_checkpoint /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/pretrained_enc_ckpts/ijepa/IN1K-vit.h.14-300e.pth.tar \
-#      --batch_size 64 \
-#      --num_workers 24
+python /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/precompute_ijepa_embeddings.py \
+     --image_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train \
+     --output_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/output_dir/ijepa_embeddings \
+     --ijepa_checkpoint /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/pretrained_enc_ckpts/ijepa/IN1K-vit.h.14-300e.pth.tar \
+     --batch_size 64 \
+     --num_workers 24
 
 # echo "Finished!"
 echo "Verifying!"
 
-python scripts/verify_data_alignment.py \
-     --image_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train \
-     --sam_npz_dir ... --ijepa_npz_dir ...
+# python scripts/verify_data_alignment.py \
+#      --image_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train \
+#      --sam_npz_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/output_dir/sam_npz \
+#      --ijepa_npz_dir /scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/output_dir/ijepa_embeddings
 
 
 

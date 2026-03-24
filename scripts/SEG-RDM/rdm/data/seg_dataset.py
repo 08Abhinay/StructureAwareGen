@@ -46,6 +46,7 @@ class SegmentationMaskDataset(Dataset):
         ijepa_h5_path: Optional[str] = None,
         ijepa_h5_key_format: str = "{class_id}/{name}",
         ijepa_lookup_json: Optional[str] = None,
+        cls_from_external_h5: bool = False,
     ):
         """
         Args:
@@ -63,6 +64,8 @@ class SegmentationMaskDataset(Dataset):
             ijepa_h5_path: Optional path to .h5 file containing IJEPA embeddings (alternative to ijepa_cache_dir)
             ijepa_h5_key_format: Format string for IJEPA h5 keys
             ijepa_lookup_json: Optional path to JSON lookup for flat IJEPA h5 (maps 'class_id/name' -> row index)
+            cls_from_external_h5: If True, route external H5 embeddings as 'cls_emb' instead of 'ijepa_emb'
+                                  (for MoCo CLS 256d pre-normalised vectors that bypass projection/z-score in ddpm.py)
         """
         self.image_dir = image_dir
         self.mask_npz_dir = mask_npz_dir
@@ -76,6 +79,7 @@ class SegmentationMaskDataset(Dataset):
         self.ijepa_h5_path = ijepa_h5_path
         self.ijepa_h5_key_format = ijepa_h5_key_format
         self.ijepa_lookup_json = ijepa_lookup_json
+        self.cls_from_external_h5 = cls_from_external_h5
         self.h5_file = None
         self.ijepa_h5_file = None
         self._h5_is_flat = False
@@ -377,7 +381,18 @@ class SegmentationMaskDataset(Dataset):
                         seg_masks = torch.from_numpy(masks_flat.reshape(N, H, W)).bool()
 
                 N_actual = embs.shape[0]
-                emb_dim = embs.shape[1] if embs.dim() == 2 else 256
+                emb_dim = embs.shape[1] if embs.dim() == 2 else 1024
+
+                # ── Deterministic token sorting ──
+                # SAM region order is arbitrary; sort by area (desc) then
+                # score (desc) then bbox_y (asc) so learned positional
+                # embeddings see a stable, semantically meaningful ordering.
+                if N_actual > 1 and 'areas' in data:
+                    sort_idx = self._sort_token_order(data)
+                    embs = embs[sort_idx]
+                    scores = scores[sort_idx]
+                    if seg_masks is not None:
+                        seg_masks = seg_masks[sort_idx]
 
                 # Load per-image mean if present (from region embedding extraction)
                 emb_image_mean = None
@@ -422,7 +437,7 @@ class SegmentationMaskDataset(Dataset):
                 f"ERROR: failed to load valid embeddings after {max_retries} attempts "
                 f"(start idx={idx}). Last error: {last_error}. Using dummy embeddings."
             )
-            seg_embs = torch.zeros(self.max_segments, 256)
+            seg_embs = torch.zeros(self.max_segments, 1024)
             num_segments = 0
             scores = torch.zeros(0)
             seg_masks = None
@@ -482,15 +497,55 @@ class SegmentationMaskDataset(Dataset):
         if emb_image_mean is not None:
             output['emb_image_mean'] = emb_image_mean  # [256]
         
-        # Add IJEPA embedding if loaded from cache
+        # Add MoCo CLS embedding if present in region H5
+        if 'cls_emb' in data:
+            cls_emb_data = data['cls_emb']
+            if isinstance(cls_emb_data, np.ndarray):
+                output['cls_emb'] = torch.from_numpy(np.array(cls_emb_data)).float()  # [256]
+            else:
+                output['cls_emb'] = torch.tensor(cls_emb_data).float()  # [256]
+        
+        # Add external embedding (IJEPA or MoCo CLS) if loaded from cache
         if ijepa_emb is not None:
-            output['ijepa_emb'] = ijepa_emb  # [1280] raw ViT-H/14 dimension
+            if self.cls_from_external_h5:
+                # MoCo CLS: already 256d & z-score normalised → use cls_emb path
+                # (ddpm.py applies input_scale only, no projection/z-score)
+                output['cls_emb'] = ijepa_emb
+            else:
+                output['ijepa_emb'] = ijepa_emb  # [1280] raw ViT-H/14 dimension
         
         if seg_masks is not None:
             output['seg_masks'] = seg_masks
         
         return output
-    
+
+    @staticmethod
+    def _sort_token_order(data: Dict) -> torch.LongTensor:
+        """
+        Compute a deterministic sort order for region tokens.
+
+        Sorting keys (applied via np.lexsort, last key is primary):
+            1. area  — descending (largest regions first)
+            2. score — descending (higher quality first)
+            3. bbox_y — ascending  (top-to-bottom tie-break)
+
+        Returns:
+            LongTensor of indices that would sort the tokens.
+        """
+        areas = np.asarray(data['areas'], dtype=np.float32)
+        scores = np.asarray(data.get('scores', np.ones_like(areas)),
+                            dtype=np.float32)
+        # bbox_y: second element of XYWH (index 1)
+        if 'bboxes' in data:
+            bboxes = np.asarray(data['bboxes'], dtype=np.float32)
+            bbox_y = bboxes[:, 1] if bboxes.ndim == 2 else np.zeros_like(areas)
+        else:
+            bbox_y = np.zeros_like(areas)
+
+        # np.lexsort: last key is primary. Negate for descending.
+        order = np.lexsort((bbox_y, -scores, -areas))
+        return torch.from_numpy(order).long()
+
     def _load_from_h5(self, img_path: str, name: str) -> Dict:
         """
         Load embeddings from centralized h5 file.
@@ -547,13 +602,17 @@ class SegmentationMaskDataset(Dataset):
         Load embeddings from flat H5 file using offset-based indexing.
         
         Flat H5 layout:
-            emb          [N_total, 256]   float32  – all segment embeddings concatenated
-            scores       [N_total]        float32
-            offsets      [n_samples]      int64    – start offset into emb/scores
-            n_segments   [n_samples]      int32
-            class_ids    [n_samples]      int32
-            names        [n_samples]      string
-            mask_shapes  [n_samples, 3]   int32    – (N, H, W) per image
+            emb              [N_total, 256]   float32  – all segment embeddings concatenated
+            scores           [N_total]        float32
+            areas            [N_total]        float32  – mask area in pixels
+            bboxes           [N_total, 4]     float32  – XYWH bounding boxes
+            pred_ious        [N_total]        float32
+            stability_scores [N_total]        float32
+            offsets          [n_samples]      int64    – start offset into emb/scores
+            n_segments       [n_samples]      int32
+            class_ids        [n_samples]      int32
+            names            [n_samples]      string
+            mask_shapes      [n_samples, 3]   int32    – (N, H, W) per image
         
         Args:
             img_path: Path to the image file (used to extract class_id)
@@ -579,6 +638,14 @@ class SegmentationMaskDataset(Dataset):
             'scores': self.h5_file['scores'][off:off + ns],    # (ns,)     float32
             'shape':  self.h5_file['mask_shapes'][idx],        # (3,)      int32
         }
+        # Load per-segment metadata for deterministic token sorting
+        if 'areas' in self.h5_file:
+            result['areas'] = self.h5_file['areas'][off:off + ns]    # (ns,) float32
+        if 'bboxes' in self.h5_file:
+            result['bboxes'] = self.h5_file['bboxes'][off:off + ns]  # (ns, 4) float32
+        # MoCo H5 files contain a pre-projected, z-score normalised CLS token
+        if 'cls_emb' in self.h5_file:
+            result['cls_emb'] = self.h5_file['cls_emb'][idx]   # (256,) float32
         return result
     
     def _load_from_flat_ijepa_h5(self, class_id: str, name: str) -> Dict:
@@ -769,6 +836,10 @@ def collate_seg_batch(batch):
     # Add per-image mean if present (for mean-subtracted region embeddings)
     if 'emb_image_mean' in batch[0]:
         output['emb_image_mean'] = torch.stack([item['emb_image_mean'] for item in batch])
+    
+    # Add pre-cached MoCo CLS embeddings if present
+    if 'cls_emb' in batch[0]:
+        output['cls_emb'] = torch.stack([item['cls_emb'] for item in batch])
     
     # Add pre-cached IJEPA embeddings if present
     if 'ijepa_emb' in batch[0]:

@@ -76,6 +76,9 @@ def get_args_parser():
                         help='Format string for IJEPA h5 keys')
     parser.add_argument('--ijepa_lookup_json', type=str, default=None,
                         help='Path to JSON lookup for flat IJEPA h5 (maps class_id/name -> row index)')
+    parser.add_argument('--cls_from_external_h5', action='store_true',
+                        help='Route external H5 embeddings as cls_emb instead of ijepa_emb '
+                             '(for MoCo CLS 256d pre-normalised vectors)')
 
     # Dataset parameters
     parser.add_argument('--data_path', default='./data/imagenet', type=str,
@@ -198,6 +201,7 @@ def main(args):
             ijepa_h5_path=args.ijepa_h5_path,  # Optional H5 file for IJEPA embeddings
             ijepa_h5_key_format=args.ijepa_h5_key_format,  # IJEPA H5 key format
             ijepa_lookup_json=getattr(args, 'ijepa_lookup_json', None),  # Flat IJEPA lookup
+            cls_from_external_h5=getattr(args, 'cls_from_external_h5', False),  # Route as cls_emb
         )
         print(f"Using SegmentationMaskDataset: {len(dataset_train)} samples")
         print(f"  Main embeddings: {args.mask_npz_dir}")

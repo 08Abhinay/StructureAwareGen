@@ -1,0 +1,128 @@
+# Unified Segmentation RDM Configuration — MoCo v3 ViT-L
+# Uses pre-extracted MoCo region + CLS embeddings from single H5 file.
+# Both global_vec (CLS) and seg_tokens (regions) come from MoCo v3 ViT-L backbone → 1024-dim.
+
+model:
+  target: rdm.models.diffusion.ddpm.UnifiedSegRDM
+  params:
+    # SAM parameters (embeddings loaded by dataset, not model)
+    max_segments: 250  # Maximum segments per image (250 regions + 1 global = 251 total)
+    lambda_diversity: 0.05  # Diversity loss weight
+    lambda_alignment: 0.05  # Alignment loss weight (global-segment consistency)
+
+    # Diffusion parameters
+    timesteps: 1000
+    beta_schedule: "linear"
+    linear_start: 0.0001
+    linear_end: 0.02
+    parameterization: "x0"  # Predict clean data directly (more stable for features)
+
+    # Loss weights
+    loss_type: "l2"
+    l_simple_weight: 1.0
+    original_elbo_weight: 0.0
+    learn_logvar: false
+
+    # Model architecture
+    conditioning_key: null  # Unconditional
+    channels: 1024  # Token dimension (MoCo backbone features, 1024-dim for ViT-L)
+    image_size: 251  # Sequence length (max_segments + 1 global token)
+
+    # EMA and checkpointing
+    use_ema: true
+    clip_denoised: false
+
+    # Unified Transformer backbone
+    unet_config:
+      target: rdm.modules.diffusionmodules.unified_transformer.UnifiedSegTransformer
+      params:
+        token_dim: 1024  # Input/output token dimension (backbone)
+        d_model: 768  # Transformer hidden dimension
+        n_heads: 12
+        n_layers: 8
+        d_ff: 3072  # 4 * d_model
+        dropout: 0.1
+        max_seq_len: 256
+        time_emb_dim: 1024
+
+    # MoCo v3 ViT-L encoder (fallback for runtime extraction if cls_emb missing)
+    pretrained_enc_config:
+      target: rdm.pretrained_enc.models_pretrained_enc
+      params:
+        pretrained_enc_arch: "mocov3_vit_large"
+        pretrained_enc_path: "/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/pretrained_enc_ckpts/mocov3/vitl.pth.tar"
+        proj_dim: 1024
+        pretrained_enc_withproj: false  # Use raw backbone CLS (1024-dim)
+
+    # No conditioning (unconditional generation)
+    cond_stage_config: "__is_unconditional__"
+
+    # Scaling — applied to both global_vec and seg_tokens
+    input_scale: 1.0
+    scale_factor: 1.0
+    scale_by_std: false
+
+
+# Data configuration
+data:
+  target: rdm.data.seg_dataset.SegmentationMaskDataset
+  params:
+    # Image directory (ImageNet-1K train)
+    image_dir: "/scratch/gilbreth/abelde/Thesis/StructureAwareGen/dataset/imagenet-1K-hf/train"
+
+    # MoCo H5 file — contains both region embeddings AND cls_emb
+    h5_path: "/scratch/gilbreth/abelde/Thesis/StructureAwareGen/h5_embeddings/region_moco_flat.h5"
+
+    # No separate IJEPA H5 needed — CLS comes from the same MoCo H5 via cls_emb
+    # ijepa_h5_path: null
+    # ijepa_lookup_json: null
+
+    max_segments: 250
+    image_size: 256
+    file_ext: "*.JPEG"
+    normalize: true  # Normalize images to [-1, 1] for DDPM
+    emb_source: "mocov3"  # Tag for logging/debugging
+
+  # DataLoader settings
+  batch_size: 32
+  num_workers: 8
+  shuffle: true
+  pin_memory: true
+
+
+# Training configuration
+training:
+  # Optimization
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  warmup_steps: 5000
+  max_steps: 500000
+
+  # Learning rate schedule
+  scheduler:
+    target: torch.optim.lr_scheduler.CosineAnnealingLR
+    params:
+      T_max: 500000
+
+  # Gradient clipping
+  gradient_clip_val: 1.0
+
+  # Mixed precision
+  use_fp16: true
+
+  # Logging
+  log_every_n_steps: 100
+  val_check_interval: 5000
+
+  # Checkpointing
+  save_every_n_steps: 10000
+  keep_n_checkpoints: 5
+
+
+# Logging configuration
+logging:
+  log_dir: "rdm/rdm_out_moco"
+  wandb:
+    project: "unified-seg-rdm"
+    name: "moco-v3-vitl"
+    enabled: true

@@ -81,6 +81,9 @@ def setup_training_loop_kwargs(
     # Segmentation options (pre-computed embeddings)
     sam_npz_dir = None,        # Directory with SAM .npz embeddings: <path>
     ijepa_npz_dir = None,      # Directory with I-JEPA .npz embeddings: <path>
+    sam_h5_path = None,        # Flat SAM H5 embeddings (region_emb_flat.h5): <path>
+    ijepa_h5_path = None,      # Flat I-JEPA H5 embeddings (ijepa_emb_flat.h5): <path>
+    ijepa_lookup_json = None,  # Lookup JSON for flat I-JEPA H5 (class/name -> row): <path>
     max_segments = None,       # Maximum number of segments: <int>, default = 250
     use_seg_embeddings = None, # Use pre-computed segmentation embeddings: <bool>, default = False
     origin_map_json = None,    # Path to origin_map.json (zip name → original name mapping): <path>
@@ -93,6 +96,20 @@ def setup_training_loop_kwargs(
     sam_model_type = None,    # SAM model type: 'vit_b', 'vit_l', 'vit_h', default = 'vit_b'
     sam_max_masks = None,     # Maximum number of masks per image: <int>, default = 250
     sam_emb_logging = None,   # Enable SAM embedding cache hit/miss logging: <bool>, default = False
+    sam_emb_source = None,    # Embedding source: 'sam_encoder' | 'region_vit'
+    sam_region_backbone = None,           # Region mode backbone: ijepa_vit_h14|dinov2_vitl14|dino_vitb8
+    sam_region_ijepa_checkpoint = None,   # I-JEPA checkpoint for region mode
+    sam_region_proj_path = None,          # Projection path for region mode
+    sam_region_max_keep = None,           # Max regions to keep in region mode
+    sam_region_dedup_iou_thresh = None,   # Region-mode dedup threshold
+    sam_region_min_quality_score = None,  # Region-mode min quality score
+    sam_region_min_area_frac = None,      # Region-mode min area fraction
+    sam_region_max_area_frac = None,      # Region-mode max area fraction
+    sam_region_mean_subtract = None,      # Region-mode mean subtraction
+    sam_crop_overlap_ratio = None,        # AMG crop overlap ratio (region mode parity)
+    sam_crop_n_points_downscale = None,   # AMG crop points downscale factor (region mode parity)
+    sam_h5_delta_dir = None,              # Optional per-rank delta H5 write directory
+    sam_preextract = None,                # Pre-extract all SAM embeddings at startup
     # AMG parameters (matching precompute_sam_embeddings.py)
     sam_points_per_side = None,          # AMG points per side: <int>, default = 32
     sam_pred_iou_thresh = None,          # AMG predicted IoU threshold: <float>, default = 0.82
@@ -169,14 +186,23 @@ def setup_training_loop_kwargs(
         max_segments = 250
     
     if use_seg_embeddings:
-        if sam_npz_dir is None or ijepa_npz_dir is None:
-            raise UserError('--use-seg-embeddings requires --sam-npz-dir and --ijepa-npz-dir')
+        has_sam_source = (sam_npz_dir is not None) or (sam_h5_path is not None)
+        has_ijepa_source = (ijepa_npz_dir is not None) or (ijepa_h5_path is not None)
+        if not has_sam_source:
+            raise UserError('--use-seg-embeddings requires at least one SAM source: --sam-npz-dir or --sam-h5-path')
+        if not has_ijepa_source:
+            raise UserError('--use-seg-embeddings requires at least one I-JEPA source: --ijepa-npz-dir or --ijepa-h5-path')
+        if ijepa_h5_path is not None and ijepa_lookup_json is None:
+            raise UserError('--ijepa-h5-path requires --ijepa-lookup-json')
         
         args.training_set_kwargs = dnnlib.EasyDict(
             class_name='training.aligned_seg_dataset.AlignedSegDataset',
             path=data,
             sam_npz_dir=sam_npz_dir,
             ijepa_npz_dir=ijepa_npz_dir,
+            sam_h5_path=sam_h5_path,
+            ijepa_h5_path=ijepa_h5_path,
+            ijepa_lookup_json=ijepa_lookup_json,
             origin_map_json=origin_map_json,
             max_segments=max_segments,
             use_labels=True,
@@ -184,8 +210,16 @@ def setup_training_loop_kwargs(
             xflip=False
         )
         print(f'Using AlignedSegDataset with pre-computed embeddings')
-        print(f'  SAM embeddings: {sam_npz_dir}')
-        print(f'  I-JEPA embeddings: {ijepa_npz_dir}')
+        if sam_h5_path is not None:
+            print(f'  SAM H5 embeddings: {sam_h5_path}')
+        if sam_npz_dir is not None:
+            print(f'  SAM NPZ embeddings (fallback): {sam_npz_dir}')
+        if ijepa_h5_path is not None:
+            print(f'  I-JEPA H5 embeddings: {ijepa_h5_path}')
+        if ijepa_lookup_json is not None:
+            print(f'  I-JEPA lookup JSON: {ijepa_lookup_json}')
+        if ijepa_npz_dir is not None:
+            print(f'  I-JEPA NPZ embeddings (fallback): {ijepa_npz_dir}')
         print(f'  Origin map: {origin_map_json}')
         print(f'  Max segments: {max_segments}')
     else:
@@ -196,7 +230,44 @@ def setup_training_loop_kwargs(
             max_size=None,
             xflip=False
         )
-    
+
+    # Validate and resolve SAM on-the-fly extractor mode/options.
+    if sam_emb_source is None:
+        sam_emb_source = 'sam_encoder'
+    if sam_region_backbone is None:
+        sam_region_backbone = 'ijepa_vit_h14'
+    if sam_region_max_keep is None:
+        sam_region_max_keep = 100
+    if sam_region_dedup_iou_thresh is None:
+        sam_region_dedup_iou_thresh = 0.65
+    if sam_region_min_quality_score is None:
+        sam_region_min_quality_score = 0.75
+    if sam_region_min_area_frac is None:
+        sam_region_min_area_frac = 0.001
+    if sam_region_max_area_frac is None:
+        sam_region_max_area_frac = 0.85
+    if sam_region_mean_subtract is None:
+        sam_region_mean_subtract = False
+    if sam_crop_overlap_ratio is None:
+        sam_crop_overlap_ratio = 0.35
+    if sam_crop_n_points_downscale is None:
+        sam_crop_n_points_downscale = 2
+    if sam_preextract is None:
+        sam_preextract = False
+
+    if sam_emb_source not in ['sam_encoder', 'region_vit']:
+        raise UserError('--sam-emb-source must be one of: sam_encoder, region_vit')
+    sam_enabled_resolved = sam_enabled if sam_enabled is not None else False
+    if sam_enabled_resolved and sam_emb_source == 'region_vit':
+        if sam_region_backbone not in ['ijepa_vit_h14', 'dinov2_vitl14', 'dino_vitb8']:
+            raise UserError('--sam-region-backbone must be one of: ijepa_vit_h14, dinov2_vitl14, dino_vitb8')
+        if sam_region_backbone == 'ijepa_vit_h14' and sam_region_ijepa_checkpoint is None:
+            raise UserError('--sam-region-ijepa-checkpoint is required when --sam-region-backbone=ijepa_vit_h14')
+        if sam_cache_dir is not None and sam_region_proj_path is None:
+            sam_region_proj_path = os.path.join(sam_cache_dir, f'projection_{sam_region_backbone}.pt')
+        if sam_region_proj_path is None:
+            raise UserError('--sam-region-proj-path is required for --sam-emb-source=region_vit (or provide --sam-cache-dir)')
+
     args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2)
     try:
         training_set = dnnlib.util.construct_class_by_name(**args.training_set_kwargs) # subclass of training.dataset.Dataset
@@ -293,13 +364,27 @@ def setup_training_loop_kwargs(
         ijepa_in_ch=ijepa_input_channel,
         ijepa_warmup_kimg=ijepa_warmup_kimg,
         # SAM parameters
-        sam_enabled=sam_enabled if sam_enabled is not None else False,
+        sam_enabled=sam_enabled_resolved,
         sam_prob=sam_prob if sam_prob is not None else 0.25,
         sam_checkpoint=sam_checkpoint,
         sam_cache_dir=sam_cache_dir,
         sam_model_type=sam_model_type if sam_model_type is not None else 'vit_b',
         sam_max_masks=sam_max_masks if sam_max_masks is not None else 250,
         sam_emb_logging=sam_emb_logging if sam_emb_logging is not None else False,
+        sam_emb_source=sam_emb_source,
+        sam_region_backbone=sam_region_backbone,
+        sam_region_ijepa_checkpoint=sam_region_ijepa_checkpoint,
+        sam_region_proj_path=sam_region_proj_path,
+        sam_region_max_keep=sam_region_max_keep,
+        sam_region_dedup_iou_thresh=sam_region_dedup_iou_thresh,
+        sam_region_min_quality_score=sam_region_min_quality_score,
+        sam_region_min_area_frac=sam_region_min_area_frac,
+        sam_region_max_area_frac=sam_region_max_area_frac,
+        sam_region_mean_subtract=sam_region_mean_subtract,
+        sam_crop_overlap_ratio=sam_crop_overlap_ratio,
+        sam_crop_n_points_downscale=sam_crop_n_points_downscale,
+        sam_h5_delta_dir=sam_h5_delta_dir,
+        sam_preextract=sam_preextract,
         # AMG parameters (matching precompute_sam_embeddings.py)
         sam_points_per_side=sam_points_per_side if sam_points_per_side is not None else 32,
         sam_pred_iou_thresh=sam_pred_iou_thresh if sam_pred_iou_thresh is not None else 0.82,
@@ -318,7 +403,22 @@ def setup_training_loop_kwargs(
         rdm_mix_prob=rdm_mix_prob if rdm_mix_prob is not None else 0.0,
         rdm_warmup_kimg=rdm_warmup_kimg if rdm_warmup_kimg is not None else 10000,
     )
-    
+
+    print('SAM on-the-fly extractor config:')
+    print(f'  enabled: {args.loss_kwargs.sam_enabled}')
+    print(f'  source: {args.loss_kwargs.sam_emb_source}')
+    print(f'  preextract: {args.loss_kwargs.sam_preextract}')
+    if args.loss_kwargs.sam_emb_source == 'region_vit':
+        print(f'  region backbone: {args.loss_kwargs.sam_region_backbone}')
+        print(f'  region proj path: {args.loss_kwargs.sam_region_proj_path}')
+        print(f'  region max keep: {args.loss_kwargs.sam_region_max_keep}')
+        print(f'  region dedup iou: {args.loss_kwargs.sam_region_dedup_iou_thresh}')
+        print(f'  region quality range: >= {args.loss_kwargs.sam_region_min_quality_score}')
+        print(f'  region area frac range: [{args.loss_kwargs.sam_region_min_area_frac}, {args.loss_kwargs.sam_region_max_area_frac}]')
+        print(f'  region mean subtract: {args.loss_kwargs.sam_region_mean_subtract}')
+    if args.loss_kwargs.sam_h5_delta_dir is not None:
+        print(f'  delta H5 dir: {args.loss_kwargs.sam_h5_delta_dir}')
+
     args.total_kimg = spec.kimg
     args.batch_size = spec.mb
     args.batch_gpu = spec.mb // spec.ref_gpus
@@ -589,6 +689,9 @@ class CommaSeparatedList(click.ParamType):
 # Segmentation options
 @click.option('--sam-npz-dir', help='Directory with SAM .npz embeddings', metavar='DIR', type=str)
 @click.option('--ijepa-npz-dir', help='Directory with I-JEPA .npz embeddings', metavar='DIR', type=str)
+@click.option('--sam-h5-path', help='Path to flat SAM H5 embeddings (region_emb_flat.h5)', metavar='PATH', type=str)
+@click.option('--ijepa-h5-path', help='Path to flat I-JEPA H5 embeddings (ijepa_emb_flat.h5)', metavar='PATH', type=str)
+@click.option('--ijepa-lookup-json', help='Path to I-JEPA lookup JSON for flat H5 (class/name -> row index)', metavar='PATH', type=str)
 @click.option('--max-segments', help='Maximum number of segments', metavar='INT', type=int, default=250, show_default=True)
 @click.option('--use-seg-embeddings/--no-seg-embeddings', help='Use pre-computed segmentation embeddings', default=False, show_default=True)
 @click.option('--origin-map-json', help='Path to origin_map.json (maps zip filenames to original image stems for NPZ lookup)', metavar='PATH', type=str)
@@ -601,12 +704,26 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--sam-model-type', help='SAM model type', type=click.Choice(['vit_b', 'vit_l', 'vit_h']), default='vit_b', show_default=True)
 @click.option('--sam-max-masks', help='Maximum number of SAM masks per image', type=int, default=250, show_default=True)
 @click.option('--sam-emb-logging', help='Enable SAM embedding cache hit/miss logging', type=bool, default=False, show_default=True)
+@click.option('--sam-emb-source', help='On-the-fly embedding source', type=click.Choice(['sam_encoder', 'region_vit']), default='sam_encoder', show_default=True)
+@click.option('--sam-region-backbone', help='Backbone used in region_vit mode', type=click.Choice(['ijepa_vit_h14', 'dinov2_vitl14', 'dino_vitb8']), default='ijepa_vit_h14', show_default=True)
+@click.option('--sam-region-ijepa-checkpoint', help='Path to I-JEPA checkpoint for region_vit mode', metavar='PATH', type=str)
+@click.option('--sam-region-proj-path', help='Path to fixed projection file for region_vit mode', metavar='PATH', type=str)
+@click.option('--sam-region-max-keep', help='Max regions to keep in region_vit mode', type=int, default=100, show_default=True)
+@click.option('--sam-region-dedup-iou-thresh', help='Dedup IoU threshold in region_vit mode', type=float, default=0.65, show_default=True)
+@click.option('--sam-region-min-quality-score', help='Minimum quality score in region_vit mode', type=float, default=0.75, show_default=True)
+@click.option('--sam-region-min-area-frac', help='Minimum area fraction in region_vit mode', type=float, default=0.001, show_default=True)
+@click.option('--sam-region-max-area-frac', help='Maximum area fraction in region_vit mode', type=float, default=0.85, show_default=True)
+@click.option('--sam-region-mean-subtract/--no-sam-region-mean-subtract', help='Per-image mean subtraction in region_vit mode', default=False, show_default=True)
+@click.option('--sam-h5-delta-dir', help='Optional directory for per-rank extracted-region H5 delta files', metavar='DIR', type=str)
+@click.option('--sam-preextract/--no-sam-preextract', help='Pre-extract SAM embeddings at startup', default=False, show_default=True)
 # AMG parameters (matching precompute_sam_embeddings.py)
 @click.option('--sam-points-per-side', help='AMG points per side for mask generation', type=int, default=32, show_default=True)
 @click.option('--sam-pred-iou-thresh', help='AMG predicted IoU threshold', type=float, default=0.82, show_default=True)
 @click.option('--sam-stability-score-thresh', help='AMG stability score threshold', type=float, default=0.85, show_default=True)
 @click.option('--sam-box-nms-thresh', help='AMG box NMS threshold', type=float, default=0.70, show_default=True)
 @click.option('--sam-crop-n-layers', help='AMG crop layers', type=int, default=0, show_default=True)
+@click.option('--sam-crop-overlap-ratio', help='AMG crop overlap ratio', type=float, default=0.35, show_default=True)
+@click.option('--sam-crop-n-points-downscale', help='AMG crop points downscale factor', type=int, default=2, show_default=True)
 @click.option('--sam-dedup-iou-thresh', help='IoU threshold for greedy mask deduplication', type=float, default=0.95, show_default=True)
 @click.option('--sam-min-mask-region-area', help='Minimum mask region area (post-processing)', type=int, default=100, show_default=True)
 @click.option('--seg-align-tau', help='Temperature for contrastive alignment loss (InfoNCE)', type=float, default=0.07, show_default=True)
