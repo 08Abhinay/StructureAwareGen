@@ -1310,7 +1310,11 @@ class UnifiedSegRDM(RDM):
             # Expand mask to match loss shape: [B, N] -> [B, 1, 1, N]
             mask_expanded = (~padding_mask).float().unsqueeze(1).unsqueeze(2)
             loss_simple = loss_simple * mask_expanded
-            # Average over non-padded tokens only
+            # Average over channels first, then over valid tokens only.
+            # Without .mean(dim=1) the denominator only counts N_valid
+            # but the numerator sums C * N_valid elements, inflating
+            # loss by a factor of C.
+            loss_simple = loss_simple.mean(dim=1, keepdim=True)   # [B, 1, 1, N]
             loss_simple = loss_simple.sum(dim=[1, 2, 3]) / mask_expanded.sum(dim=[1, 2, 3]).clamp(min=1)
         else:
             loss_simple = loss_simple.mean(dim=[1, 2, 3])
@@ -1331,6 +1335,7 @@ class UnifiedSegRDM(RDM):
         loss_vlb_per_elem = self.get_loss(model_output, target, mean=False)
         if padding_mask is not None:
             loss_vlb_per_elem = loss_vlb_per_elem * mask_expanded
+            loss_vlb_per_elem = loss_vlb_per_elem.mean(dim=1, keepdim=True)  # [B,1,1,N]
             loss_vlb = (loss_vlb_per_elem.sum(dim=[1, 2, 3]) / mask_expanded.sum(dim=[1, 2, 3]).clamp(min=1))
         else:
             loss_vlb = loss_vlb_per_elem.mean(dim=(1, 2, 3))

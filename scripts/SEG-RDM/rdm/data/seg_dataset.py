@@ -634,10 +634,12 @@ class SegmentationMaskDataset(Dataset):
         ns  = int(self.h5_file['n_segments'][idx])
         
         result = {
-            'emb':    self.h5_file['emb'][off:off + ns],       # (ns, 256) float32
-            'scores': self.h5_file['scores'][off:off + ns],    # (ns,)     float32
-            'shape':  self.h5_file['mask_shapes'][idx],        # (3,)      int32
+            'emb':    self.h5_file['emb'][off:off + ns],       # (ns, C) float32
+            'scores': self.h5_file['scores'][off:off + ns],    # (ns,)   float32
         }
+        # Binary mask shapes (optional — not present in REN H5 files)
+        if 'mask_shapes' in self.h5_file:
+            result['shape'] = self.h5_file['mask_shapes'][idx]  # (3,) int32
         # Load per-segment metadata for deterministic token sorting
         if 'areas' in self.h5_file:
             result['areas'] = self.h5_file['areas'][off:off + ns]    # (ns,) float32

@@ -1,0 +1,31 @@
+# REN DINOv2 ViT-L/14 config for region token extraction.
+# Adapted from REN/configs/ren_dinov2_vitl14.yaml.
+# SAM2 references removed (not needed for inference with SLIC/grid prompts).
+
+parameters:
+  image_resolution: 518
+  grid_size: 37
+  use_slic: true
+  aggregate_tokens: true
+  token_variant: 'ren'
+  merge_similarity: 0.975
+  feature_extractor: 'dinov2_vitl14'
+  ren_ckpt: '/scratch/gilbreth/abelde/Thesis/REN/logs/ren-dinov2-vitl14/checkpoint.pth'
+
+ren:
+  pretrained:
+    feature_extractors:
+      - 'dinov2_vitl14'
+    patch_sizes:
+      - 14
+
+  architecture:
+    grid_size: 518
+    hidden_dim: 1024
+    decoder_layers: 4
+    num_attention_heads: 8
+
+  parameters:
+    image_resolution: 518
+    upsample_features: false
+    merge_similarity: 0.975
