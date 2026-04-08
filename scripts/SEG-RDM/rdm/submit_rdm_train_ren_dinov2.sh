@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH -A pfw-cs
-#SBATCH -p a100-80gb
-#SBATCH -q normal
+#SBATCH -p a30
+#SBATCH -q standby
 #SBATCH --job-name=RDM-ren-dinov2
-#SBATCH --nodes=2
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=2
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=16
 #SBATCH --mem-per-gpu=80G
-#SBATCH --time=24:00:00
+#SBATCH --time=04:00:00
 
 #SBATCH --output=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/RDM_ren_dinov2/%x-%j.out
 #SBATCH --error=/scratch/gilbreth/abelde/Thesis/StructureAwareGen/scripts/SEG-RDM/rdm/SLRUM_OUTPUT_FILES/RDM_ren_dinov2/%x-%j.err
@@ -24,7 +24,7 @@ PROJECT_ROOT="/scratch/gilbreth/abelde/Thesis/StructureAwareGen"
 SEG_RDM_ROOT="${PROJECT_ROOT}/scripts/SEG-RDM"
 RDM_ROOT="${SEG_RDM_ROOT}/rdm"
 
-RUN_DIR="${RDM_ROOT}/rdm_out_final/ren_dinov2/2_nodes/"
+RUN_DIR="${RDM_ROOT}/rdm_out_final/ren_dinov2/4x2_nodes-a30/"
 
 module load anaconda
 conda activate "${PROJECT_ROOT}/SegmentationAwareGen"
@@ -33,8 +33,13 @@ export OMP_NUM_THREADS=2
 export MKL_NUM_THREADS=2
 export OPENBLAS_NUM_THREADS=2
 export NUMEXPR_NUM_THREADS=2
-export TORCH_NCCL_DUMP_ON_TIMEOUT=1
-export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
+export HDF5_USE_FILE_LOCKING=FALSE
+
+# NCCL: do NOT hardcode NCCL_SOCKET_IFNAME — interface names differ between node types
+# NCCL auto-detects the correct interface; IB/RoCE will be used for data transport
+export NCCL_IB_DISABLE=0
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,NET
 
 cd "${SEG_RDM_ROOT}"
 export PYTHONPATH="$PWD:$PYTHONPATH"
@@ -55,7 +60,6 @@ TORCHRUN_CMD=(
   torchrun
   --nnodes="$SLURM_NNODES"
   --nproc_per_node=2
-  --node_rank="$SLURM_PROCID"
   --rdzv_backend=c10d
   --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT"
   --rdzv_id="$SLURM_JOB_ID"
@@ -70,12 +74,14 @@ TORCHRUN_CMD=(
   --epochs 300
   --batch_size 128
   --accum_iter 1
-  --num_workers 4
+  --num_workers 8
   --output_dir "${RUN_DIR}"
   --log_dir "${RUN_DIR}"
   --data_path "${PROJECT_ROOT}/dataset/imagenet-1K-hf"
   --use_seg_dataset
+  --emb_source dinov2
   --h5_path "${PROJECT_ROOT}/h5_embeddings/region_ren_dinov2_flat.h5"
+  --image_h5_path "${PROJECT_ROOT}/h5_embeddings/imagenet_train_images.h5"
   --max_segments 100
 )
 
@@ -83,5 +89,4 @@ if [ ${#RESUME_ARGS[@]} -gt 0 ]; then
   TORCHRUN_CMD+=("${RESUME_ARGS[@]}")
 fi
 
-srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
-  "${TORCHRUN_CMD[@]}"
+srun "${TORCHRUN_CMD[@]}"

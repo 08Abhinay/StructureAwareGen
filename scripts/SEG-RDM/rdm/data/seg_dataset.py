@@ -3,6 +3,7 @@ Dataset loader for Unified Segmentation RDM.
 Loads images and pre-computed SAM segmentation embeddings.
 """
 
+import io
 import os
 import glob
 import numpy as np
@@ -47,6 +48,7 @@ class SegmentationMaskDataset(Dataset):
         ijepa_h5_key_format: str = "{class_id}/{name}",
         ijepa_lookup_json: Optional[str] = None,
         cls_from_external_h5: bool = False,
+        image_h5_path: Optional[str] = None,
     ):
         """
         Args:
@@ -66,6 +68,8 @@ class SegmentationMaskDataset(Dataset):
             ijepa_lookup_json: Optional path to JSON lookup for flat IJEPA h5 (maps 'class_id/name' -> row index)
             cls_from_external_h5: If True, route external H5 embeddings as 'cls_emb' instead of 'ijepa_emb'
                                   (for MoCo CLS 256d pre-normalised vectors that bypass projection/z-score in ddpm.py)
+            image_h5_path: Optional path to .h5 file containing raw JPEG bytes (avoids 1M+ random file opens).
+                           Layout: images[N] vlen uint8, class_ids[N] int32, names[N] string.
         """
         self.image_dir = image_dir
         self.mask_npz_dir = mask_npz_dir
@@ -86,6 +90,9 @@ class SegmentationMaskDataset(Dataset):
         self._flat_h5_index = None   # (class_id_str, name_str) → sample_index
         self._ijepa_h5_is_flat = False
         self._ijepa_flat_index = None  # "class_id/name" → row_index
+        self.image_h5_path = image_h5_path
+        self._image_h5_file = None
+        self._image_h5_index = None  # (class_id_str, name_str) → row_index
         
         # Open h5 file if provided (lazy loading)
         if self.h5_path and os.path.exists(self.h5_path):
@@ -107,27 +114,49 @@ class SegmentationMaskDataset(Dataset):
             print(f"Using flat IJEPA h5 with lookup: {self.ijepa_lookup_json} "
                   f"({len(self._ijepa_flat_index)} entries, loaded in {time.time()-t0:.1f}s)")
         
+        # ── Build image H5 index if provided ──
+        if self.image_h5_path and os.path.exists(self.image_h5_path):
+            print(f"[Image H5] Building index from {self.image_h5_path} ...")
+            t0 = time.time()
+            with h5py.File(self.image_h5_path, 'r') as _ih:
+                _img_cids = _ih['class_ids'][:]
+                _img_nms  = _ih['names'][:]
+            self._image_h5_index = {}
+            for i, (cid, nm) in enumerate(zip(_img_cids, _img_nms)):
+                nm_str = nm.decode() if isinstance(nm, bytes) else str(nm)
+                self._image_h5_index[(str(cid), nm_str)] = i
+            print(f"  Indexed {len(self._image_h5_index)} images in {time.time()-t0:.1f}s")
+        
         # Find all images with corresponding SAM embeddings
         # Scan mask_npz_dir subdirectories: {mask_npz_dir}/0/masks_npz/, /1/masks_npz/, etc.
         # Build image lookup table (fast: scan images once instead of checking each npz)
-        print(f"Building image lookup table from {image_dir}...")
         image_lookup = {}  # {(class_id, basename): full_path}
         
-        # Scan image directory structure
-        try:
-            class_dirs = [d for d in os.listdir(image_dir) 
-                         if os.path.isdir(os.path.join(image_dir, d)) and d.isdigit()]
-            
-            for class_id in class_dirs:
-                class_path = os.path.join(image_dir, class_id)
-                for img_file in os.listdir(class_path):
-                    if img_file.endswith(('.JPEG', '.jpg', '.jpeg', '.JPG', '.png', '.PNG')):
-                        basename = os.path.splitext(img_file)[0]
-                        image_lookup[(class_id, basename)] = os.path.join(class_path, img_file)
-            
-            print(f"  Found {len(image_lookup)} images")
-        except Exception as e:
-            print(f"  WARNING: Failed to build lookup: {e}")
+        if self._image_h5_index is not None:
+            # Image H5 available: build lookup from H5 index (no filesystem scan!)
+            print(f"Building image lookup from image H5 (skipping filesystem scan)...")
+            for (class_id, basename) in self._image_h5_index:
+                # Synthesize a path that matches the expected structure for class_id extraction
+                img_path = os.path.join(image_dir, class_id, f"{basename}.JPEG")
+                image_lookup[(class_id, basename)] = img_path
+            print(f"  Found {len(image_lookup)} images (from H5 index)")
+        else:
+            # Scan image directory structure (original path)
+            print(f"Building image lookup table from {image_dir}...")
+            try:
+                class_dirs = [d for d in os.listdir(image_dir) 
+                             if os.path.isdir(os.path.join(image_dir, d)) and d.isdigit()]
+                
+                for class_id in class_dirs:
+                    class_path = os.path.join(image_dir, class_id)
+                    for img_file in os.listdir(class_path):
+                        if img_file.endswith(('.JPEG', '.jpg', '.jpeg', '.JPG', '.png', '.PNG')):
+                            basename = os.path.splitext(img_file)[0]
+                            image_lookup[(class_id, basename)] = os.path.join(class_path, img_file)
+                
+                print(f"  Found {len(image_lookup)} images")
+            except Exception as e:
+                print(f"  WARNING: Failed to build lookup: {e}")
         
         # Discover samples: prefer flat H5, then nested H5, then NPZ directory
         use_flat_h5_discovery = False
@@ -296,6 +325,21 @@ class SegmentationMaskDataset(Dataset):
                 transforms.ToTensor(),
             ])
     
+    def _load_image(self, img_path: str, name: str) -> torch.Tensor:
+        """Load image from H5 file (if available) or from disk."""
+        if self._image_h5_index is not None:
+            class_id = os.path.basename(os.path.dirname(img_path))
+            row = self._image_h5_index.get((class_id, name))
+            if row is not None:
+                if self._image_h5_file is None:
+                    self._image_h5_file = h5py.File(self.image_h5_path, 'r')
+                raw = self._image_h5_file['images'][row]
+                image = Image.open(io.BytesIO(raw.tobytes())).convert('RGB')
+                return self.transform(image)
+        # Fallback: read from disk
+        image = Image.open(img_path).convert("RGB")
+        return self.transform(image)
+    
     def _get_basename(self, path: str) -> str:
         """Get filename without extension."""
         return os.path.splitext(os.path.basename(path))[0]
@@ -327,8 +371,7 @@ class SegmentationMaskDataset(Dataset):
             npz_path = self.npz_paths[current_idx]
             name = self._get_basename(img_path)
             try:
-                image = Image.open(img_path).convert("RGB")
-                image = self.transform(image)  # [3, H, W]
+                image = self._load_image(img_path, name)
             except Exception as e:
                 print(f"Error loading image {img_path}: {e}")
                 image = torch.zeros(3, self.image_size, self.image_size)
@@ -429,8 +472,7 @@ class SegmentationMaskDataset(Dataset):
             img_path = self.image_paths[idx]
             name = self._get_basename(img_path)
             try:
-                image = Image.open(img_path).convert("RGB")
-                image = self.transform(image)
+                image = self._load_image(img_path, name)
             except Exception:
                 image = torch.zeros(3, self.image_size, self.image_size)
             print(
@@ -732,6 +774,11 @@ class SegmentationMaskDataset(Dataset):
         if self.ijepa_h5_file is not None:
             try:
                 self.ijepa_h5_file.close()
+            except:
+                pass
+        if self._image_h5_file is not None:
+            try:
+                self._image_h5_file.close()
             except:
                 pass
 
